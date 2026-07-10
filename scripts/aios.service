@@ -1,0 +1,23 @@
+# AIOS systemd user service — start on login, restart on crash.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp scripts/aios.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now aios
+#   journalctl --user -u aios -f        # logs
+#
+# To keep it running when you log out:  loginctl enable-linger $USER
+
+[Unit]
+Description=AIOS — personal AI operating hub
+After=network.target
+
+[Service]
+WorkingDirectory=%h/personal-project/OS
+ExecStart=/usr/bin/env node server/index.js
+Restart=on-failure
+RestartSec=3
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target

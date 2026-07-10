@@ -1,0 +1,20 @@
+# Bundled SearXNG metasearch instance powering the AIOS web_search tool.
+# Managed via `npm run searxng` (see scripts/searxng.mjs).
+# Bound to 127.0.0.1 only — searches go through the AIOS server, so the
+# instance never needs to be reachable from the LAN.
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: aios-searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8890:8080"
+    volumes:
+      - ./config:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://127.0.0.1:8890/
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "1"

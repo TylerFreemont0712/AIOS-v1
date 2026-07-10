@@ -1,0 +1,26 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=AIOS
+GenericName=AI Operating Hub
+Comment=Restart your personal AI hub (kills any running server) and open it
+Exec=/home/joejin/personal-project/OS/scripts/aios-launch.sh --restart
+Path=/home/joejin/personal-project/OS
+Icon=/home/joejin/personal-project/OS/scripts/aios.svg
+Terminal=false
+StartupNotify=true
+Categories=Development;
+Keywords=AI;LLM;agent;AIOS;Claude;Ollama;hub;restart;
+Actions=Start;Open;Stop;
+
+[Desktop Action Start]
+Name=Start (don't restart if already running)
+Exec=/home/joejin/personal-project/OS/scripts/aios-launch.sh --start
+
+[Desktop Action Open]
+Name=Open in browser (don't start server)
+Exec=/home/joejin/personal-project/OS/scripts/aios-launch.sh --open
+
+[Desktop Action Stop]
+Name=Stop AIOS server
+Exec=/home/joejin/personal-project/OS/scripts/aios-launch.sh --stop

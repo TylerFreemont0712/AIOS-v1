@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AIOS</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='42' fill='%23d97757'/><circle cx='50' cy='50' r='16' fill='%23f0eee5'/></svg>">
+  <link rel="stylesheet" href="/css/theme.css">
+  <link rel="stylesheet" href="/css/shell.css">
+  <link rel="stylesheet" href="/css/apps.css">
+  <link rel="stylesheet" href="/vendor/xterm.css">
+  <script src="/vendor/xterm.js"></script>
+  <script src="/vendor/xterm-addon-fit.js"></script>
+</head>
+<body>
+  <div id="wallpaper"></div>
+
+  <header class="topbar">
+    <div class="tb-left">
+      <div class="tb-brand">AIOS</div>
+      <span class="tb-crumb"><span class="tb-sep">/</span><span class="tb-view" id="tb-view"></span></span>
+      <button class="tb-project" id="tb-project" title="Active project">
+        <span id="tb-project-name">no project</span>
+      </button>
+    </div>
+    <div class="tb-right">
+      <button class="tb-btn" id="tb-palette" title="Command palette (Ctrl+K)">⌘K</button>
+      <span class="tb-status" id="tb-provider" title="Providers"></span>
+      <button class="tb-btn" id="tb-theme" title="Toggle theme"></button>
+      <span class="tb-clock" id="tb-clock"></span>
+    </div>
+  </header>
+
+  <main class="desktop" id="desktop">
+    <div id="views"></div>
+  </main>
+
+  <nav class="dock" id="dock"></nav>
+
+  <div class="toasts" id="toasts"></div>
+
+  <script type="module" src="/js/main.js"></script>
+</body>
+</html>
