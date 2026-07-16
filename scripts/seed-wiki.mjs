@@ -6,7 +6,7 @@
 // agent pulling them back through wiki_recall before it works.
 
 import { loadConfig } from '../server/config.js';
-import { upsertNote, rebuildIndex } from '../server/wiki.js';
+import { upsertNote, rebuildIndex, NOTE_KINDS } from '../server/wiki.js';
 
 const cfg = loadConfig();
 if (!cfg.vault?.path) {
@@ -240,6 +240,32 @@ More than ~100 lines, needs arrays-of-objects, JSON manipulation beyond \`jq\`, 
 - [[Wiki Guide]]`,
   },
 ];
+
+// The typed-note system: a guide note + one template note per kind, straight from
+// the NOTE_KINDS registry so Meta/Templates never drifts from what the tools serve.
+const kindTitle = (k) => k === 'howto' ? 'How-To' : k[0].toUpperCase() + k.slice(1);
+NOTES.push({
+  title: 'Note System', folder: 'Meta', tags: ['meta'],
+  content: `**Every durable note in this wiki is one of seven typed kinds, each with a fixed template — typed notes stay scannable, recall packs them efficiently, and human + agent can co-maintain them without style drift.**
+
+## The kinds
+${Object.entries(NOTE_KINDS).map(([k, v]) => `- **${k}** — ${v.what} → [[Template — ${kindTitle(k)}]]`).join('\n')}
+
+## Rules of thumb
+- Pick the kind BEFORE writing; if a note wants to be two kinds, it is two notes.
+- Definition-first bold line, concrete facts, ≥2 [[links]] in a closing Related section.
+- The agent gets templates via the \`note_template\` tool and stamps \`type:\` frontmatter through \`wiki_learn {kind}\`; the full quality bar lives in the \`notes\` skill.
+- Templates live under Meta/Templates — copy their structure, never fill them in.
+
+## Related
+- [[Wiki Guide]]`,
+});
+for (const [k, v] of Object.entries(NOTE_KINDS)) {
+  NOTES.push({
+    title: `Template — ${kindTitle(k)}`, folder: 'Meta/Templates', tags: ['meta', 'template'], kind: k,
+    content: `**Canonical scaffold for a \`${k}\` note — ${v.what}. Copy the structure; keep the section names.**\n\n\`\`\`markdown\n${v.template}\n\`\`\`\n\n## Related\n- [[Note System]]`,
+  });
+}
 
 let created = 0, updated = 0;
 for (const n of NOTES) {

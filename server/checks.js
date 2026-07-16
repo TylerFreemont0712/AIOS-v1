@@ -5,7 +5,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { safePath } from './util.js';
 
 let esbuildPromise;
@@ -78,4 +78,63 @@ export async function checkFiles(root, rels) {
     if (r) out.push(r);
   }
   return out;
+}
+
+// ---------- project test runner (verify loop v2) ----------
+
+const readIf = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return ''; } };
+
+/**
+ * Figure out how this project runs its tests. Priority:
+ * an explicit `verify: <command>` line in .aios/instructions.md, then the
+ * ecosystem defaults. Returns { cmd, via } or null when the project has none.
+ */
+export function detectTestCommand(root) {
+  const inst = readIf(path.join(root, '.aios', 'instructions.md'));
+  const explicit = inst.match(/^verify:\s*(.+)$/mi)?.[1]?.trim();
+  if (explicit) return { cmd: explicit, via: '.aios/instructions.md' };
+
+  const pkg = readIf(path.join(root, 'package.json'));
+  if (pkg) {
+    try {
+      const test = JSON.parse(pkg).scripts?.test;
+      if (test && !/no test specified/i.test(test)) return { cmd: 'npm test --silent', via: 'package.json' };
+    } catch { }
+  }
+  const pyproject = readIf(path.join(root, 'pyproject.toml'));
+  if ((fs.existsSync(path.join(root, 'pytest.ini')) || /\[tool\.pytest/i.test(pyproject)) && hasCmd('python3')) {
+    return { cmd: 'python3 -m pytest -x -q', via: 'pytest config' };
+  }
+  if (/^test:/m.test(readIf(path.join(root, 'Makefile'))) && hasCmd('make')) return { cmd: 'make test', via: 'Makefile' };
+  if (fs.existsSync(path.join(root, 'Cargo.toml')) && hasCmd('cargo')) return { cmd: 'cargo test --quiet', via: 'Cargo.toml' };
+  if (fs.existsSync(path.join(root, 'go.mod')) && hasCmd('go')) return { cmd: 'go test ./...', via: 'go.mod' };
+  return null;
+}
+
+/** Run the project's tests, bounded and async (never blocks the server loop).
+ *  Resolves { ok, cmd, via, output, ms } — or null when the project has no tests. */
+export function runProjectTests(root, { timeoutMs = 120_000 } = {}) {
+  const t = detectTestCommand(root);
+  if (!t) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const child = spawn('/bin/bash', ['-c', t.cmd], {
+      cwd: root, detached: true,
+      env: { ...process.env, CI: '1', FORCE_COLOR: '0' },
+    });
+    let out = '';
+    let killed = false;
+    const kill = () => { killed = true; try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { } } };
+    const timer = setTimeout(kill, timeoutMs);
+    child.stdout.on('data', d => { out += d; if (out.length > 200_000) kill(); });
+    child.stderr.on('data', d => { out += d; });
+    child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, cmd: t.cmd, via: t.via, output: 'spawn error: ' + e.message, ms: Date.now() - t0 }); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      let output = out.trim();
+      if (output.length > 8000) output = output.slice(0, 3000) + '\n… (middle trimmed) …\n' + output.slice(-4500);
+      if (killed) output = `(killed: ${Math.round(timeoutMs / 1000)}s timeout or output cap)\n` + output;
+      resolve({ ok: !killed && code === 0, cmd: t.cmd, via: t.via, output, ms: Date.now() - t0 });
+    });
+  });
 }

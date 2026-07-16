@@ -77,7 +77,16 @@ export async function sendMessage(cid, text, { modelRef, attachments } = {}) {
   const ctl = new AbortController();
   live.set(cid, ctl);
   const cfg = loadConfig();
-  const system = c.system || `You are Claude inside AIOS, ${cfg.user.name}'s personal AI hub. Be direct, warm, and genuinely useful. Use markdown when it helps. Today is ${new Date().toDateString()}.`;
+  let system = c.system || `You are Claude inside AIOS, ${cfg.user.name}'s personal AI hub. Be direct, warm, and genuinely useful. Use markdown when it helps. Today is ${new Date().toDateString()}.`;
+  // app-wide awareness: planner/mail/weather brief so day-to-day questions
+  // ("what's going on tomorrow?") answer from real data, on every provider
+  if (cfg.defaults.appContext !== false) {
+    try {
+      const { appContext } = await import('./context.js');
+      const ctx = appContext({ chars: 1900 });
+      if (ctx) system += '\n\n' + ctx;
+    } catch { }
+  }
 
   try {
     // fit system + history inside the model's context window, reserving room for the reply

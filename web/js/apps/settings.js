@@ -159,6 +159,38 @@ export default {
         }, icon('plus'), 'Add endpoint');
         ui.panel.append(el('div', { style: { marginTop: '10px' } }, addBtn));
 
+        // ---- managed llama.cpp: profiles + the desktop launcher ----
+        if (c.llm?.managed !== false) {
+          ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '22px' } }, 'LOCAL LLAMA.CPP (AIOS-managed)'));
+          let ls = null;
+          try { ls = await get('/llm/status'); } catch { }
+          const profiles = ls?.profiles || ['big', 'tiny'];
+          const cur = ls?.running ? ls.profile : (ls?.foreign ? 'foreign' : '');
+          const profSeg = el('div', { class: 'seg' }, ...profiles.map(p => el('button', {
+            class: 'seg-btn' + (cur === p ? ' on' : ''),
+            onclick: async (ev) => {
+              const b = ev.target; const prev = b.textContent; b.disabled = true; b.textContent = 'loading…';
+              try { await post('/llm/profile', { profile: p }); toast(`switched to ${p} — may take a minute`, 'ok'); }
+              catch (e) { toast(e.message, 'err'); }
+              b.disabled = false; b.textContent = prev; refreshStatus(); renderPanel();
+            },
+          }, p)));
+          ui.panel.append(row(
+            el('span', { class: 'row' }, el('span', { class: 'pdot ' + (ls?.running ? 'up' : ls?.foreign ? 'warn' : 'off') }), 'Active profile'),
+            ls?.running ? `${ls.profile} on :${ls.port}${ls.gpu ? ` · GPU ${ls.gpu.freeMB}MB free` : ''}`
+              : ls?.foreign ? 'running unmanaged (started outside AIOS — switching a profile takes it over)'
+                : 'stopped — pick a profile to start it',
+            profSeg));
+          ui.panel.append(row('Launcher app',
+            'Open the desktop GUI for Whisper, MusicGen, and manual llama.cpp tuning. AIOS manages the text model itself, so use the launcher\'s llama tab only when experimenting.',
+            el('button', {
+              class: 'btn sm', onclick: async () => {
+                try { await post('/llm/launcher', {}); toast('launcher opening on your desktop', 'ok'); }
+                catch (e) { toast(e.message, 'err'); }
+              },
+            }, icon('external'), 'Open launcher')));
+        }
+
         // ---- sampling: everything the harness can reasonably set on a request ----
         ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '22px' } }, 'SAMPLING (all models — blank = provider default)'));
         const sm = c.sampling || {};
@@ -384,6 +416,26 @@ export default {
         ui.panel.append(row('Webhook URL', 'Server settings → Integrations → Webhooks → copy URL', el('div', { class: 'row' }, hook, hookBtn, hookTest)));
         ui.panel.append(row('Ping on important mail', 'Send a Discord digest when a scan finds new important messages',
           switchBtn(c.notify?.onImportantMail !== false, async (next) => { if (await save({ notify: { onImportantMail: next } })) renderPanel(); })));
+
+        // ---- sender rules: the inbox's learned ratings ----
+        ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '22px' } }, 'SENDER RULES'),
+          el('div', { class: 'set-sub', style: { marginBottom: '8px' } },
+            '⚡ starred senders are fast-tracked to the top of the Home inbox · ⊘ muted senders never appear. Rate senders from the inbox rows/modal; dismissing one sender 3× auto-mutes it.'));
+        let rules = [];
+        try { rules = await get('/mail/senders'); } catch { }
+        if (!rules.length) ui.panel.append(el('div', { class: 'muted small' }, 'no sender rules yet'));
+        for (const r of rules) {
+          ui.panel.append(row(
+            el('span', { class: 'mono', style: { fontSize: '12px' } }, `${r.rule === 'star' ? '⚡' : '⊘'} ${r.key}`),
+            `${r.rule === 'star' ? 'fast-tracked' : 'muted'}${r.kind === 'domain' ? ' (whole domain)' : ''}${r.via === 'auto' ? ' · auto (dismissed 3×)' : ''}`,
+            el('button', {
+              class: 'btn sm ghost danger', title: 'Remove this rule',
+              onclick: async () => {
+                try { await post('/mail/sender', { from: r.key.startsWith('@') ? 'x' + r.key : r.key, rule: 'clear', kind: r.kind }); toast('rule removed', 'ok'); renderPanel(); }
+                catch (e) { toast(e.message, 'err'); }
+              },
+            }, icon('trash'))));
+        }
       }
 
       if (S.tab === 'agent') {
@@ -419,6 +471,12 @@ export default {
           rounds.addEventListener('change', () => save({ agent: { maxFixRounds: Math.max(1, Math.min(5, +rounds.value || 2)) } }));
           ui.panel.append(row('Max auto-fix rounds', 'How many times the review may send problems back per request', rounds));
         }
+
+        ui.panel.append(row('Run project tests', 'After a clean self-check, runs the project\'s own test command (package.json test script, pytest, Makefile, cargo, go — or a "verify: <cmd>" line in .aios/instructions.md) and sends failures back to the agent',
+          switchBtn(c.agent.runTests !== 'off', async (v) => { await save({ agent: { runTests: v ? 'review' : 'off' } }); renderPanel(); })));
+
+        ui.panel.append(row('Life context in chat & agent', 'Injects a live brief of your planner (events, birthdays, tasks), important mail, weather, and job pipeline into every chat/agent message — so "what\'s going on tomorrow?" just works',
+          switchBtn(c.defaults.appContext !== false, async (v) => { await save({ defaults: { appContext: v } }); renderPanel(); })));
 
         ui.panel.append(row('Coding playbooks', 'Injects best-practice guides (skills/*.md) matched to the project\'s stack into the agent prompt; the rest stay available via the skill tool',
           switchBtn(c.agent.skills !== false, async (v) => { await save({ agent: { skills: v } }); renderPanel(); })));

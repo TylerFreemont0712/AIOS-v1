@@ -6,10 +6,37 @@ start something, move it to the top and mark it; when it ships, add it to **Ship
 and delete it from the buckets below (keep this list forward-looking).
 
 Priority tags: 🔥 wanted soon · ✨ nice-to-have · 🧪 experimental · 💭 blue-sky.
+See also **Suggestions.md** — a curated 2026-07-11 review with implementation sketches.
 
 ---
 
 ## Shipped (baseline — don't re-suggest these)
+Shipped (2026-07-16): **Studio workflows + typed notes + Learning Corner** — (1) **Studio
+gained a workflow selector**: Text→Image (unchanged), **Image→Image** (source picker —
+"Use render" from the history strip or upload any image — plus a remix-strength/denoise
+slider with plain-language hints; source scaled to the target size, batch via
+RepeatLatentBatch), and **Upscale** (pure-ESRGAN 2×/4× with upscaler model pick, no
+prompt/checkpoint needed, relaxed VRAM guard at 2.5GB so it rarely triggers the LLM swap);
+sources upload into ComfyUI via /upload/image; deeper graph surgery (LoRA stacks,
+ControlNet) stays one click away in ComfyUI proper. (2) **The second brain became a typed
+note system**: seven note kinds (concept / howto / reference / decision / troubleshooting
+/ source / project), each with a canonical template — served to the agent via a new
+`note_template` tool and a `kind` param on wiki_learn that stamps `type:` frontmatter
+(preserved across untyped updates); a new **`notes` skill** teaches the system (quality
+bar, filing, maintenance) and is auto-packed into the agent prompt when a vault is
+connected; `npm run seed-wiki` now also seeds `Meta/Note System` + `Meta/Templates/*`
+(ran live: 8 new notes). (3) **Mindmaps → Learning Corner**: a lesson-plan/roadmap tutor
+app (`learn` in the dock) — subjects with goal + level, an AI-designed roadmap of
+capability modules (prerequisite-ordered, project modules, grounded by web search of
+current curricula), and one-click **web-grounded lessons** (plan → search current sources
+→ read → streamed lesson with objectives / runnable examples / exercises-with-folded-
+solutions / self-quiz / cited sources / next-lesson ideas), lesson types standard/project/
+review/deep-dive per the new **`tutor` skill**; progress toggles per module and lesson,
+lessons auto-export to the vault's `Learning/` shelf, default **Programming** subject
+seeded. Mindmap UI removed (server store + agent tool remain, outlines still land in the
+wiki). New `learn.e2e.mjs` (15 checks, mock LLM + SearXNG) — e2e now 8 suites; audit +2
+areas (learn store, workflow graphs + typed notes) → 30 hard checks.
+
 The hub already has: web desktop (attached page views, dock, Ctrl+K palette, light/dark/accent/wallpaper),
 LAN broadcast + token auth, provider abstraction (Anthropic + Ollama + OpenAI-compatible),
 **Chat** (streaming, per-chat system prompts, history), **Agent** (Claude-Code-style tool loop:
@@ -42,6 +69,139 @@ auto-generated Home.md map-of-content, vault-app Home button); wiki-scoped write
 Hermes-style **tool foundry** (create_tool / list_custom_tools / delete_tool) where the agent
 forges persistent sandboxed tools (node:vm, least-privilege read/write capability injection),
 managed in Settings → Tools.
+Also shipped (2026-07-12, night): **research streaming fix + deeper research + launcher fit** —
+**the big one**: the WS client's topic-fanout only mapped agent/chat/vault message types, so
+**research, Studio progress, AND GitHub-suggestion streams were silently dropped** (nothing
+showed until you refreshed and re-read persisted state). Fixed at the choke point — the
+server now stamps `_topic` on every published message and the client routes generically
+(no per-type mapping to drift out of sync). Verified live: first event at 245ms, 540
+thinking-deltas + 2613 report-deltas streamed. **Research depth raised** for genuinely
+deliberate investigations: tiers quick/standard/deep now 4/5/6 queries and 5/8/11 reads
+(deep is 4 rounds, was 3), per-round wall-clock budget 100→180s local / 150→240s cloud (the
+old budget cut the slow local model off after 2-3 reads), synthesis token cap 4k→5k/8k with
+a "thorough briefing, 2-4 paragraphs per section" prompt. A real quick run now reads 6
+sources over ~4.7 min and writes a 14.5KB/7-section cited report (was "a few seconds, not
+much"). **Launcher fit**: the two-column split was wildly imbalanced (left 247px vs right
+632px = 385px of deadspace) — rebalanced to model+draft+serving left / tuning right (95px
+gap), window reshaped to landscape 1460×900 (from 1060×1040). New `stream.e2e.mjs` (7 checks)
+locks in the fanout fix.
+Also shipped (2026-07-12, evening): **polish sweep + llama-launcher integration** —
+efficiency: `/api/services` probes now run **concurrently** (a down ComfyUI no longer
+stalls the row on its network timeout; ~0.4s with everything up), the ComfyUI service chip
+uses a **lightweight ping** (no nvidia-smi/pgrep spawns), **Studio render PNGs are
+garbage-collected** when jobs fall off the 100-ring (was an unbounded disk leak), agent
+tool-card icons cover comfy/mail/wiki/planner/research, and a dead per-turn tool rescan was
+removed. Two **premature memoizations were caught and reverted** — the git prompt-context
+memo broke the per-turn branch-state refresh (the agent-git e2e caught it) and the
+app-context memo risked "add an event, ask again → stale"; both are now correctly always-
+fresh. **llama-launcher in AIOS**: Settings → AI Providers gained a "LOCAL LLAMA.CPP
+(AIOS-managed)" section — shows the active profile, switches **big ⇄ tiny** inline, and an
+**Open launcher** button spawns the desktop GUI (Whisper/MusicGen/manual tuning) via
+`/api/llm/launcher`. The **launcher GUI was redesigned**: the llama tab's six config
+sections went from one tall vertical stack to a **two-column layout**, each tab wrapped in a
+**scroll area**, window reshaped 1060×1040 → **1280×860 landscape** (backup kept as
+`.py.bak`). `.aios/instructions.md` added (verify: npm run check). Audit +3 checks (context,
+comfy plan, llmctl) → 29 total; all 6 e2e suites green.
+Also shipped (2026-07-12, later): **Studio v2 — the generation cockpit** — access fixed at
+every layer (ComfyUI now binds the LAN via `--listen`, the ↗ link rewrites localhost to
+wherever you're browsing from, and **Generate auto-boots ComfyUI** when it's down);
+two-column layout: inputs LEFT (model + live **sampling-plan line** showing exactly what
+will run, style presets with Animagine-official quality-tags-at-the-end, **positive starter
+templates** [portrait/landscape/chibi/dark-fantasy/retro-90s/mecha/cozy], **negative
+templates** incl. the official Animagine negative, an **LLM prompt generator** — type an
+idea, get a proper danbooru-tag prompt + matching negative), render RIGHT (big hero image +
+click-to-open, meta line with seed/steps/mode, history thumbnail strip); **hi-res 2-pass
+checkbox** — calibrated live to PIXEL space (decode → 4x-AnimeSharp → ×1.5 lanczos →
+0.45-denoise repaint) after latent upscales turned to mush under few-step models; **speed
+select** with quality as default (Animagine-official euler_a · cfg 5 · 28 steps) and the
+Lightning LoRA as explicit ⚡ opt-in — verified over three seed-777 renders that the LoRA
+shreds busy backgrounds on Animagine while characters stay clean. Two more workflows in
+ComfyUI's browser: **Anime Hi-Res 2-pass** and **Anime img2img** (native settings, LoRA
+node present but bypassed, Ctrl+B to enable).
+Also shipped (2026-07-12): **anime stack v2 + app-wide chat awareness** — **Animagine XL
+4.0** (real anime finetune) + SDXL-Lightning **4/8-step LoRAs** + **4x-AnimeSharp**
+upscaler installed; Studio's generator became Lightning-aware (`samplingPlan`: fast
+checkpoints keep 4/8-step cfg-1, plain finetunes auto-attach the Lightning LoRA, no LoRA →
+proper 26-step cfg-6 sampling) so picking Animagine "just works"; anime preset upgraded
+with quality tags; two more workflows in ComfyUI's browser (**Anime v2 Animagine+LoRA**,
+**Upscale 4x AnimeSharp**) + a tiered "what your 8GB can do" menu in comfyui-plan.md
+(hi-res fix → ControlNet → AnimateDiff/LTX-Video/WAN-1.3B ceiling). **Live app context**
+(`server/context.js`): a compact planner/birthdays/tasks/mail/weather/job-pipeline brief
+injected into every chat message and the agent prompt (sync — weather self-refreshes its
+cache; toggle in Settings → Agent; `GET /api/chat/context` shows exactly what's shared) —
+"what's going on tomorrow?" now answers from the calendar ("🎂 Tyler (turns 34)" proved it
+live on first try).
+Also shipped (2026-07-11, later): **Studio server controls + first live render** — AIOS now
+starts/stops ComfyUI itself (config comfy.dir/python — the shared venv at `~/venv` was
+discovered via ComfyUI's own logs; Start/Free-VRAM/Stop buttons in the Studio header,
+foreign-instance detection, logs at data/comfy/comfyui.log); style presets (anime default,
+painterly, photo) decorating prompts; an "AIOS Anime txt2img" workflow saved into ComfyUI's
+own workflow browser; **comfyui-mcp added to Claude Code** (user scope, npx, connected) so
+Claude sessions can drive ComfyUI directly; fixed a real install bug (venv had comfy-aimdo
+0.3.0, repo pins 0.4.10 → CheckpointLoader crashed with ModelMMAP.get_file_handle). **Live
+end-to-end test passed**: AIOS started ComfyUI (7.5s), the VRAM guard auto-killed the
+launcher's 9B and brought up tiny CPU Qwen (7.8GB freed), SDXL-Lightning rendered an anime
+Pikachu (4 steps), the image landed in the Studio gallery, and Studio-mode-off restored the
+big model. The GUI launcher no longer owns the text LLM.
+Also shipped (2026-07-11): **Studio — ComfyUI phases 0-2** (decisions: SDXL-Lightning first,
+AIOS owns llama.cpp, tiny = Qwen3-1.7B): **downloads** — `sdxl_lightning_4step.safetensors`
+(6.9GB → ComfyUI checkpoints) + `Qwen3-1.7B-Q8_0.gguf` (1.8GB → `data/llm/models/`;
+`~/ai/models` turned out to be root-owned). **server/llmctl.js** — AIOS-managed llama.cpp:
+config-defined profiles (`big` = ornith-9b GPU exactly as the launcher ran it, `tiny` =
+1.7B CPU-only `-ngl 0`), pidfile discipline, detects/replaces "foreign" (GUI-launcher)
+instances, /health-gated startup with log-tail errors. **server/comfy.js** — status probe,
+checkpoint discovery, SDXL-Lightning txt2img template (euler · sgm_uniform · cfg 1 ·
+4/8 steps), job store, ComfyUI-WS progress → AIOS WS relay, output copies under
+`data/comfy/`, `POST /free` after jobs (autoFree), and the **VRAM guard**: generating while
+the big LLM holds the GPU auto-swaps to tiny first (autoSwap). **Studio app** in the dock:
+prompt + checkpoint/size/steps/batch/seed, live progress bar, gallery, ComfyUI ↗ link, and
+a **Studio-mode toggle** (tiny CPU LLM ⇄ big GPU LLM, Comfy unloads first). Agent tools
+`comfy_generate` / `comfy_status`. Service chips for ComfyUI + llama profile. gpu.js
+nvidia-smi wrapper.
+Also shipped (2026-07-11): **suggestions batch 1 (items 1/4/6/8) + ComfyUI plan** —
+**E2E harness in-repo**: `npm run e2e` runs scripts/e2e/*.e2e.mjs (agent-git loop, github
+mock API incl. PR drafting, REST, mail/MIME units, core git/weather/verify units + a
+verify-loop suite) — the mock-provider tests that caught this week's real bugs are now
+permanent. **Push + PR**: `↑n` push chip and `⇄ PR` button in the agent composer — PR
+title/body AI-drafted from branch commits (1600-token budget + generic-subject gate,
+commit-subject fallback), draft-PR checkbox, existing-PR detection; routes
+/git/pr/draft + /git/pr. **Verify v2**: after a clean syntax self-check the agent run now
+executes the project's real test command (package.json test, pytest, Makefile, cargo, go,
+or a `verify:` line in .aios/instructions.md; async + process-group killed, 120s default)
+and failures bounce back exactly like syntax errors — proven by an E2E where the mock
+agent ships a parsing-but-failing bug and fixes it from the bounced test output; Settings →
+Agent toggle. **PWA + responsive**: manifest + passthrough SW + pure-Node-generated PNG
+icons (`npm` dep-free rasterizer in scripts/make-icons.mjs), installable from the pairing
+link; ≤760px the dock becomes a swipeable bottom strip, side panels become ☰-toggled
+off-canvas overlays, planner/diff rails hide, week/month grids side-scroll; Planner and
+GitHub finally added to the dock. **comfyui-plan.md**: machine survey (8GB 3070 Ti, 6.5GB
+held by ornith-9b, ComfyUI 0.25 installed but zero checkpoints), three VRAM strategies
+(recommended: "Studio mode" tiny CPU-only tool-model swap), MCP research (official cloud
+MCP vs artokun local-first for Claude Code), and a 5-phase build plan.
+Also shipped (2026-07-11): **agent diff rail + commit messages that read the diff** — a `±`
+button beside the commit chip expands a third column from the right: per-file working diffs
+(status badge, +/− counts, accordion bodies; untracked files render as additions via
+`--no-index`), auto-refreshing after agent turns and commits; GET /api/projects/:id/git/diff.
+Commit drafting fixed for reasoning models: 1600-token budget (was 220 — the 9B burned it all
+thinking), a method-first prompt with GOOD/BAD examples, unified=2 context, and a
+**generic-subject gate** ("make changes"/"update files" → one stern retry → template
+fallback). Verified live: the 9B produced an accurate multi-bullet message naming each file's
+actual classes/functions.
+Also shipped (2026-07-10): **Home inbox v2 — interactive triage + sender ratings** — looser
+LEAN-IMPORTANT triage prompt (versioned verdict cache re-judges on policy change), NDJSON
+per-line verdicts (truncation-proof for reasoning models; 8-msg batches, 6k output budget,
+per-batch retry, coverage + errors REPORTED in the card, model fallback to any reachable
+provider), JIS-mojibake stripped from headers; **read mail drops off the list**, ★
+message-starred mail (≤10 days) tails it newest-first; rows click into a **mini window**
+(why-it-matters + full body fetched read-only) with **↗ open-in-Gmail** deep links
+(rfc822msgid) on rows + modal; **sender ratings**: ⊘ mute address/domain (never notify
+again), ⚡ star sender (fast-tracked above triage), **3 dismissals auto-mute** a sender —
+all managed under Settings → Mail; Discord pings respect rules; wider inbox rail; the whole
+dashboard self-refreshes every 5 min. Follow-up polish: the email popup is now a **mini mail
+client** — a zero-dep MIME walker (nested multipart, base64/QP, charsets) extracts the real
+text/html part, scripts/handlers stripped, rendered in a big sandboxed iframe (no JS, links
+escape to new tabs, remote images allowed) in a new XL modal size; plain-text mail falls back
+to the text box; Home center widened (3-column launch grid restored next to the wider rails).
 Also shipped (2026-07-10): **GitHub app + research v2 + feature audit** — a full **GitHub
 window** (Overview / Repositories / Pull Requests / Issues): profile with contribution
 **heatmap** (GraphQL calendar, quartile levels), streamed **AI "Suggested next"** card

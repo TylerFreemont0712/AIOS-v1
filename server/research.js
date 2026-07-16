@@ -20,9 +20,9 @@ export const setPublisher = (fn) => { publish = fn; };
 const emit = (id, ev) => publish(`research:${id}`, { t: 'research.event', id, ev });
 
 const DEPTHS = {
-  quick: { rounds: 1, queries: 3, reads: 3 },
-  standard: { rounds: 2, queries: 3, reads: 4 },
-  deep: { rounds: 3, queries: 4, reads: 5 },
+  quick: { rounds: 1, queries: 4, reads: 5 },
+  standard: { rounds: 2, queries: 5, reads: 8 },
+  deep: { rounds: 4, queries: 6, reads: 11 },
 };
 
 // ---------- store ----------
@@ -90,10 +90,12 @@ async function run(r, ctl) {
   // fast cloud models can afford more reading inside the same wall-clock feel;
   // the tight numbers exist for slow local models where every read = an LLM call.
   const fast = provider === 'anthropic';
-  const reads = d.reads + (fast ? 2 : 0);
-  // soft wall-clock budget: always leave time to synthesize, however slow the model.
+  const reads = d.reads + (fast ? 4 : 0);
+  // soft wall-clock budget: always leave time to synthesize, however slow the
+  // model. Generous per-round so a slow local model actually completes its reads
+  // instead of getting cut off after two or three (the old 100s/round did that).
   const started = Date.now();
-  const deadlineMs = d.rounds * (fast ? 150_000 : 100_000);
+  const deadlineMs = d.rounds * (fast ? 240_000 : 180_000);
   const overBudget = () => Date.now() - started > deadlineMs;
   // questions about the current state of things should prefer fresh sources
   const wantsRecent = /\b(latest|newest|current(ly)?|today|right now|this (year|month)|recent|upcoming|best|20(2[5-9]|3\d))\b/i.test(r.question);
@@ -207,8 +209,8 @@ async function run(r, ctl) {
         let note;
         try {
           note = await llm(
-            `Research question: ${r.question}\n\nSource below. Extract every fact relevant to the research question: findings, numbers, dates, names, definitions, direct claims, pros/cons. Quote key phrases. Be generous — if it has ANY relevant information, capture it. Only output exactly IRRELEVANT if the source is truly off-topic, an error page, or spam.\nOutput format: 3-10 terse bullet points, no introduction.\n\nSOURCE (${c.url}):\n${material}`,
-            { maxTokens: 1024 });
+            `Research question: ${r.question}\n\nSource below. Extract every fact relevant to the research question: findings, numbers, dates, names, definitions, direct claims, pros/cons. Quote key phrases. Be generous — if it has ANY relevant information, capture it. Only output exactly IRRELEVANT if the source is truly off-topic, an error page, or spam.\nOutput format: 4-12 terse bullet points, no introduction.\n\nSOURCE (${c.url}):\n${material}`,
+            { maxTokens: 1500 });
         } catch (e) { emit(r.id, { type: 'note', n, url: c.url, skipped: `model error: ${e.message}` }); continue; }
         if (!note.trim() || /^\s*IRRELEVANT\s*$/m.test(note.slice(0, 40))) {
           emit(r.id, { type: 'note', n, url: c.url, skipped: 'irrelevant' });
@@ -246,8 +248,8 @@ async function run(r, ctl) {
     phase('writing');
     const subsBlock = r.subs?.length ? `\nSub-questions to answer (one section each):\n${r.subs.map(s => `- ${s}`).join('\n')}\n` : '';
     const report = await llm(
-      `Research question: ${r.question}\n${subsBlock}\nNotes from ${r.sources.length} sources (each has a citation number):\n${clip(notesBlock(r), notesCap)}\n\nWrite a markdown report that DIRECTLY answers the research question for a technically literate reader.\nRules:\n- Begin with "## Answer" — 3-6 sentences that answer the question head-on, with the single most important takeaway in **bold**. No throat-clearing, no "it depends" without immediately saying on what.\n- Then one "## <short heading>" section per sub-question${r.subs?.length ? '' : ' (infer sensible sub-questions from the question)'}, answering it from the notes.\n- If the question compares options, include a compact markdown comparison table.\n- Cite sources inline with their numbers like [1] or [2][5] after each claim.\n- End with "## Open questions" ONLY if real gaps or contradictions remain — name what conflicts.\n- Use ONLY the notes above — do not invent facts or citations.\n- No preamble before the first heading.`,
-      { stream: true, maxTokens: 4096, onReason: think });
+      `Research question: ${r.question}\n${subsBlock}\nNotes from ${r.sources.length} sources (each has a citation number):\n${clip(notesBlock(r), notesCap)}\n\nWrite a thorough, substantive markdown report that DIRECTLY answers the research question for a technically literate reader. Use the depth of the notes — this should read like a briefing, not a summary.\nRules:\n- Begin with "## Answer" — 3-6 sentences that answer the question head-on, with the single most important takeaway in **bold**. No throat-clearing, no "it depends" without immediately saying on what.\n- Then one "## <short heading>" section per sub-question${r.subs?.length ? '' : ' (infer sensible sub-questions from the question)'}, each 2-4 paragraphs that develop the specifics — concrete facts, numbers, names, tradeoffs, and disagreements from the notes, not vague generalities.\n- If the question compares options, include a compact markdown comparison table.\n- Cite sources inline with their numbers like [1] or [2][5] after each claim.\n- End with "## Open questions" ONLY if real gaps or contradictions remain — name what conflicts.\n- Use ONLY the notes above — do not invent facts or citations, but do synthesize across sources.\n- No preamble before the first heading.`,
+      { stream: true, maxTokens: fast ? 8000 : 5000, onReason: think });
 
     r.report = report.trim() + '\n\n## Sources\n' + r.sources.map(s => `${s.n}. [${s.title}](${s.url})`).join('\n');
     r.status = 'done';

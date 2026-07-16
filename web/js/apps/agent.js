@@ -43,10 +43,16 @@ export default {
     ui.attach = el('button', { class: 'btn sm ghost attach-btn', title: 'Attach image, PDF, or file', onclick: () => ui.file.click() }, icon('paperclip'));
 
     ui.git = el('button', { class: 'btn sm ghost git-chip', style: { display: 'none' }, onclick: () => gitClick() });
+    ui.diffBtn = el('button', {
+      class: 'btn sm ghost git-chip', style: { display: 'none' }, title: 'Show working diff (per-file)',
+      onclick: () => toggleDiffRail(),
+    }, '±');
+    ui.push = el('button', { class: 'btn sm ghost git-chip', style: { display: 'none' }, onclick: () => pushBranch() });
+    ui.pr = el('button', { class: 'btn sm ghost git-chip', style: { display: 'none' }, title: 'Open a pull request for this branch', onclick: () => prModal() }, '⇄ PR');
 
     const box = el('div', { class: 'composer-box' }, ui.tray.node, ui.input,
       el('div', { class: 'composer-row' },
-        ui.attach, ui.git,
+        ui.attach, ui.git, ui.diffBtn, ui.push, ui.pr,
         el('span', { class: 'muted small' }, 'working in ', ui.cwd = el('span', { class: 'mono' }, state.project?.name || '—')),
         el('span', { class: 'grow' }), ui.send));
     const composer = el('div', { class: 'composer' }, box, ui.file);
@@ -59,7 +65,11 @@ export default {
       if (files.length) { e.preventDefault(); ui.tray.add(files); }
     });
 
-    body.append(el('div', { class: 'app-cols' }, side, el('div', { class: 'main-pane' }, ui.head, ui.events, el('div', { style: { padding: '0 18px' } }, ui.status), composer)));
+    ui.diffRail = el('div', { class: 'diff-rail', style: { display: 'none' } });
+    body.append(el('div', { class: 'app-cols' },
+      side,
+      el('div', { class: 'main-pane' }, ui.head, ui.events, el('div', { style: { padding: '0 18px' } }, ui.status), composer),
+      ui.diffRail));
 
     S.offs.push(on('project', () => {
       ui.head.querySelector('.ttl').textContent = projectLabel();
@@ -81,9 +91,19 @@ export default {
     let gitInfo = null;
     async function refreshGit() {
       gitInfo = null;
-      if (!state.project) { ui.git.style.display = 'none'; return; }
+      if (!state.project) { ui.git.style.display = 'none'; ui.diffBtn.style.display = 'none'; toggleDiffRail(false); return; }
       try { gitInfo = await get(`/projects/${state.project.id}/git`); } catch { }
-      if (!gitInfo?.git) { ui.git.style.display = 'none'; return; }
+      if (!gitInfo?.git) { ui.git.style.display = 'none'; ui.diffBtn.style.display = 'none'; return; }
+      ui.diffBtn.style.display = gitInfo.repo ? '' : 'none';
+      if (!gitInfo.repo) toggleDiffRail(false);
+      // push: remote exists and there's something the remote doesn't have
+      const onWorkBranch = gitInfo.repo && !['main', 'master', '?'].includes(gitInfo.branch);
+      const needsPush = !!gitInfo.remote && gitInfo.hasCommits && (!gitInfo.hasUpstream || gitInfo.ahead > 0);
+      ui.push.style.display = needsPush ? '' : 'none';
+      ui.push.innerHTML = '';
+      ui.push.append(`↑${gitInfo.ahead || ''}`.trim());
+      ui.push.title = gitInfo.hasUpstream ? `Push ${gitInfo.ahead} commit(s) to origin/${gitInfo.branch}` : `Push ${gitInfo.branch} to origin (sets upstream)`;
+      ui.pr.style.display = onWorkBranch && gitInfo.remote && /github\.com/.test(gitInfo.remote) ? '' : 'none';
       ui.git.style.display = '';
       ui.git.innerHTML = '';
       ui.git.classList.toggle('dirty', !!(gitInfo.repo && gitInfo.dirty));
@@ -96,6 +116,109 @@ export default {
           ? `${gitInfo.dirty} uncommitted change(s) on ${gitInfo.branch} — click to commit`
           : `On ${gitInfo.branch} — working tree clean`;
       }
+    }
+
+    // ---------- diff rail: the working tree's per-file diffs, one glance away ----------
+
+    function toggleDiffRail(force) {
+      S.diffOpen = force !== undefined ? force : !S.diffOpen;
+      ui.diffRail.style.display = S.diffOpen ? '' : 'none';
+      ui.diffBtn.classList.toggle('on', S.diffOpen);
+      if (S.diffOpen) refreshDiffRail();
+    }
+
+    async function refreshDiffRail() {
+      if (!S.diffOpen || !state.project) return;
+      ui.diffRail.innerHTML = '';
+      ui.diffRail.append(el('div', { class: 'empty', style: { minHeight: '80px' } }, el('span', { class: 'spinner' })));
+      let d = null;
+      try { d = await get(`/projects/${state.project.id}/git/diff`); }
+      catch (e) {
+        ui.diffRail.innerHTML = '';
+        ui.diffRail.append(el('div', { class: 'rail-head', style: { padding: '10px 12px' } },
+          el('span', { class: 'rail-title' }, 'Working diff'), el('span', { class: 'grow' }),
+          el('button', { class: 'btn sm ghost', onclick: () => toggleDiffRail(false) }, '×')),
+          el('div', { class: 'muted small', style: { padding: '4px 12px' } }, e.message));
+        return;
+      }
+      ui.diffRail.innerHTML = '';
+      ui.diffRail.append(el('div', { class: 'rail-head', style: { padding: '10px 12px 6px' } },
+        el('span', { class: 'rail-title' }, `Working diff · ${d.dirty} file${d.dirty === 1 ? '' : 's'}`),
+        el('span', { class: 'grow' }),
+        el('button', { class: 'btn sm ghost', title: 'Refresh', onclick: refreshDiffRail }, icon('refresh')),
+        el('button', { class: 'btn sm ghost', title: 'Close', onclick: () => toggleDiffRail(false) }, '×')));
+      if (!d.files.length) {
+        ui.diffRail.append(el('div', { class: 'muted small', style: { padding: '4px 12px' } }, `working tree clean on ${d.branch}`));
+        return;
+      }
+      for (const f of d.files) {
+        const lines = (f.diff || '').split('\n');
+        const adds = lines.filter(l => l.startsWith('+') && !l.startsWith('+++')).length;
+        const dels = lines.filter(l => l.startsWith('-') && !l.startsWith('---')).length;
+        const bodyEl = el('div', { class: 'diff-file-body', style: { display: 'none' } },
+          f.binary ? el('div', { class: 'muted small', style: { padding: '4px 8px' } }, 'binary file') : diffEl(f.diff || '(no diff)'));
+        const head = el('div', {
+          class: 'diff-file-head',
+          onclick: () => { bodyEl.style.display = bodyEl.style.display === 'none' ? '' : 'none'; head.classList.toggle('open'); },
+        },
+          el('span', { class: 'diff-file-status s-' + (f.s === '??' ? 'new' : f.s[0] === 'D' ? 'del' : 'mod') }, f.s === '??' ? 'A' : f.s[0]),
+          el('span', { class: 'diff-file-path mono' }, f.path),
+          el('span', { class: 'grow' }),
+          el('span', { class: 'diff-counts' },
+            adds ? el('span', { class: 'd-add' }, `+${adds}`) : null, ' ',
+            dels ? el('span', { class: 'd-del' }, `−${dels}`) : null));
+        ui.diffRail.append(el('div', { class: 'diff-file' }, head, bodyEl));
+      }
+      // a single changed file might as well open itself
+      if (d.files.length === 1) ui.diffRail.querySelector('.diff-file-head')?.click();
+    }
+
+    async function pushBranch() {
+      if (!state.project) return;
+      ui.push.disabled = true;
+      try {
+        const r = await post(`/projects/${state.project.id}/git/publish`, {});
+        toast(`pushed ${r.branch} ↗`, 'ok');
+      } catch (e) { toast(e.message, 'err'); }
+      ui.push.disabled = false;
+      refreshGit();
+    }
+
+    async function prModal() {
+      if (!state.project) return;
+      ui.pr.disabled = true;
+      let d = null;
+      try { d = await post(`/projects/${state.project.id}/git/pr/draft`, { modelRef: ui.model.getValue() }); }
+      catch (e) { toast(e.message, 'err'); ui.pr.disabled = false; return; }
+      ui.pr.disabled = false;
+      const title = el('input', { class: 'input', value: d.title, style: { width: '100%' } });
+      const bodyTa = el('textarea', { class: 'input mono', rows: 9, style: { width: '100%', fontSize: '12px' } });
+      bodyTa.value = d.body || '';
+      const draftCb = el('input', { type: 'checkbox' });
+      await modal({
+        title: `Pull request · ${d.branch} → ${d.base}`, wide: true,
+        sub: d.generated ? 'AI-drafted from the branch commits — edit freely' : 'drafted from commit subjects — edit freely',
+        body: el('div', { class: 'col', style: { gap: '8px', marginTop: '8px' } },
+          title, bodyTa,
+          el('label', { class: 'row small muted', style: { gap: '6px' } }, draftCb, 'open as draft PR')),
+        actions: [
+          { label: 'Cancel', value: null },
+          {
+            label: 'Push & create PR', kind: 'primary',
+            onpick: async (close) => {
+              if (!title.value.trim()) { toast('title is required', 'err'); return false; }
+              try {
+                const r = await post(`/projects/${state.project.id}/git/pr`, { title: title.value.trim(), body: bodyTa.value, draft: draftCb.checked });
+                toast(r.existing ? `PR #${r.number} already open ↗` : `PR #${r.number} created ↗`, 'ok');
+                window.open(r.url, '_blank', 'noreferrer');
+                close('done');
+                refreshGit();
+              } catch (e) { toast(e.message, 'err'); }
+              return false;
+            },
+          },
+        ],
+      });
     }
 
     async function gitClick() {
@@ -137,6 +260,7 @@ export default {
               try {
                 const r = await post(`/projects/${state.project.id}/git/commit`, { message });
                 toast(`committed ${r.hash}`, 'ok'); close('done'); refreshGit();
+                if (S.diffOpen) refreshDiffRail();
               } catch (e) { toast(e.message, 'err'); }
               return false;
             },
@@ -251,8 +375,9 @@ export default {
       card.bodyEl.append(el('pre', {}, content || '(no output)'));
     }
 
-    const iconFor = (name) => name.startsWith('git_') ? 'git'
-      : ({ bash: 'terminal', read_file: 'file', write_file: 'save', edit_file: 'edit', list_dir: 'folder', glob: 'search', grep: 'search', delete_path: 'trash', move_path: 'files', fetch_url: 'network', web_search: 'globe', skill: 'star', vault_search: 'vault', vault_list: 'vault', vault_read: 'vault', vault_write: 'vault', vault_append: 'vault' }[name] || 'code');
+    const iconFor = (name) => name.startsWith('git_') ? 'git' : name.startsWith('comfy_') ? 'image'
+      : name.startsWith('mail_') ? 'send' : name.startsWith('wiki_') ? 'vault'
+        : ({ bash: 'terminal', read_file: 'file', write_file: 'save', edit_file: 'edit', list_dir: 'folder', glob: 'search', grep: 'search', delete_path: 'trash', move_path: 'files', fetch_url: 'network', web_search: 'globe', skill: 'star', vault_search: 'vault', vault_list: 'vault', vault_read: 'vault', vault_write: 'vault', vault_append: 'vault', agenda_view: 'daily', task_add: 'daily', event_add: 'daily', research_start: 'research', research_status: 'research', mindmap_generate: 'mindmap' }[name] || 'code');
 
     function summarizeArgs(name, args = {}) {
       if (name === 'bash') return args.command || '';
@@ -289,6 +414,13 @@ export default {
             ev.failed
               ? `self-check: ${ev.failed} of ${ev.checked} changed file${ev.checked > 1 ? 's' : ''} still failing — sending back (round ${ev.round})`
               : `self-check: all ${ev.checked} changed file${ev.checked > 1 ? 's' : ''} parse clean`));
+          scrollDown();
+          break;
+        case 'test.report':
+          ui.events.append(el('div', { class: 'check-line' + (ev.ok ? '' : ' bad') }, icon('play'),
+            ev.ok
+              ? `tests: PASS — ${ev.cmd} (${(ev.ms / 1000).toFixed(1)}s)`
+              : `tests: FAIL — ${ev.cmd} (${(ev.ms / 1000).toFixed(1)}s) — sending back (round ${ev.round})`));
           scrollDown();
           break;
         case 'status':
@@ -332,7 +464,7 @@ export default {
         }
         case 'approval.request': approvalCard(ev); scrollDown(true); break;
         case 'approval.resolved': document.querySelector(`[data-approval="${ev.callId}"]`)?.remove(); break;
-        case 'turn.done': paintUsage(ev.usage); setRunning(false); refreshList(); refreshGit(); break;
+        case 'turn.done': paintUsage(ev.usage); setRunning(false); refreshList(); refreshGit(); if (S.diffOpen) refreshDiffRail(); break;
         case 'error': toast(ev.message, 'err'); ui.events.append(el('div', { class: 'muted small', style: { marginBottom: '10px' } }, '⚠ ' + ev.message)); setRunning(false); break;
       }
     }

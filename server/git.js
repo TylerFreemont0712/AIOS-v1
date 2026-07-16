@@ -57,17 +57,33 @@ export function gitInfo(root) {
   let ahead = 0, behind = 0;
   const lr = sync(root, ['rev-list', '--left-right', '--count', '@{upstream}...HEAD']);
   if (lr) { const [b, a] = lr.split(/\s+/).map(Number); behind = b || 0; ahead = a || 0; }
+  const hasUpstream = lr !== null;
   // origin URL with any embedded credentials stripped — safe to show in the UI
   const remote = (sync(root, ['remote', 'get-url', 'origin']) || '').replace(/\/\/[^@/]*@/, '//');
   return {
     git: true, repo: true, branch, detached: branch === 'HEAD',
     dirty: lines.length,
     files: lines.slice(0, 40).map(l => ({ s: l.slice(0, 2).trim() || '??', path: l.slice(3) })),
-    hasCommits: !!lastCommit, lastCommit, ahead, behind, remote,
+    hasCommits: !!lastCommit, lastCommit, ahead, behind, hasUpstream, remote,
   };
 }
 
-/** One-line summary for the agent system prompt. */
+/** Commits on this branch that the base branch doesn't have (for PR drafting). */
+export function branchCommits(root, base) {
+  const log = sync(root, ['log', `${base}..HEAD`, '--format=%s']) || '';
+  return log.split('\n').filter(Boolean);
+}
+
+/** The local default branch a PR would target: main, else master. */
+export function defaultBase(root) {
+  for (const b of ['main', 'master']) if (sync(root, ['rev-parse', '--verify', '--quiet', b]) !== null) return b;
+  return 'main';
+}
+
+/** One-line summary for the agent system prompt. Intentionally NOT memoized —
+ *  it's rebuilt every loop turn precisely so branch/dirty state stays live
+ *  (git_branch mid-run must show up next turn). The ~5 git subprocesses are
+ *  negligible next to the LLM call that dominates each turn. */
 export function promptContext(root) {
   try {
     if (!hasGit()) return '';
@@ -102,12 +118,34 @@ export function cleanBranchName(name) {
   return n.slice(0, 60);
 }
 
+/** Untracked directories that are themselves git repos. `git add -A` on one either
+ *  fails outright ("'dir/' does not have a commit checked out" when the inner repo has
+ *  no commits) or silently records a gitlink — a submodule entry with no .gitmodules,
+ *  which breaks every future clone. Both are traps, so we name them instead of letting
+ *  git's cryptic error (or silent success) through. */
+export function nestedRepos(root) {
+  const porcelain = sync(root, ['status', '--porcelain']) ?? '';
+  const out = [];
+  for (const line of porcelain.split('\n')) {
+    if (!line.startsWith('??')) continue;
+    const p = line.slice(3).replace(/\/$/, '');
+    try { if (fs.existsSync(path.join(root, p, '.git'))) out.push(p); } catch { }
+  }
+  return out;
+}
+
 /** Stage everything and commit. Returns { hash, message, stat }. */
 export async function gitCommit(root, { message } = {}) {
   message = String(message || '').trim();
   if (!message) throw err('commit message is required');
   if (!isRepo(root)) throw err('not a git repository');
   await ensureIdentity(root);
+  const nested = nestedRepos(root);
+  if (nested.length) {
+    throw err(`can't stage everything: ${nested.map(n => `"${n}/"`).join(', ')} ${nested.length > 1 ? 'are' : 'is a'} git repo${nested.length > 1 ? 's' : ''} nested inside this one. ` +
+      `Git would fail or record a broken submodule. Fix one of three ways: delete the inner .git folder (keeps the files in THIS repo), ` +
+      `move the folder out of the project, or add "${nested[0]}/" to .gitignore.`);
+  }
   const a = await runGit(root, ['add', '-A']);
   if (a.code !== 0) throw err('git add failed: ' + a.out.trim(), 500);
   if (!sync(root, ['diff', '--cached', '--name-only'])) throw err('nothing to commit — working tree clean');
@@ -127,6 +165,32 @@ export function statPreview(root) {
   if (!info.dirty) return null;
   const stat = info.hasCommits ? sync(root, ['diff', 'HEAD', '--stat']) : null;
   return stat || info.files.map(f => `${f.s} ${f.path}`).join('\n');
+}
+
+const DIFF_FILE_CAP = 60_000;
+
+/** Per-file unified diffs of everything uncommitted (the diff-rail's payload).
+ *  Untracked files render as all-additions via --no-index against /dev/null. */
+export async function workingDiff(root) {
+  if (!isRepo(root)) throw err('not a git repository');
+  const info = gitInfo(root);
+  const files = [];
+  for (const f of info.files) {
+    const p = f.path.includes(' -> ') ? f.path.split(' -> ')[1] : f.path;   // renames: diff the new side
+    let r;
+    if (f.s === '??') {
+      // --no-index exits 1 when the files differ — that's success here
+      r = await runGit(root, ['diff', '--no-index', '--', '/dev/null', p]);
+      if (r.code !== 0 && r.code !== 1) r = { code: 0, out: '' };
+    } else {
+      r = await runGit(root, info.hasCommits ? ['diff', 'HEAD', '--', p] : ['diff', '--', p]);
+    }
+    let diff = (r.out || '').trim();
+    const binary = /^Binary files /m.test(diff) || (!diff && f.s !== '??');
+    if (diff.length > DIFF_FILE_CAP) diff = diff.slice(0, DIFF_FILE_CAP) + '\n… (diff truncated)';
+    files.push({ path: f.path, s: f.s, diff, binary });
+  }
+  return { branch: info.branch, dirty: info.dirty, files };
 }
 
 // ---------- commit message generation ----------
@@ -154,7 +218,7 @@ export function cleanMessage(text) {
 function changesText(root, info, cap) {
   const base = info.hasCommits ? ['diff', 'HEAD'] : ['diff'];
   const stat = (sync(root, [...base, '--stat']) || '').slice(0, 2000);
-  let patch = (sync(root, [...base, '--unified=1']) || '');
+  let patch = (sync(root, [...base, '--unified=2']) || '');
   let extra = '';
   // untracked files never show in diff — include their heads so the model knows what they are
   for (const f of info.files.filter(f => f.s === '??').slice(0, 6)) {
@@ -170,6 +234,14 @@ function changesText(root, info, cap) {
   return `${stat}\n\n${patch}${extra}`;
 }
 
+/** A subject that describes nothing — reject and retry rather than commit it. */
+export const isGenericSubject = (subject) => {
+  const s = String(subject || '').replace(/^(feat|fix|chore|refactor|docs|test|style|perf)[:!]?\s*/i, '').trim();
+  if (s.length < 8) return true;
+  return /^(update|change|modify|edit|improve|fix)e?s?\b[\s\w]{0,14}$/i.test(s)
+    || /need to|some (changes|updates|fixes)|various (changes|fixes)|make (a )?changes?|^wip\b|misc\b/i.test(s);
+};
+
 /** Draft a commit message from the working-tree diff; template fallback without a model. */
 export async function commitMessage(root, { modelRef } = {}) {
   if (!isRepo(root)) throw err('not a git repository');
@@ -179,13 +251,19 @@ export async function commitMessage(root, { modelRef } = {}) {
   const ref = modelRef || cfg.defaults.agentModel || cfg.defaults.chatModel;
   if (!ref) return { message: templateMessage(info), generated: false };
 
-  const { inputChars } = contextBudget({ modelRef: ref, wantOutput: 300 });
-  const cap = Math.max(2000, Math.min(inputChars - 1200, 24_000));
-  const prompt = `Write a git commit message for these changes.
+  const { inputChars } = contextBudget({ modelRef: ref, wantOutput: 1600 });
+  const cap = Math.max(2000, Math.min(inputChars - 1600, 24_000));
+  const prompt = (nudge = '') => `Write a git commit message for the diff below.${nudge}
+
+Method: read the diff, identify WHAT actually changed in each file and WHY it matters, then write the message about those specifics.
 
 Format:
-- Line 1: imperative subject, at most 70 chars, with a conventional-commit prefix when it fits (feat:/fix:/refactor:/docs:/chore:/test:)
-- Optionally a blank line, then 1-3 short "- " bullets for the why/what that doesn't fit the subject.
+- Line 1: imperative subject ≤ 70 chars naming the MAIN concrete change, with a conventional-commit prefix when it fits (feat:/fix:/refactor:/docs:/chore:/test:).
+- Then a blank line and 1-4 "- " bullets: one per significant change, each naming the file/area and the specific behavior added, removed, or fixed.
+
+BAD (rejected): "chore: make changes", "fix: update files", "need to make a change"
+GOOD: "feat: add sender mute rules to inbox triage" with bullets like "- mail.js: block/star rules by address or domain, checked in notifications()"
+
 Output ONLY the commit message — no fences, no quotes, no commentary.
 
 Branch: ${info.branch}
@@ -193,13 +271,17 @@ Branch: ${info.branch}
 ${changesText(root, info, cap)}`;
 
   try {
-    const res = await streamChat({
-      modelRef: ref, maxTokens: 220,
-      system: 'You write excellent git commit messages. Output only the message itself.',
-      messages: [{ role: 'user', text: prompt }],
-    });
-    const msg = cleanMessage(res.text);
-    if (msg) return { message: msg, generated: true };
+    // reasoning models spend most tokens thinking before the first message line —
+    // give them room, and reject content-free subjects with one retry
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await streamChat({
+        modelRef: ref, maxTokens: 1600,
+        system: 'You write excellent, specific git commit messages. Think briefly if you must, then output only the message itself.',
+        messages: [{ role: 'user', text: prompt(attempt ? '\nThe previous draft was too vague — name the actual files and behaviors from the diff.' : '') }],
+      });
+      const msg = cleanMessage(res.text);
+      if (msg && !isGenericSubject(msg.split('\n')[0])) return { message: msg, generated: true };
+    }
   } catch { /* fall through to template */ }
   return { message: templateMessage(info), generated: false };
 }

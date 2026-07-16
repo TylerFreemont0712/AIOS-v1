@@ -120,9 +120,18 @@ export default {
               el('span', { class: 'mono' }, state.project.name),
               gitState?.repo ? el('span', { class: 'chip' }, `⎇ ${gitState.branch}${gitState.dirty ? ` · ${gitState.dirty}±` : ''}`) : el('span', { class: 'chip' }, 'no git repo')),
             gitState?.remote
-              ? el('div', { class: 'row', style: { gap: '8px' } },
+              ? el('div', { class: 'row', style: { gap: '8px', flexWrap: 'wrap' } },
                 extLink(gitState.remote.replace(/\.git$/, ''), 'view on GitHub ↗'),
-                el('button', { class: 'btn sm', onclick: () => publishFlow(true) }, 'Push current branch'))
+                el('button', {
+                  class: 'btn sm' + (gitState.ahead ? ' primary' : ''),
+                  title: gitState.ahead ? `${gitState.ahead} local commit(s) the remote doesn't have` : 'push the current branch',
+                  onclick: () => syncFlow('push'),
+                }, `Push${gitState.ahead ? ` (${gitState.ahead})` : ''}`),
+                el('button', {
+                  class: 'btn sm' + (gitState.behind ? ' primary' : ''),
+                  title: gitState.behind ? `${gitState.behind} remote commit(s) you don't have — rebase + autostash` : 'pull with rebase + autostash',
+                  onclick: () => syncFlow('pull'),
+                }, `Pull${gitState.behind ? ` (${gitState.behind})` : ''}`))
               : el('div', { class: 'row' },
                 el('button', { class: 'btn sm primary', onclick: () => publishFlow(false) }, icon('github'), 'Publish to GitHub'),
                 el('span', { class: 'muted small' }, gitState?.repo ? 'creates the repo and pushes this branch' : 'init → commit → create repo → push'))));
@@ -218,16 +227,20 @@ export default {
 
     const stat = (num, lbl) => el('span', { class: 'small' }, el('b', {}, String(num ?? 0)), ' ', el('span', { class: 'muted' }, lbl));
 
+    /** Plain push/pull for an already-published repo — the publish flow (repo creation,
+     *  auto-commit) stays separate so a stray click can never create repos or commits. */
+    async function syncFlow(kind) {
+      if (!state.project) return;
+      try {
+        const r = await post(`/projects/${state.project.id}/git/${kind}`, {});
+        toast(kind === 'push' ? `pushed ${r.branch} ↗` : `pulled origin into ${r.branch} ↙`, 'ok');
+        delete S.cache.overview; render();
+      } catch (e) { toast(e.message, 'err'); }
+    }
+
     async function publishFlow(pushOnly) {
       if (!state.project) return;
-      if (pushOnly) {
-        try {
-          const r = await post(`/projects/${state.project.id}/git/publish`, {});
-          toast(`pushed ${r.branch} ↗`, 'ok');
-          delete S.cache.overview; render();
-        } catch (e) { toast(e.message, 'err'); }
-        return;
-      }
+      if (pushOnly) { return syncFlow('push'); }
       const f = {
         name: el('input', { class: 'input', value: state.project.name.replace(/[^A-Za-z0-9._-]+/g, '-') }),
         desc: el('input', { class: 'input', placeholder: 'description (optional)' }),

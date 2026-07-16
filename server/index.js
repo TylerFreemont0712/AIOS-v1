@@ -26,6 +26,7 @@ import * as vault from './vault.js';
 import * as wiki from './wiki.js';
 import * as forge from './toolforge.js';
 import * as mindmap from './mindmap.js';
+import * as learn from './learn.js';
 import * as term from './terminal.js';
 import * as research from './research.js';
 import * as mail from './mail.js';
@@ -34,6 +35,9 @@ import * as planner from './planner.js';
 import * as weather from './weather.js';
 import * as git from './git.js';
 import * as github from './github.js';
+import * as comfy from './comfy.js';
+import * as llmctl from './llmctl.js';
+import { gpuStats } from './gpu.js';
 
 const cfg = loadConfig();
 fs.mkdirSync(DATA, { recursive: true });
@@ -146,10 +150,15 @@ const projRoot = (id) => {
   return p.path;
 };
 app.get('/api/projects/:id/git', h(req => git.gitInfo(projRoot(req.params.id))));
+app.get('/api/projects/:id/git/diff', h(req => git.workingDiff(projRoot(req.params.id))));
 app.post('/api/projects/:id/git/init', h(req => git.gitInit(projRoot(req.params.id))));
 app.post('/api/projects/:id/git/message', h(req => git.commitMessage(projRoot(req.params.id), { modelRef: req.body?.modelRef })));
 app.post('/api/projects/:id/git/commit', h(req => git.gitCommit(projRoot(req.params.id), { message: req.body?.message })));
 app.post('/api/projects/:id/git/publish', h(req => github.publishProject(projRoot(req.params.id), req.body || {})));
+app.post('/api/projects/:id/git/push', h(req => github.gitPush(projRoot(req.params.id))));
+app.post('/api/projects/:id/git/pull', h(req => github.gitPull(projRoot(req.params.id))));
+app.post('/api/projects/:id/git/pr/draft', h(req => github.draftPR(projRoot(req.params.id), { modelRef: req.body?.modelRef })));
+app.post('/api/projects/:id/git/pr', h(req => github.openPR(projRoot(req.params.id), req.body || {})));
 
 // ---------- github ----------
 
@@ -215,6 +224,8 @@ app.get('/api/uploads/:id', (req, res) => {
 
 // ---------- chat ----------
 
+// what the chat/agent currently "knows" about your day — for transparency + testing
+app.get('/api/chat/context', h(async () => ({ context: (await import('./context.js')).appContext() })));
 app.get('/api/chats', h(() => chat.listChats()));
 app.post('/api/chats', h(req => chat.createChat(req.body || {})));
 app.get('/api/chats/:id', h(req => chat.getChat(req.params.id)));
@@ -257,7 +268,10 @@ registerService({
 app.get('/api/mail/status', h(() => mail.mailStatus()));
 app.post('/api/mail/scan', h(req => mail.scanMail({ modelRef: req.body?.modelRef })));
 app.get('/api/mail/notifications', h(() => mail.notifications()));
-app.post('/api/mail/dismiss', h(req => { mail.dismiss(String(req.body?.id || '')); }));
+app.get('/api/mail/message/:uid', h(req => mail.readMessage(Number(req.params.uid))));
+app.post('/api/mail/dismiss', h(req => mail.dismiss(String(req.body?.id || ''))));
+app.get('/api/mail/senders', h(() => mail.listSenderRules()));
+app.post('/api/mail/sender', h(req => mail.setSenderRule(req.body || {})));
 app.post('/api/notify/test', h(() => notify.sendDiscord('🔔 AIOS test notification — Discord is wired up.')));
 
 // ---------- planner ----------
@@ -290,7 +304,99 @@ app.post('/api/planner/reminders/:id/log', h(req => {
 app.get('/api/weather', h(() => weather.getWeather()));
 app.get('/api/weather/geocode', h(req => weather.geocode(req.query.q)));
 
-// ---------- mindmaps ----------
+// ---------- studio (ComfyUI) + managed llama.cpp ----------
+
+registerService({
+  id: 'comfy', name: 'ComfyUI', group: 'Studio', settingsTab: 'about',
+  probe: async () => {
+    const s = await comfy.comfyPing();
+    if (!s.up) return { status: 'off', detail: 'not running' };
+    return { status: 'up', detail: s.vramFreeMB ? `${s.vramFreeMB}MB VRAM free` : 'up' };
+  },
+});
+registerService({
+  id: 'llm-profile', name: 'llama.cpp', group: 'Models', settingsTab: 'providers',
+  probe: async () => {
+    const s = llmctl.llmStatus();
+    if (s.running) return { status: 'up', detail: `profile: ${s.profile}` };
+    if (s.foreign) return { status: 'warn', detail: 'running (not AIOS-managed yet)' };
+    return { status: 'off', detail: 'stopped' };
+  },
+});
+app.get('/api/comfy/status', h(() => comfy.comfyStatus()));
+app.get('/api/comfy/checkpoints', h(() => comfy.listCheckpoints()));
+app.get('/api/comfy/upscalers', h(() => comfy.listUpscalers()));
+app.post('/api/comfy/generate', h(req => comfy.generate(req.body || {})));
+app.get('/api/comfy/jobs', h(() => comfy.listJobs()));
+app.get('/api/comfy/jobs/:id', h(req => comfy.getJob(req.params.id)));
+// plain handler: h() would race sendFile (same latent bug as /api/uploads/:id)
+app.get('/api/comfy/image/:name', (req, res) => {
+  try { res.sendFile(comfy.imagePath(req.params.name)); }
+  catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+app.post('/api/comfy/studio', h(req => comfy.setStudio(!!req.body?.on)));
+app.post('/api/comfy/start', h(() => comfy.startComfy()));
+app.post('/api/comfy/stop', h(() => comfy.stopComfy()));
+app.post('/api/comfy/free', h(() => comfy.freeVram()));
+app.get('/api/comfy/plan', h(req => comfy.samplingPlan(String(req.query.checkpoint || ''), Number(req.query.steps) || 8, String(req.query.accel || 'quality'))));
+app.post('/api/comfy/expand', h(req => comfy.expandPrompt(req.body || {})));
+app.get('/api/llm/status', h(() => ({ ...llmctl.llmStatus(), gpu: gpuStats() })));
+app.post('/api/llm/profile', h(req => llmctl.startProfile(String(req.body?.profile || ''))));
+app.post('/api/llm/launcher', h(() => llmctl.openLauncher()));
+
+// ---------- learning corner ----------
+
+app.get('/api/learn', h(() => learn.listSubjects()));
+app.post('/api/learn', h(req => learn.createSubject(req.body || {})));
+app.get('/api/learn/:id', h(req => learn.getSubject(req.params.id)));
+app.patch('/api/learn/:id', h(req => learn.updateSubject(req.params.id, req.body || {})));
+app.delete('/api/learn/:id', h(req => { learn.deleteSubject(req.params.id); }));
+app.post('/api/learn/:id/roadmap', h(req => learn.generateRoadmap({ id: req.params.id, modelRef: req.body?.modelRef })));
+app.post('/api/learn/:id/lesson', h(req => learn.generateLesson({ id: req.params.id, moduleId: req.body?.moduleId, focus: req.body?.focus, review: req.body?.review, modelRef: req.body?.modelRef })));
+app.post('/api/learn/:id/modules/:mid', h(req => learn.setModuleDone(req.params.id, req.params.mid, !!req.body?.done)));
+app.post('/api/learn/:id/lessons/:lid', h(req => learn.setLessonDone(req.params.id, req.params.lid, req.body?.done !== false)));
+
+// lesson content is fetched on demand — the subject payload carries metadata only
+app.get('/api/learn/:id/lessons/:lid', h(req => learn.getLesson(req.params.id, req.params.lid)));
+app.delete('/api/learn/:id/lessons/:lid', h(req => learn.deleteLesson(req.params.id, req.params.lid)));
+
+// regenerate a lesson IN PLACE (same slot/id), with revision history to fall back on
+app.post('/api/learn/:id/lessons/:lid/regenerate', h(req => learn.regenerateLesson({
+  id: req.params.id, lessonId: req.params.lid,
+  instructions: req.body?.instructions, focus: req.body?.focus,
+  useWeb: req.body?.useWeb, modelRef: req.body?.modelRef,
+})));
+app.post('/api/learn/:id/lessons/:lid/recheck', h(req => learn.recheckLesson(req.params.id, req.params.lid)));
+app.get('/api/learn/:id/lessons/:lid/revisions', h(req => learn.listRevisions(req.params.id, req.params.lid)));
+app.get('/api/learn/:id/lessons/:lid/revisions/:rid', h(req => learn.getRevision(req.params.id, req.params.lid, req.params.rid)));
+app.post('/api/learn/:id/lessons/:lid/revisions/:rid/restore', h(req => learn.restoreRevision(req.params.id, req.params.lid, req.params.rid)));
+app.post('/api/learn/:id/check', h(req => learn.checkSubjectLessons(req.params.id)));
+// HTTP twin of the WS learn.cancel — an escape hatch when a run wedges and the app
+// isn't open to hit Stop (otherwise the subject stays locked until a restart).
+app.post('/api/learn/:id/cancel', h(req => ({ ok: learn.cancel(req.params.id) })));
+
+// assessments: generate → fetch (answers stripped) → start attempt → submit → review
+app.post('/api/learn/:id/assessment', h(req => learn.generateAssessment({
+  id: req.params.id, kind: req.body?.kind, moduleId: req.body?.moduleId,
+  lessonId: req.body?.lessonId, modelRef: req.body?.modelRef,
+})));
+app.get('/api/learn/:id/assessment/:aid', h(req => learn.getAssessment(req.params.id, req.params.aid)));
+app.delete('/api/learn/:id/assessment/:aid', h(req => learn.deleteAssessment(req.params.id, req.params.aid)));
+app.post('/api/learn/:id/assessment/:aid/start', h(req => learn.startAttempt(req.params.id, req.params.aid)));
+app.post('/api/learn/:id/assessment/:aid/submit', h(req => learn.submitAttempt({
+  subjectId: req.params.id, assessmentId: req.params.aid,
+  attemptId: req.body?.attemptId, answers: req.body?.answers || {}, modelRef: req.body?.modelRef,
+})));
+app.get('/api/learn/:id/attempt/:tid', h(req => learn.getAttempt(req.params.id, req.params.tid)));
+
+// the feedback button + the adaptive read-outs behind it
+app.post('/api/learn/:id/feedback', h(req => learn.generateFeedback({ id: req.params.id, modelRef: req.body?.modelRef })));
+// career/cert advisor — result is stored on the subject and returned by GET /learn/:id
+app.post('/api/learn/:id/advise', h(req => learn.generateAdvice({ id: req.params.id, modelRef: req.body?.modelRef })));
+app.get('/api/learn/:id/weak', h(req => learn.getWeakTopics(req.params.id, Number(req.query?.limit) || 8)));
+
+// ---------- mindmaps (headless store — the app was replaced by the Learning Corner;
+// the agent's mindmap_generate tool and vault export still use these) ----------
 
 app.get('/api/mindmaps', h(() => mindmap.listMaps()));
 app.post('/api/mindmaps', h(req => mindmap.createMap(req.body || {})));
@@ -313,7 +419,9 @@ const wss = new WebSocketServer({ noServer: true });
 const clients = new Set();
 
 function publish(topic, obj) {
-  const msg = JSON.stringify(obj);
+  // stamp the topic so the client fans out generically — no per-message-type
+  // mapping to keep in sync (that drift silently broke research/comfy/gh streams)
+  const msg = JSON.stringify({ ...obj, _topic: topic });
   for (const c of clients) if (c.subs.has(topic)) { try { c.ws.send(msg); } catch { } }
 }
 agent.setPublisher(publish);
@@ -321,6 +429,8 @@ chat.setPublisher(publish);
 vault.setPublisher(publish);
 research.setPublisher(publish);
 github.setPublisher(publish);
+comfy.setPublisher(publish);
+learn.setPublisher(publish);
 
 server.on('upgrade', (req, socket, head) => {
   if (!req.url.startsWith('/ws')) return socket.destroy();
@@ -355,6 +465,7 @@ async function route(client, m) {
     case 'chat.stop': chat.stop(m.chatId); return;
 
     case 'research.cancel': research.cancel(m.id); return;
+    case 'learn.cancel': learn.cancel(m.id); return;
 
     case 'term.open': {
       let cwd = m.cwd;

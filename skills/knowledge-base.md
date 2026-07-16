@@ -2,6 +2,8 @@
 
 You can grow and maintain the user's second brain with the vault_* tools. Treat it
 as a durable, reusable memory that makes future work faster and less error-prone.
+Notes are TYPED — read the `notes` skill for the seven kinds and their templates
+(`note_template` serves the exact scaffold; `wiki_learn {kind}` stamps the type).
 
 ## When to read it
 - Before writing code against a library/API you're unsure about, `vault_search` it —

@@ -495,6 +495,18 @@ async function ollamaStream({ p, model, system, messages, tools, onEvent, signal
 
 // ---------- stream body parsers ----------
 
+// How long a stream may go with NO bytes at all before we declare it dead. This is a
+// wedge detector, not a slowness cap: a local model legitimately sends nothing for
+// minutes while it processes a long prompt (measured ~4 min to first token on an 8GB
+// GPU with a 10k-token prompt), so the bar is deliberately high. What it catches is a
+// provider that dies without closing the socket — without this, reader.read() blocks
+// forever and whatever awaited the stream (a chat, an agent run, a Learning Corner
+// subject's lock) hangs until the server restarts.
+// 8 min: measured ~4 min of silent prompt processing on this machine's worst case
+// (10k-token prompt, layers evicted to CPU) — double it so a slow-but-alive run is
+// never killed, while a truly wedged one still surfaces instead of hanging forever.
+const STREAM_STALL_MS = Number(process.env.AIOS_STREAM_STALL_MS) || 480_000;   // env override is for tests
+
 async function* rawLines(body, signal, sep = '\n') {
   const reader = body.getReader();
   const dec = new TextDecoder();
@@ -502,7 +514,18 @@ async function* rawLines(body, signal, sep = '\n') {
   try {
     while (true) {
       if (signal?.aborted) { try { await reader.cancel(); } catch { } return; }
-      const { done, value } = await reader.read();
+      let stallTimer;
+      let chunk;
+      try {
+        chunk = await Promise.race([
+          reader.read(),
+          new Promise((_, rej) => { stallTimer = setTimeout(() => rej(new Error(`stream stalled — no data for ${STREAM_STALL_MS / 1000}s (the model server may have wedged; stop and retry)`)), STREAM_STALL_MS); }),
+        ]);
+      } catch (e) {
+        try { await reader.cancel(); } catch { }
+        throw e;
+      } finally { clearTimeout(stallTimer); }
+      const { done, value } = chunk;
       if (done) break;
       buf += dec.decode(value, { stream: true });
       let i;

@@ -165,6 +165,16 @@ export const TOOL_DEFS = [
     parameters: { type: 'object', properties: {} },
   },
   {
+    name: 'git_push', write: true, group: 'git',
+    description: 'Push the current branch to origin (sets upstream on first push). Never creates repos or commits — fails with a clear reason when there is no remote, no commits, or the remote is ahead (pull first). Push only after the user asked, or after a commit they approved.',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'git_pull', write: true, group: 'git',
+    description: 'Pull from origin with rebase + autostash. On conflicts the rebase is aborted automatically — the working tree comes back untouched and the error names the conflicting files. Safe to run with uncommitted local changes.',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
     name: 'skill', write: false, group: 'system',
     description: `Read a best-practices playbook before working in an area you have not read a playbook for this session. Available: ${listSkills().join(', ') || 'core'}.`,
     parameters: {
@@ -224,16 +234,25 @@ export const TOOL_DEFS = [
   },
   {
     name: 'wiki_learn', write: true, group: 'vault',
-    description: 'Save durable knowledge to the wiki the right way: give a title and markdown body; frontmatter, tags, [[autolinks]] to existing notes, and the Home index are handled for you. Use whenever you learn something reusable (an API, a decision, a fix, a concept). Writes into the wiki folder and is normally pre-approved.',
+    description: 'Save durable knowledge to the wiki the right way: give a title and markdown body; frontmatter, tags, [[autolinks]] to existing notes, and the Home index are handled for you. Use whenever you learn something reusable (an API, a decision, a fix, a concept). Pick a `kind` and follow its template (see note_template / the notes skill). Writes into the wiki folder and is normally pre-approved.',
     parameters: {
       type: 'object',
       properties: {
         title: { type: 'string', description: 'Concise noun phrase, e.g. "QTableWidget cell editing"' },
         content: { type: 'string', description: 'Markdown body — definition first, then details/examples, then a Related section' },
+        kind: { type: 'string', enum: ['concept', 'howto', 'reference', 'decision', 'troubleshooting', 'source', 'project'], description: 'Note type — stamps frontmatter and implies the template (note_template shows it)' },
         folder: { type: 'string', description: 'Optional subfolder inside the wiki, e.g. "PyQt6"' },
         tags: { type: 'array', items: { type: 'string' } },
       },
       required: ['title', 'content'],
+    },
+  },
+  {
+    name: 'note_template', write: false, group: 'vault',
+    description: 'Get the canonical template for a note kind (concept, howto, reference, decision, troubleshooting, source, project) before writing it with wiki_learn. Call without a kind to list all kinds and when to use each.',
+    parameters: {
+      type: 'object',
+      properties: { kind: { type: 'string', description: 'One of the note kinds; omit to list them' } },
     },
   },
   {
@@ -261,7 +280,7 @@ export const TOOL_DEFS = [
   },
   {
     name: 'mindmap_generate', write: true, group: 'apps',
-    description: 'Create a mindmap in the Mindmaps app from a topic (AI-designed tree, uses the session model). When a vault is connected the outline is also saved to the wiki. Use to structure a topic, plan, or brainstorm without waiting for the user to open the app.',
+    description: 'Generate an AI-designed tree outline of a topic (uses the session model); when a vault is connected the outline is saved to the wiki as a nested-list note. Use to structure a topic, plan, or brainstorm.',
     parameters: {
       type: 'object',
       properties: {
@@ -325,6 +344,27 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: 'comfy_generate', write: true, group: 'apps',
+    description: 'Generate images on the local ComfyUI (SDXL-Lightning txt2img). AIOS frees the GPU automatically (swaps the LLM to a tiny CPU profile) — expect the swap on first use. Blocks until the render finishes; results appear in the Studio app.',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'What to render — concrete, visual language' },
+        negative: { type: 'string', description: 'What to avoid (optional)' },
+        width: { type: 'number', description: 'Default 1024' },
+        height: { type: 'number', description: 'Default 1024' },
+        count: { type: 'number', description: '1-4 images (default 1)' },
+        seed: { type: 'number', description: 'Fixed seed for reproducibility (optional)' },
+      },
+      required: ['prompt'],
+    },
+  },
+  {
+    name: 'comfy_status', write: false, group: 'apps',
+    description: 'Check the local ComfyUI: reachable? VRAM free? which llama.cpp profile is live? recent renders. Use before comfy_generate when unsure.',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
     name: 'mail_recent', write: false, group: 'mail',
     description: 'List the user\'s most recent inbox messages over IMAP (read-only — nothing is marked seen). Returns uid, from, subject, date, and a snippet. Use mail_read with a uid for the full message.',
     parameters: {
@@ -377,6 +417,213 @@ export const TOOL_DEFS = [
     name: 'delete_tool', write: true, group: 'system',
     description: 'Delete a custom tool you previously created (e.g. superseded or broken beyond repair).',
     parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
+  },
+
+  // ---- Learning Corner ----------------------------------------------------
+  // These let the agent act as the tutor: inspect the student's real record
+  // (mastery is measured, not guessed), author assessments question by question,
+  // and drive the curriculum. Read tools first so the agent can look before it writes.
+  {
+    name: 'learn_subjects', write: false, group: 'learning',
+    description: 'List every Learning Corner subject with its id, parent (subjects nest: Programming → Python → Graphs), module/lesson counts and overall mastery %. Call this first to find a subject id.',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'learn_subject', write: false, group: 'learning',
+    description: 'Full detail for one subject: goal, level, breadcrumb path, child subjects, roadmap modules (with topics + done state), lesson list, assessments with best scores, measured weak topics, and what the Corner thinks the student should do next.',
+    parameters: {
+      type: 'object',
+      properties: { subject_id: { type: 'string' } },
+      required: ['subject_id'],
+    },
+  },
+  {
+    name: 'learn_lesson_read', write: false, group: 'learning',
+    description: 'Read the full markdown of one lesson. Use before writing a quiz about it so the questions test what was actually taught rather than what you assume was taught.',
+    parameters: {
+      type: 'object',
+      properties: { subject_id: { type: 'string' }, lesson_id: { type: 'string' } },
+      required: ['subject_id', 'lesson_id'],
+    },
+  },
+  {
+    name: 'learn_weak_topics', write: false, group: 'learning',
+    description: 'The student\'s measured weak spots for a subject: per-topic accuracy from every graded answer, worst first. This is evidence, not vibes — use it to decide what to re-teach or re-test.',
+    parameters: {
+      type: 'object',
+      properties: { subject_id: { type: 'string' }, limit: { type: 'number', description: 'Default 8' } },
+      required: ['subject_id'],
+    },
+  },
+  {
+    name: 'learn_attempt_review', write: false, group: 'learning',
+    description: 'Review one graded attempt question by question: what was asked, what the student answered, whether it was right, the rubric/explanation, and any grader feedback. The highest-signal record of how they actually think.',
+    parameters: {
+      type: 'object',
+      properties: { subject_id: { type: 'string' }, attempt_id: { type: 'string' } },
+      required: ['subject_id', 'attempt_id'],
+    },
+  },
+  {
+    name: 'learn_create_subject', write: true, group: 'learning',
+    description: 'Create a subject, optionally nested under a parent (pass parent_id to make e.g. "Python" a child of "Programming", or "Dijkstra\'s" a child of "Python"). Nests up to 5 deep.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        goal: { type: 'string', description: 'What the student should be able to DO — steers the roadmap' },
+        level: { type: 'string', description: 'beginner | intermediate | advanced' },
+        parent_id: { type: 'string', description: 'Optional parent subject id' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'learn_create_quiz', write: true, group: 'learning',
+    description: 'Create an empty assessment shell, then fill it with learn_add_question. kind: quiz (one lesson/module) | midterm (several modules) | final (whole subject) | diagnostic (placement, spans everything). Use this + learn_add_question when you want to author questions yourself; use learn_generate_assessment to have the tutor engine write a whole paper in one shot.',
+    parameters: {
+      type: 'object',
+      properties: {
+        subject_id: { type: 'string' },
+        kind: { type: 'string', description: 'quiz | midterm | final | diagnostic (default quiz)' },
+        title: { type: 'string' },
+        blurb: { type: 'string', description: 'One line: what it covers and how it is scored' },
+        module_id: { type: 'string', description: 'Optional module this quiz belongs to' },
+        lesson_id: { type: 'string', description: 'Optional lesson this quiz belongs to' },
+        scope: { type: 'array', items: { type: 'string' }, description: 'Module ids covered (midterm/final)' },
+        pass_pct: { type: 'number', description: 'Pass threshold, default by kind (quiz/midterm 70, final 75)' },
+      },
+      required: ['subject_id'],
+    },
+  },
+  {
+    name: 'learn_add_question', write: true, group: 'learning',
+    description: 'Add one question to an assessment. kind "mcq": exactly one correct — pass choices and set answer to the 0-based index as a string ("2"). kind "multi": several correct — answer is a JSON array of indices ("[0,2]"). kind "open": no choices, the student writes prose/code and the model grades it — answer holds the RUBRIC (what a full-credit response must contain). Always set topic: it is the key mastery is tracked under, so a typo silently splits the student\'s record.',
+    parameters: {
+      type: 'object',
+      properties: {
+        assessment_id: { type: 'string' },
+        kind: { type: 'string', description: 'mcq | multi | open (default mcq)' },
+        prompt: { type: 'string' },
+        choices: { type: 'array', items: { type: 'string' }, description: 'mcq: exactly 4; multi: 4-6. Distractors must be plausible misconceptions.' },
+        answer: { type: 'string', description: 'mcq: "2" · multi: "[0,2]" · open: the rubric' },
+        explanation: { type: 'string', description: 'Why the answer is right AND why the tempting wrong one is wrong' },
+        topic: { type: 'string', description: '2-4 words; match a roadmap topic where possible' },
+        difficulty: { type: 'string', description: 'warmup | core | stretch' },
+        points: { type: 'number', description: '1-5, default 1' },
+      },
+      required: ['assessment_id', 'prompt'],
+    },
+  },
+  {
+    name: 'learn_generate_assessment', write: true, group: 'learning',
+    description: 'Have the tutor engine write a complete assessment (web-grounded, weighted toward the student\'s measured weak topics) and save it. Runs in the background and streams to the Learning app. Prefer this over hand-authoring unless you need exact control of the questions.',
+    parameters: {
+      type: 'object',
+      properties: {
+        subject_id: { type: 'string' },
+        kind: { type: 'string', description: 'diagnostic | quiz | midterm | final (default quiz)' },
+        module_id: { type: 'string' },
+        lesson_id: { type: 'string' },
+      },
+      required: ['subject_id'],
+    },
+  },
+  {
+    name: 'learn_generate_lesson', write: true, group: 'learning',
+    description: 'Generate the next lesson for a subject (searches current sources, writes it, exports to the vault). Pass review:true to aim it squarely at the student\'s measured weak topics instead of the next new topic.',
+    parameters: {
+      type: 'object',
+      properties: {
+        subject_id: { type: 'string' },
+        module_id: { type: 'string', description: 'Optional — defaults to the first unfinished module' },
+        focus: { type: 'string', description: 'Optional specific topic to teach' },
+        review: { type: 'boolean', description: 'Target measured weak spots' },
+      },
+      required: ['subject_id'],
+    },
+  },
+  {
+    name: 'learn_check_lessons', write: false, group: 'learning',
+    description: 'Health-check every lesson in a subject and report what is damaged. Catches the failures that still "succeed": the model narrating a web search instead of writing, output truncated mid-code-fence, unbalanced <details>, missing practice. Run this when the student says a lesson came out wrong.',
+    parameters: {
+      type: 'object',
+      properties: { subject_id: { type: 'string' } },
+      required: ['subject_id'],
+    },
+  },
+  {
+    name: 'learn_regenerate_lesson', write: true, group: 'learning',
+    description: 'Rewrite an existing lesson IN PLACE — same slot, same id, so quizzes and vault notes pointing at it stay valid. The old body is snapshotted to revision history first, so this is never a one-way door. Pass instructions to say what to fix; omit them and the detected health problems are used as the brief. Pass use_web:false to skip research entirely — the escape hatch when web search is what derailed the previous attempt.',
+    parameters: {
+      type: 'object',
+      properties: {
+        subject_id: { type: 'string' },
+        lesson_id: { type: 'string' },
+        instructions: { type: 'string', description: 'What to fix, e.g. "it was truncated — write it complete" or "too shallow on closures"' },
+        focus: { type: 'string', description: 'Optionally re-aim the lesson at a different topic' },
+        use_web: { type: 'boolean', description: 'Default true. false = write from fundamentals, no search.' },
+      },
+      required: ['subject_id', 'lesson_id'],
+    },
+  },
+  {
+    name: 'learn_lesson_revisions', write: false, group: 'learning',
+    description: 'List the saved previous versions of a lesson (every regenerate snapshots one), with why each was replaced. Use with learn_restore_revision to put a better older draft back.',
+    parameters: {
+      type: 'object',
+      properties: { subject_id: { type: 'string' }, lesson_id: { type: 'string' } },
+      required: ['subject_id', 'lesson_id'],
+    },
+  },
+  {
+    name: 'learn_restore_revision', write: true, group: 'learning',
+    description: 'Restore a previous version of a lesson. The current version is snapshotted first, so you can bounce between drafts without losing either.',
+    parameters: {
+      type: 'object',
+      properties: { subject_id: { type: 'string' }, lesson_id: { type: 'string' }, revision_id: { type: 'string' } },
+      required: ['subject_id', 'lesson_id', 'revision_id'],
+    },
+  },
+  {
+    name: 'learn_suggest_paths', write: true, group: 'learning',
+    description: 'Research and store certificate + career-path suggestions for a subject (web-grounded: real certs, current costs, prep time), shown in the Learning app\'s Paths tab. Each suggestion can be adopted as a sub-subject. Use when the student asks "what should I aim for / which cert is worth it".',
+    parameters: {
+      type: 'object',
+      properties: { subject_id: { type: 'string' } },
+      required: ['subject_id'],
+    },
+  },
+  {
+    name: 'learn_generate_roadmap', write: true, group: 'learning',
+    description: 'Design (or redesign) the prerequisite-ordered module roadmap for a subject. Completed modules keep their done state across a redesign, matched by title.',
+    parameters: {
+      type: 'object',
+      properties: { subject_id: { type: 'string' } },
+      required: ['subject_id'],
+    },
+  },
+  {
+    name: 'learn_record_result', write: true, group: 'learning',
+    description: 'Record one graded answer against a topic directly, moving the student\'s mastery. Use when you assessed them conversationally (e.g. you asked a question in chat and judged the answer) so tutoring outside the quiz UI still teaches the Corner what they know.',
+    parameters: {
+      type: 'object',
+      properties: {
+        subject_id: { type: 'string' },
+        topic: { type: 'string' },
+        correct: { type: 'boolean' },
+      },
+      required: ['subject_id', 'topic', 'correct'],
+    },
+  },
+  {
+    name: 'learn_module_done', write: true, group: 'learning',
+    description: 'Mark a roadmap module complete (or not). Passing a midterm/final auto-completes the modules it covered, so use this mainly for modules the student finished outside an exam.',
+    parameters: {
+      type: 'object',
+      properties: { subject_id: { type: 'string' }, module_id: { type: 'string' }, done: { type: 'boolean' } },
+      required: ['subject_id', 'module_id'],
+    },
   },
 ];
 
@@ -695,6 +942,18 @@ const impls = {
       : 'Initialized empty git repository on branch "main". Add a .gitignore before the first commit if the project needs one.';
   },
 
+  async git_push(_, { root }) {
+    const { gitPush } = await import('./github.js');
+    const r = await gitPush(root);
+    return `Pushed ${r.branch} to origin.${r.behind ? ` Note: still ${r.behind} commit(s) behind the remote — consider git_pull.` : ''}`;
+  },
+
+  async git_pull(_, { root }) {
+    const { gitPull } = await import('./github.js');
+    const r = await gitPull(root);
+    return `Pulled origin into ${r.branch}.${r.out ? `\n${r.out}` : ''}${r.ahead ? `\nYou now have ${r.ahead} local commit(s) to push.` : ''}`;
+  },
+
   async vault_search({ query, limit = 10 }) {
     requireVault();
     const hits = vaultSearch(String(query || ''), Math.min(Math.max(limit || 10, 1), 30));
@@ -742,12 +1001,22 @@ const impls = {
     return `Recalled ${notes.length} note(s):\n\n${text}`;
   },
 
-  async wiki_learn({ title, content, folder, tags }) {
+  async wiki_learn({ title, content, folder, tags, kind }) {
     requireVault();
-    const r = wiki.upsertNote({ title, folder, content, tags, source: 'agent' });
+    const r = wiki.upsertNote({ title, folder, content, tags, kind, source: 'agent' });
     let idx = '';
     try { wiki.rebuildIndex(); idx = ', Home index refreshed'; } catch { }
     return `${r.created ? 'Created' : 'Updated'} ${r.path}${r.linked.length ? ` (autolinked: ${r.linked.join(', ')})` : ''}${idx}.`;
+  },
+
+  async note_template({ kind }) {
+    const t = wiki.noteTemplate(kind);
+    if (t.kinds) {
+      return 'Note kinds (pass one as `kind`):\n'
+        + t.kinds.map(k => `- ${k.kind} — ${k.what}`).join('\n')
+        + '\nRead the `notes` skill for the full system (quality bar, filing, maintenance).';
+    }
+    return `Template for a "${t.kind}" note (${t.what}) — fill every section, keep the section names:\n\n${t.template}`;
   },
 
   async wiki_index() {
@@ -792,7 +1061,7 @@ const impls = {
         try { wiki.rebuildIndex(); } catch { }
       } catch { }
     }
-    return `Mindmap "${m.name}" created (${count} nodes) — open the Mindmaps app to view/edit it (id ${m.id}).${vaultNote}`;
+    return `Topic outline "${m.name}" generated (${count} nodes).${vaultNote || ' Connect a vault to have outlines saved as notes.'}`;
   },
 
   async research_start({ question, depth }, { modelRef }) {
@@ -827,6 +1096,33 @@ const impls = {
   async event_add({ title, date, start, end, recur, notes }) {
     const e = planner.addEvent({ title, date, start, end, recur, notes });
     return `Event added: "${e.title}" on ${e.date}${e.allDay ? ' (all-day)' : ` at ${e.start}${e.end ? `–${e.end}` : ''}`}${e.recur ? `, repeats ${e.recur}` : ''}.`;
+  },
+
+  async comfy_generate({ prompt, negative, width, height, count, seed }, { signal }) {
+    const comfy = await import('./comfy.js');
+    const job = await comfy.generate({ prompt, negative, width, height, count, seed });
+    // block (bounded) until the job settles so the model gets a real answer
+    for (let i = 0; i < 600; i++) {
+      if (signal?.aborted) throw new Error('cancelled');
+      const j = comfy.getJob(job.id);
+      if (j.status === 'done') return `Rendered ${j.images.length} image(s) — visible in the Studio app (job ${j.id}, seed ${j.seed}, ${j.width}×${j.height}). Files: ${j.images.join(', ')}`;
+      if (j.status === 'error') throw new Error(j.error || 'generation failed');
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    throw new Error('generation still running after 10 minutes — check the Studio app');
+  },
+
+  async comfy_status() {
+    const comfy = await import('./comfy.js');
+    const s = await comfy.comfyStatus();
+    const jobs = comfy.listJobs().slice(0, 3);
+    const lines = [
+      s.up ? `ComfyUI up at ${s.url} — ${s.vramFreeMB}MB VRAM free of ${s.vramTotalMB}MB` : `ComfyUI NOT running at ${s.url} (${s.error || ''}) — the user must start it`,
+      s.llm?.running ? `llama.cpp profile: ${s.llm.profile}${s.llm.profile === 'big' ? ' (GPU held — generation will auto-swap to tiny)' : ''}` : s.llm?.foreign ? 'llama.cpp running unmanaged (will be replaced on first swap)' : 'llama.cpp stopped',
+      s.gpu ? `GPU: ${s.gpu.name} — ${s.gpu.freeMB}MB free / ${s.gpu.totalMB}MB` : 'no NVIDIA GPU visible',
+      jobs.length ? `Recent: ${jobs.map(j => `${j.id}:${j.status}`).join(', ')}` : 'no renders yet',
+    ];
+    return lines.join('\n');
   },
 
   async mail_recent({ limit = 15, days = 3 }) {
@@ -879,7 +1175,188 @@ const impls = {
     const { status, text } = await fetchReadable(url);
     return `[${status}] ${url}\n\n${text}`;
   },
+
+  // ---- Learning Corner ----------------------------------------------------
+  // learn.js imports webSearch/fetchReadable from this module, so a static import
+  // back would be a cycle — these load it on demand (same trick learn.js uses for
+  // vault.js). learnMod() is cheap after the first call: ESM caches the module.
+
+  async learn_subjects() {
+    const learn = await learnMod();
+    const rows = learn.listSubjects();
+    if (!rows.length) return 'No subjects yet. Create one with learn_create_subject.';
+    const byId = new Map(rows.map(r => [r.id, r]));
+    const label = (r) => {
+      const crumbs = [];
+      let cur = r;
+      while (cur && crumbs.length < 6) { crumbs.unshift(cur.name); cur = cur.parentId ? byId.get(cur.parentId) : null; }
+      return crumbs.join(' → ');
+    };
+    return rows.map(r =>
+      `${r.id}  ${label(r)}\n   level=${r.level} · ${r.modulesDone}/${r.modules} modules · ${r.lessons} lessons · ${r.assessments} assessments · mastery=${r.mastery === null ? 'unmeasured' : r.mastery + '%'}`
+    ).join('\n');
+  },
+
+  async learn_subject({ subject_id }) {
+    const learn = await learnMod();
+    const s = learn.getSubject(subject_id);
+    const mods = (s.roadmap?.modules || []).map((m, i) =>
+      `  ${i + 1}. [${m.done ? 'x' : ' '}] ${m.title} (id=${m.id}, ${m.kind})\n     ${m.summary}\n     topics: ${m.topics.join(' · ') || '(none)'}`).join('\n');
+    const lessons = s.lessons.map(l => `  L${l.n} ${l.title} (id=${l.id}, ${l.type})${l.done ? ' ✓' : ''}`).join('\n');
+    const assess = s.assessments.map(a =>
+      `  ${a.kind}: "${a.title}" (id=${a.id}, ${a.questions} questions, ${a.attempts} attempts${a.best ? `, best ${a.best.score}/${a.best.maxScore} ${a.best.passed ? 'PASS' : 'FAIL'}` : ''})`).join('\n');
+    const weak = s.weak.map(w => `  ${w.topic}: ${w.correct}/${w.seen} (${Math.round(w.ratio * 100)}%)`).join('\n');
+    return [
+      `${s.path.map(p => p.name).join(' → ')}  (id=${s.id})`,
+      `goal: ${s.goal || '(not stated)'}`,
+      `level: ${s.level} · mastery: ${s.mastery.pct === null ? 'unmeasured' : s.mastery.pct + '%'} across ${s.mastery.topics} topics`,
+      s.children.length ? `sub-subjects: ${s.children.map(c => `${c.name} (id=${c.id})`).join(', ')}` : 'sub-subjects: (none)',
+      '', `ROADMAP (${s.roadmap?.modules?.length || 0} modules):`, mods || '  (no roadmap yet — call learn_generate_roadmap)',
+      '', `LESSONS (${s.lessons.length}):`, lessons || '  (none)',
+      '', `ASSESSMENTS (${s.assessments.length}):`, assess || '  (none)',
+      '', 'MEASURED WEAK TOPICS:', weak || '  (nothing assessed yet)',
+      '', `NEXT UP: [${s.nextUp.kind}] ${s.nextUp.why}`,
+    ].join('\n');
+  },
+
+  async learn_lesson_read({ subject_id, lesson_id }) {
+    const learn = await learnMod();
+    const l = learn.getLesson(subject_id, lesson_id);
+    return `# ${l.title} (lesson ${l.n}, ${l.type})\ntopic: ${l.topic}\n\n${l.content}`;
+  },
+
+  async learn_weak_topics({ subject_id, limit = 8 }) {
+    const learn = await learnMod();
+    const rows = learn.getWeakTopics(subject_id, Math.max(1, Math.min(30, Number(limit) || 8)));
+    if (!rows.length) return 'Nothing assessed yet for this subject — no mastery data. Give them a quiz or a diagnostic first.';
+    return rows.map(r => `${r.topic}: ${r.correct}/${r.seen} correct (${Math.round(r.ratio * 100)}%)${r.streak >= 3 ? ` · streak ${r.streak}` : ''}`).join('\n');
+  },
+
+  async learn_attempt_review({ subject_id, attempt_id }) {
+    const learn = await learnMod();
+    const t = learn.getAttempt(subject_id, attempt_id);
+    const head = `Attempt ${t.id} — ${t.score}/${t.maxScore} (${Math.round(t.score / (t.maxScore || 1) * 100)}%) ${t.passed ? 'PASS' : 'FAIL'} · ${t.submittedAt || 'not submitted'}`;
+    const body = t.responses.map(r => {
+      const given = r.kind === 'open' ? String(r.given).slice(0, 400) : renderGiven(r);
+      return `Q${r.idx + 1} [${r.topic || 'untagged'} · ${r.difficulty}] ${r.correct ? '✓' : '✗'} ${r.points}/${r.worth}\n  ${r.prompt.slice(0, 300)}\n  answered: ${given || '(blank)'}\n  ${r.kind === 'open' ? `grader: ${r.feedback}` : `correct: ${renderAnswer(r)}`}\n  why: ${(r.explanation || '').slice(0, 300)}`;
+    }).join('\n\n');
+    return `${head}\n\n${body}`;
+  },
+
+  async learn_create_subject({ name, goal, level, parent_id }) {
+    const learn = await learnMod();
+    const s = learn.createSubject({ name, goal, level, parentId: parent_id || null });
+    return `Created subject "${s.name}" (id=${s.id}${s.parentId ? `, nested under ${s.parentId}` : ''}). Next: learn_generate_roadmap.`;
+  },
+
+  async learn_create_quiz({ subject_id, kind = 'quiz', title, blurb, module_id, lesson_id, scope, pass_pct }) {
+    const learn = await learnMod();
+    const a = learn.createAssessment({
+      subjectId: subject_id, kind, title, blurb,
+      moduleId: module_id || null, lessonId: lesson_id || null,
+      scope: Array.isArray(scope) ? scope : [], passPct: pass_pct,
+    });
+    return `Created empty ${a.kind} (id=${a.id}). Add questions with learn_add_question(assessment_id="${a.id}", ...). It stays unanswerable until it has questions.`;
+  },
+
+  async learn_add_question({ assessment_id, kind = 'mcq', prompt, choices, answer, explanation, topic, difficulty, points }) {
+    const learn = await learnMod();
+    const q = learn.addQuestion(assessment_id, { kind, prompt, choices, answer, explanation, topic, difficulty, points });
+    return `Added question ${q.idx + 1} (id=${q.id}, ${kind}) to assessment ${assessment_id}.`;
+  },
+
+  async learn_generate_assessment({ subject_id, kind = 'quiz', module_id, lesson_id }, { modelRef }) {
+    const learn = await learnMod();
+    const r = learn.generateAssessment({ id: subject_id, kind, moduleId: module_id, lessonId: lesson_id, modelRef });
+    return `Started generating a ${kind} for subject ${subject_id} (streaming to the Learning app). It writes the questions, weights them toward measured weak topics, and saves when done. Status: ${r.status}.`;
+  },
+
+  async learn_generate_lesson({ subject_id, module_id, focus, review }, { modelRef }) {
+    const learn = await learnMod();
+    const r = learn.generateLesson({ id: subject_id, moduleId: module_id, focus, review: !!review, modelRef });
+    return `Started generating a${review ? ' REVIEW' : ''} lesson for subject ${subject_id} (status: ${r.status}). It searches current sources, writes the lesson, and exports it to the vault.`;
+  },
+
+  async learn_generate_roadmap({ subject_id }, { modelRef }) {
+    const learn = await learnMod();
+    const r = learn.generateRoadmap({ id: subject_id, modelRef });
+    return `Started designing the roadmap for subject ${subject_id} (status: ${r.status}).`;
+  },
+
+  async learn_suggest_paths({ subject_id }, { modelRef }) {
+    const learn = await learnMod();
+    const r = learn.generateAdvice({ id: subject_id, modelRef });
+    return `Started researching certificates and career paths for subject ${subject_id} (status: ${r.status}). Results land in the Learning app's Paths tab; each can be adopted as a sub-subject.`;
+  },
+
+  async learn_check_lessons({ subject_id }) {
+    const learn = await learnMod();
+    const r = learn.checkSubjectLessons(subject_id);
+    if (!r.checked) return 'This subject has no lessons yet.';
+    const lines = r.lessons.map(l => {
+      if (l.ok) return `  L${l.n} (id=${l.id}) OK — ${l.title}`;
+      const errs = l.health.filter(i => i.level === 'error').map(i => i.text);
+      const warns = l.health.filter(i => i.level === 'warn').map(i => i.text);
+      return `  L${l.n} (id=${l.id}) ${errs.length ? 'DAMAGED' : 'minor gaps'} — ${l.title}` +
+        (errs.length ? `\n     errors: ${errs.join('; ')}` : '') +
+        (warns.length ? `\n     warnings: ${warns.join('; ')}` : '');
+    });
+    return `${r.checked} lesson(s) checked, ${r.broken} damaged.\n${lines.join('\n')}` +
+      (r.broken ? `\n\nFix a damaged one with learn_regenerate_lesson (omit instructions to use these findings as the brief; add use_web:false if search is what derailed it).` : '');
+  },
+
+  async learn_regenerate_lesson({ subject_id, lesson_id, instructions, focus, use_web }, { modelRef }) {
+    const learn = await learnMod();
+    const r = learn.regenerateLesson({
+      id: subject_id, lessonId: lesson_id, instructions, focus,
+      useWeb: use_web !== false, modelRef,
+    });
+    return `Rewriting lesson ${lesson_id} in place (status: ${r.status}${use_web === false ? ', offline — no web search' : ''}). The previous version is saved to revision history and can be restored.`;
+  },
+
+  async learn_lesson_revisions({ subject_id, lesson_id }) {
+    const learn = await learnMod();
+    const rows = learn.listRevisions(subject_id, lesson_id);
+    if (!rows.length) return 'No previous versions — this lesson has never been regenerated.';
+    return rows.map(r => `${r.id}  ${r.createdAt}  "${r.title}" · ${r.chars} chars · ${r.sources} sources${r.health.length ? ` · had ${r.health.length} issue(s)` : ' · clean'}\n   replaced because: ${r.reason || '(no reason recorded)'}`).join('\n');
+  },
+
+  async learn_restore_revision({ subject_id, lesson_id, revision_id }) {
+    const learn = await learnMod();
+    learn.restoreRevision(subject_id, lesson_id, revision_id);
+    return `Restored revision ${revision_id} into lesson ${lesson_id}. The version it replaced was snapshotted, so this is reversible.`;
+  },
+
+  async learn_record_result({ subject_id, topic, correct }) {
+    const learn = await learnMod();
+    learn.recordTopicResult(subject_id, topic, !!correct);
+    const after = learn.getWeakTopics(subject_id, 30).find(w => w.topic === String(topic).trim().toLowerCase());
+    return `Recorded ${correct ? 'CORRECT' : 'INCORRECT'} for "${topic}" in subject ${subject_id}.${after ? ` Now ${after.correct}/${after.seen} (${Math.round(after.ratio * 100)}%).` : ''}`;
+  },
+
+  async learn_module_done({ subject_id, module_id, done = true }) {
+    const learn = await learnMod();
+    const r = learn.setModuleDone(subject_id, module_id, !!done);
+    return `Module ${module_id} marked ${r.done ? 'complete' : 'incomplete'}.`;
+  },
 };
+
+const learnMod = () => import('./learn.js');
+
+/** Render a stored MCQ/multi response back into readable choice text. */
+function renderGiven(r) {
+  const idxs = r.kind === 'multi'
+    ? (() => { try { return JSON.parse(r.given); } catch { return []; } })()
+    : [(() => { try { return JSON.parse(r.given); } catch { return r.given; } })()];
+  return idxs.filter(i => i !== '' && i !== null && i !== undefined)
+    .map(i => `${i}) ${r.choices[Number(i)] ?? '?'}`).join(', ');
+}
+function renderAnswer(r) {
+  const idxs = r.kind === 'multi'
+    ? (() => { try { return JSON.parse(r.answer); } catch { return []; } })()
+    : [r.answer];
+  return idxs.map(i => `${i}) ${r.choices[Number(i)] ?? '?'}`).join(', ');
+}
 
 // ---------- shared web helpers (used by the tools above and by research.js) ----------
 

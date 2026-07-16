@@ -2,7 +2,7 @@
 // LEFT a mini calendar (the Planner's own widget), weather, the next 3 days of
 // events, and today's tasks; RIGHT the AI-triaged inbox (Mail).
 
-import { el, icon, toast } from '../ui.js';
+import { el, icon, toast, modal } from '../ui.js';
 import { get, post, patch } from '../api.js';
 import { state, on } from '../state.js';
 import { openApp } from '../wm.js';
@@ -52,10 +52,10 @@ export default {
       const h = new Date().getHours();
       const greet = h < 5 ? 'Up late' : h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
 
-      let vaultNotes = '—', chats = '—', maps = '—', services = [], agenda = null, inbox = null;
+      let vaultNotes = '—', chats = '—', lessons = '—', services = [], agenda = null, inbox = null;
       try { vaultNotes = cfg.vault?.path ? String((await get('/vault/status')).notes) : '—'; } catch { }
       try { chats = String((await get('/chats')).length); } catch { }
-      try { maps = String((await get('/mindmaps')).length); } catch { }
+      try { lessons = String((await get('/learn')).reduce((n, s) => n + (s.lessons || 0), 0)); } catch { }
       try { services = await get('/services'); } catch { }
       try { agenda = await get('/planner/agenda'); } catch { }
       let mailStat = null;
@@ -167,25 +167,116 @@ export default {
         },
       }, icon('refresh'));
 
+      // rate a sender: block/star/clear — the backend remembers across scans
+      const rateSender = async (m, rule, kind = 'address') => {
+        try {
+          const r = await post('/mail/sender', { from: m.from, rule, kind });
+          toast(rule === 'clear' ? `rule removed for ${r.key}` : `${rule === 'block' ? 'muted' : '⚡ fast-tracked'} ${r.key}`, 'ok');
+          render();
+        } catch (e2) { toast(e2.message, 'err'); }
+      };
+      const dismissMail = async (m) => {
+        try {
+          const r = await post('/mail/dismiss', { id: m.id });
+          if (r.mutedSender) toast(`dismissed 3× — muted ${r.mutedSender} (undo in Settings → Mail)`, 'ok');
+          render();
+        } catch (e2) { toast(e2.message, 'err'); }
+      };
+
+      // an inbox row: click → detail modal · ⊘ → mute sender · ↗ → webmail tab · × → dismiss
+      const mailRow = (m, starred = false) => el('div', {
+        class: 'mail-notif' + (m.urgency === 'high' && !starred ? ' hot' : '') + (starred ? ' starred' : '') + (m.fast ? ' fast' : ''),
+        onclick: () => emailModal(m),
+        title: m.snippet ? m.snippet.slice(0, 300) : 'click for details',
+      },
+        el('div', { class: 'mail-line' },
+          el('span', { class: 'mail-from' }, (m.fast ? '⚡ ' : starred ? '★ ' : '') + (m.from.replace(/<[^>]*>/g, '').replace(/"/g, '').trim() || m.from)),
+          m.senderRule !== 'star' ? el('button', {
+            class: 'mail-x', title: 'Mute this sender — never notify again (undo in Settings → Mail)',
+            onclick: (ev) => { ev.stopPropagation(); rateSender(m, 'block'); },
+          }, '⊘') : null,
+          m.link ? el('button', {
+            class: 'mail-x open', title: 'Open in your mail client (new tab)',
+            onclick: (ev) => { ev.stopPropagation(); window.open(m.link, '_blank', 'noreferrer'); },
+          }, '↗') : null,
+          el('button', {
+            class: 'mail-x', title: 'Dismiss this message',
+            onclick: (ev) => { ev.stopPropagation(); dismissMail(m); },
+          }, '×')),
+        el('div', { class: 'mail-subj' }, m.subject),
+        m.reason ? el('div', { class: 'mail-reason' }, m.reason) : null);
+
       const mailItems = [];
       if (inbox) {
-        for (const m of inbox.items) {
-          mailItems.push(el('div', { class: 'mail-notif' + (m.urgency === 'high' ? ' hot' : '') },
-            el('div', { class: 'mail-line' },
-              el('span', { class: 'mail-from' }, m.from.replace(/<[^>]*>/g, '').replace(/"/g, '').trim() || m.from),
-              el('button', {
-                class: 'mail-x', title: 'Dismiss',
-                onclick: async () => { try { await post('/mail/dismiss', { id: m.id }); render(); } catch (e2) { toast(e2.message, 'err'); } },
-              }, '×')),
-            el('div', { class: 'mail-subj' }, m.subject),
-            m.reason ? el('div', { class: 'mail-reason' }, m.reason) : null));
-        }
+        for (const m of inbox.items) mailItems.push(mailRow(m));
         if (!inbox.items.length) mailItems.push(el('div', { class: 'muted small', style: { padding: '2px 4px' } },
-          inbox.scannedAt ? 'nothing important right now' : 'not scanned yet — hit refresh'));
+          inbox.scannedAt ? 'no unread important mail — nice' : 'not scanned yet — hit refresh'));
+        if (inbox.starred?.length) {
+          mailItems.push(el('div', { class: 'ag-day' }, '★ starred · last 10 days'));
+          for (const m of inbox.starred) mailItems.push(mailRow(m, true));
+        }
         if (inbox.error) mailItems.push(el('div', { class: 'mail-err' }, inbox.error));
+        if (inbox.triage?.via === 'heuristic' && inbox.triage.error) mailItems.push(el('div', {
+          class: 'muted small', style: { padding: '3px 4px' }, title: inbox.triage.error,
+        }, `⚠ AI triage unavailable (${inbox.triage.error.slice(0, 60)}) — keyword fallback`));
       } else {
         mailItems.push(el('div', { class: 'muted small link', style: { padding: '2px 4px' }, onclick: () => openApp('settings', { tab: 'mail' }) },
           'connect your inbox in Settings → Mail & Alerts'));
+      }
+
+      // mini-Gmail window: why it surfaced + the actual email (HTML part rendered
+      // in a sandboxed frame — no scripts; links open in new tabs), ↗ to webmail
+      async function emailModal(m) {
+        const bodyBox = el('div', { class: 'mail-body' }, el('span', { class: 'spinner' }));
+        const chip = (t) => t ? el('span', { class: 'chip' }, t) : null;
+        const openGlyph = m.link ? el('a', {
+          class: 'btn sm ghost', href: m.link, target: '_blank', rel: 'noreferrer',
+          title: 'Open in your mail client (new tab)', style: { textDecoration: 'none' },
+        }, '↗') : null;
+        modal({
+          title: m.subject, xl: true,
+          body: el('div', { class: 'col', style: { gap: '8px', marginTop: '6px' } },
+            el('div', { class: 'row', style: { gap: '7px', flexWrap: 'wrap' } },
+              el('span', { class: 'mail-from', style: { flex: 'none', maxWidth: '420px' } }, m.from),
+              el('span', { class: 'muted small' }, m.date || ''),
+              el('span', { class: 'grow' }),
+              m.urgency === 'high' ? el('span', { class: 'chip', style: { color: 'var(--err)' } }, 'high') : null,
+              chip(m.category !== 'other' ? m.category : ''), m.starred ? chip('★ starred') : null, openGlyph),
+            m.reason ? el('div', { class: 'mail-why' }, '💡 ', m.reason) : null,
+            bodyBox),
+          actions: [
+            m.senderRule === 'star'
+              ? { label: '⚡ Unstar sender', kind: 'ghost', onpick: (close) => { rateSender(m, 'clear'); close('rated'); return false; } }
+              : { label: '⚡ Star sender', kind: 'ghost', onpick: (close) => { rateSender(m, 'star'); close('rated'); return false; } },
+            { label: '⊘ Sender', kind: 'ghost danger', onpick: (close) => { rateSender(m, 'block'); close('rated'); return false; } },
+            { label: '⊘ Domain', kind: 'ghost danger', onpick: (close) => { rateSender(m, 'block', 'domain'); close('rated'); return false; } },
+            {
+              label: 'Dismiss', kind: 'ghost',
+              onpick: (close) => { dismissMail(m); close('dismissed'); return false; },
+            },
+            { label: 'Close', kind: 'primary' },
+          ],
+        });
+        try {
+          const full = await get('/mail/message/' + m.uid);
+          if (full.html) {
+            // render the real email like a mail client would: sandboxed (no JS),
+            // remote images allowed, links escape to new tabs
+            const doc = '<!doctype html><html><head><meta charset="utf-8">'
+              + '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src https: http: data: cid:; style-src \'unsafe-inline\'; font-src https: data:">'
+              + '<base target="_blank"><style>body{margin:12px;background:#fff;color:#111;font:13.5px/1.5 -apple-system,\'Segoe UI\',sans-serif;word-break:break-word}img{max-width:100%;height:auto}</style></head><body>'
+              + full.html + '</body></html>';
+            bodyBox.replaceWith(el('iframe', {
+              class: 'mail-frame', title: m.subject,
+              sandbox: 'allow-popups allow-popups-to-escape-sandbox',
+              srcdoc: doc,
+            }));
+          } else {
+            bodyBox.textContent = full.body || m.snippet || '(no readable text body — open it in your mail client)';
+          }
+        } catch {
+          bodyBox.textContent = m.snippet || '(could not fetch the message — open it in your mail client)';
+        }
       }
 
       // life rail on the LEFT (calendar → weather → events → tasks), inbox on the RIGHT
@@ -194,7 +285,7 @@ export default {
         weatherPanel(weatherData),
         sideCard('Next 3 Days', 'planner', null, ...evItems),
         sideCard('Today\'s Tasks', 'planner', el('span', { class: 'muted small' }, new Date().toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })), ...taskItems));
-      const rightRail = el('div', { class: 'dash-side' },
+      const rightRail = el('div', { class: 'dash-side mail' },
         sideCard('Inbox', () => openApp('settings', { tab: 'mail' }), mailStat?.configured ? scanBtn : null, ...mailItems));
 
       root.innerHTML = '';
@@ -208,7 +299,7 @@ export default {
             stat(state.projects.length, 'projects'),
             stat(chats, 'chats'),
             stat(vaultNotes, 'vault notes'),
-            stat(maps, 'mindmaps')),
+            stat(lessons, 'lessons')),
           servicesEl,
           el('div', { class: 'quick-capture' }, capture),
           el('div', { class: 'dash-grid' },
@@ -218,11 +309,12 @@ export default {
             card('daily', 'Planner', 'Calendar, tasks, and your day at a glance', 'planner'),
             card('briefcase', 'Job Search', 'Find jobs and track your applications', 'jobsearch'),
             card('vault', 'Second Brain', cfg.vault?.path ? 'Browse, ask, and grow your Obsidian vault' : 'Connect your Obsidian vault', 'vault'),
-            card('mindmap', 'Mindmaps', 'Sketch ideas, expand branches with AI', 'mindmap'),
+            card('learn', 'Learning', 'Roadmaps and AI-tutored lessons, web-grounded', 'learn'),
             card('files', 'Files', 'Explore and edit project files', 'files'),
             card('terminal', 'Terminal', 'A real shell, right in your hub', 'terminal'),
             card('projects', 'Projects', 'Register, create, and manage workspaces', 'projects'),
             card('github', 'GitHub', 'Repos, PRs, and publishing — no browser needed', 'github'),
+            card('image', 'Studio', 'Generate images on your ComfyUI, VRAM handled', 'studio'),
             card('settings', 'Settings', 'Providers, appearance, network, security', 'settings'),
           )),
         rightRail,
@@ -230,7 +322,12 @@ export default {
     }
     const stat = (num, lbl) => el('div', { class: 'dash-stat' }, el('div', { class: 'num' }, String(num)), el('div', { class: 'lbl2' }, lbl));
     render();
+    // keep the dashboard live: weather, agenda, and inbox refresh themselves
+    win._tick = setInterval(() => { if (document.visibilityState !== 'hidden') render(); }, 5 * 60_000);
   },
 
-  unmount(win) { win._offs?.forEach(off => off()); },
+  unmount(win) {
+    clearInterval(win._tick);
+    win._offs?.forEach(off => off());
+  },
 };

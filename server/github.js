@@ -316,6 +316,134 @@ export async function publishProject(root, { name, description = '', isPrivate =
   return { ok: true, created, branch, remote: remote.replace(/\/\/[^@/]*@/, '//'), url: htmlUrl };
 }
 
+/** Push the current branch. Lighter than publishProject: never creates repos, never
+ *  commits — it pushes what exists and explains what's wrong when it can't. */
+export async function gitPush(root) {
+  if (!git.isRepo(root)) throw err('not a git repository');
+  const info = git.gitInfo(root);
+  if (!info.hasCommits) throw err('no commits yet — commit something first');
+  if (!info.remote) throw err('no origin remote — use Publish to create the GitHub repo first');
+  const args = info.hasUpstream ? ['push'] : ['push', '--set-upstream', 'origin', info.branch];
+  let r = await git.runGit(root, args, { timeoutMs: 60_000 });
+  if (r.code !== 0 && /github\.com/.test(info.remote)) {
+    r = await git.runGit(root, [...authArgs(), ...args], { timeoutMs: 60_000 });
+  }
+  if (r.code !== 0) {
+    const out = r.out.trim();
+    if (/non-fast-forward|fetch first|\[rejected\]/i.test(out)) {
+      throw err('push rejected — the remote has commits you don\'t have locally. Pull first, then push again.', 409);
+    }
+    throw err('git push failed: ' + out.slice(0, 400), 500);
+  }
+  const after = git.gitInfo(root);
+  return { ok: true, branch: after.branch, ahead: after.ahead, behind: after.behind };
+}
+
+/** Pull with rebase + autostash — the safe default for a single-author machine.
+ *  On conflict the rebase is aborted so the working tree comes back untouched,
+ *  and the error says which files collided instead of leaving a half-rebase. */
+export async function gitPull(root) {
+  if (!git.isRepo(root)) throw err('not a git repository');
+  const info = git.gitInfo(root);
+  if (!info.remote) throw err('no origin remote — nothing to pull from');
+  const args = ['pull', '--rebase', '--autostash', 'origin', ...(info.hasUpstream ? [] : [info.branch])];
+  let r = await git.runGit(root, args, { timeoutMs: 90_000 });
+  if (r.code !== 0 && /github\.com/.test(info.remote) && /authentication|403|could not read/i.test(r.out)) {
+    r = await git.runGit(root, [...authArgs(), ...args], { timeoutMs: 90_000 });
+  }
+  if (r.code !== 0) {
+    const out = r.out.trim();
+    if (/CONFLICT|could not apply/i.test(out)) {
+      await git.runGit(root, ['rebase', '--abort']);   // restore the tree — no half-rebase left behind
+      const files = [...out.matchAll(/CONFLICT [^:]*: (?:Merge conflict in )?(.+)/g)].map(m => m[1]).slice(0, 6);
+      throw err(`pull hit conflicts${files.length ? ` in: ${files.join(', ')}` : ''} — the rebase was aborted, your tree is unchanged. Commit your work, then resolve manually.`, 409);
+    }
+    throw err('git pull failed: ' + out.slice(0, 400), 500);
+  }
+  const after = git.gitInfo(root);
+  return { ok: true, branch: after.branch, ahead: after.ahead, behind: after.behind, out: r.out.trim().split('\n').slice(-3).join('\n') };
+}
+
+/** "https://github.com/o/r.git" or "git@github.com:o/r.git" → { owner, repo }. */
+export function parseGithubRemote(remote) {
+  const m = String(remote || '').match(/github\.com[/:]([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/);
+  return m ? { owner: m[1], repo: m[2] } : null;
+}
+
+/** Draft a PR title/body from the branch's commits + stat; template fallback. */
+export async function draftPR(root, { modelRef } = {}) {
+  const info = git.gitInfo(root);
+  if (!info.repo) throw err('not a git repository');
+  if (['main', 'master'].includes(info.branch)) throw err(`you're on ${info.branch} — create a work branch first (PRs from the default branch aren't useful)`);
+  const gh2 = parseGithubRemote(info.remote);
+  if (!gh2) throw err('origin is not a github.com remote — publish the project first');
+  const localBase = git.defaultBase(root);
+  const commits = git.branchCommits(root, localBase);
+  if (!commits.length) throw err(`no commits on ${info.branch} beyond ${localBase} — commit something first`);
+
+  const cfg = loadConfig();
+  const ref = modelRef || cfg.defaults.agentModel || cfg.defaults.chatModel;
+  const fallback = () => ({
+    title: commits[commits.length - 1] || `Changes on ${info.branch}`,
+    body: `## Changes\n${commits.map(c => `- ${c}`).join('\n')}`,
+  });
+  if (!ref) return { ...fallback(), branch: info.branch, base: localBase, generated: false };
+  try {
+    const res = await streamChat({
+      modelRef: ref, maxTokens: 1600,
+      system: 'You write excellent pull-request descriptions. Think briefly if you must, then output only the PR text.',
+      messages: [{
+        role: 'user',
+        text: `Write a pull request title and description for branch "${info.branch}".
+
+Format EXACTLY:
+TITLE: <imperative, ≤ 70 chars, names the main concrete change>
+BODY:
+## What
+<1-3 sentences on what this PR does>
+## Changes
+<one "- " bullet per meaningful change, specific>
+
+Commits on this branch:
+${commits.map(c => `- ${c}`).join('\n')}
+
+Diff stat vs ${localBase}:
+${(git.statPreview(root) || '').slice(0, 1500)}`,
+      }],
+    });
+    const t = res.text.match(/TITLE:\s*(.+)/i)?.[1]?.trim();
+    const b = res.text.split(/BODY:\s*/i)[1]?.trim();
+    if (t && b && !git.isGenericSubject(t)) return { title: t.slice(0, 90), body: b.slice(0, 4000), branch: info.branch, base: localBase, generated: true };
+  } catch { /* fall through */ }
+  return { ...fallback(), branch: info.branch, base: localBase, generated: false };
+}
+
+/** Push the branch and open (or find) its pull request. */
+export async function openPR(root, { title, body, base, draft = false, modelRef } = {}) {
+  const info = git.gitInfo(root);
+  const gh2 = parseGithubRemote(info.remote);
+  if (!gh2) throw err('origin is not a github.com remote — publish the project first');
+  if (['main', 'master'].includes(info.branch)) throw err(`you're on ${info.branch} — create a work branch first`);
+
+  // make sure the branch exists on the remote (tolerate failure if it was pushed before)
+  const pushed = await publishProject(root, {}).catch(e => ({ error: e.message }));
+  if (pushed.error && !info.hasUpstream) throw err('push failed: ' + pushed.error, 500);
+
+  const { data: repoInfo } = await gh(`/repos/${gh2.owner}/${gh2.repo}`);
+  const baseBranch = base || repoInfo.default_branch || 'main';
+
+  const { data: existing } = await gh(`/repos/${gh2.owner}/${gh2.repo}/pulls`, { params: { head: `${gh2.owner}:${info.branch}`, state: 'open' } });
+  if (existing?.length) return { existing: true, url: existing[0].html_url, number: existing[0].number, title: existing[0].title };
+
+  let t = title, b = body;
+  if (!t) { const d = await draftPR(root, { modelRef }); t = d.title; b = b || d.body; }
+  const { data } = await gh(`/repos/${gh2.owner}/${gh2.repo}/pulls`, {
+    method: 'POST',
+    body: { title: t, body: b || '', head: info.branch, base: baseBranch, draft: !!draft },
+  });
+  return { url: data.html_url, number: data.number, title: t };
+}
+
 /** Clone one of the user's repos into projectsRoot and register it as a project. */
 export async function cloneRepo({ fullName, cloneUrl } = {}) {
   fullName = String(fullName || '').trim();

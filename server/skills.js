@@ -72,6 +72,8 @@ export function skillsPrompt(root, modelRef) {
   const maxDetected = provider === 'ollama' ? 1 : 3;
 
   const chosen = ['core', ...detectStacks(root).slice(0, maxDetected)];
+  // a connected vault means the agent is expected to keep notes — teach the note system
+  if (loadConfig().vault?.path && provider !== 'ollama') chosen.push('notes');
   let out = '';
   const included = [];
   for (const name of chosen) {

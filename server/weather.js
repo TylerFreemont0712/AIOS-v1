@@ -77,6 +77,16 @@ export async function getWeather() {
   return data;
 }
 
+/** Synchronous view of the cache for prompt-context use; refreshes in the
+ *  background when stale so the NEXT message has fresh numbers. */
+export function cachedWeather() {
+  const w = loadConfig().weather || {};
+  if (typeof w.lat !== 'number' || typeof w.lon !== 'number') return null;
+  const fresh = cache.data && Date.now() - cache.at < 15 * 60_000;
+  if (!fresh) getWeather().catch(() => { });
+  return cache.data && cache.data.configured && !cache.data.error ? cache.data : null;
+}
+
 /** Lat/lon candidates for a place name (Open-Meteo geocoding, no key). */
 export async function geocode(q) {
   q = String(q || '').trim();

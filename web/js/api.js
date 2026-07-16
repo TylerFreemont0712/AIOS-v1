@@ -104,11 +104,13 @@ function connect() {
   ws.onmessage = (e) => {
     let m; try { m = JSON.parse(e.data); } catch { return; }
     for (const fn of typeHandlers.get(m.t) || []) { try { fn(m); } catch (err) { console.error(err); } }
-    // topic fanout: published messages carry ids we can map back to topics
-    const topic =
-      m.t === 'agent.event' ? `agent:${m.sessionId}` :
-      m.t === 'chat.event' ? `chat:${m.chatId}` :
-      m.t === 'vault.ai' ? `vaultai:${m.reqId}` : null;
+    // topic fanout: the server stamps _topic on every published message, so any
+    // stream (agent/chat/research/comfy/gh.suggest/vault.ai) routes generically.
+    // Legacy fallbacks kept in case an older server omits _topic.
+    const topic = m._topic ||
+      (m.t === 'agent.event' ? `agent:${m.sessionId}` :
+       m.t === 'chat.event' ? `chat:${m.chatId}` :
+       m.t === 'vault.ai' ? `vaultai:${m.reqId}` : null);
     if (topic) for (const fn of subs.get(topic) || []) { try { fn(m); } catch (err) { console.error(err); } }
   };
   ws.onclose = () => {

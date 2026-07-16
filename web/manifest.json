@@ -1,0 +1,16 @@
+{
+  "name": "AIOS — your AI operating hub",
+  "short_name": "AIOS",
+  "description": "Chat, agent, planner, inbox, research, and your second brain — self-hosted on your LAN.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#262624",
+  "theme_color": "#262624",
+  "icons": [
+    { "src": "/icons/aios.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icons/aios-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/aios-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

@@ -31,6 +31,7 @@ export const icons = {
   projects: I('<rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="8" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/>'),
   vault: I('<path d="M4 19.5V6a2 2 0 0 1 2-2h13.5v14H6a2 2 0 0 0-2 2z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19.5v-4"/><path d="M9 8h7M9 11.5h5"/>'),
   mindmap: I('<circle cx="12" cy="12" r="2.6"/><circle cx="4.5" cy="6" r="1.8"/><circle cx="19.5" cy="5.5" r="1.8"/><circle cx="5" cy="18.5" r="1.8"/><circle cx="19" cy="18" r="1.8"/><path d="M10 10.4 6 7.2m8-.1 3.7-1.1M10.2 13.7 6.3 17.4m7.6-.2 3.5.5"/>'),
+  learn: I('<path d="M12 4 2.5 8.5 12 13l9.5-4.5z"/><path d="M6.2 10.8V16c0 1.5 2.6 2.9 5.8 2.9s5.8-1.4 5.8-2.9v-5.2"/><path d="M21.5 8.5V14"/>'),
   settings: I('<circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55h.01a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1z"/>'),
   folder: I('<path d="M3 6.5A2.5 2.5 0 0 1 5.5 4h4L12 7h6.5A2.5 2.5 0 0 1 21 9.5v8a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/>'),
   plus: I('<path d="M12 5v14M5 12h14"/>'),
@@ -91,12 +92,12 @@ export function toast(msg, kind = '') {
 
 // ---------- modals ----------
 
-export function modal({ title, sub, body, actions, wide }) {
+export function modal({ title, sub, body, actions, wide, xl }) {
   return new Promise((resolve) => {
     const overlay = el('div', { class: 'modal-overlay' });
     const close = (v) => { overlay.remove(); resolve(v); };
     overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(null); });
-    const box = el('div', { class: 'modal' + (wide ? ' wide' : '') },
+    const box = el('div', { class: 'modal' + (xl ? ' xl' : wide ? ' wide' : '') },
       title && el('div', { class: 'modal-title' }, title),
       sub && el('div', { class: 'modal-sub' }, sub),
       body,

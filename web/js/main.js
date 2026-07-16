@@ -15,8 +15,9 @@ import files from './apps/files.js';
 import terminal from './apps/terminal.js';
 import projectsApp from './apps/projects.js';
 import githubApp from './apps/github.js';
+import studio from './apps/studio.js';
 import vault from './apps/vault.js';
-import mindmap from './apps/mindmap.js';
+import learn from './apps/learn.js';
 import planner from './apps/planner.js';
 import settings from './apps/settings.js';
 
@@ -155,7 +156,7 @@ function openPalette() {
     { group: 'Actions', label: 'Job application board', icon: 'briefcase', run: () => openApp('jobsearch', { view: 'board' }) },
     { group: 'Actions', label: 'Daily note capture', icon: 'daily', run: quickCapture },
     { group: 'Actions', label: 'Today\'s agenda', icon: 'daily', run: () => openApp('planner') },
-    { group: 'Actions', label: 'New mindmap', icon: 'mindmap', run: () => openApp('mindmap', { fresh: true }) },
+    { group: 'Actions', label: 'Learning corner', icon: 'learn', run: () => openApp('learn') },
     { group: 'Actions', label: 'Agent tools & web search', icon: 'wrench', run: () => openApp('settings', { tab: 'tools' }) },
     { group: 'Actions', label: 'Toggle theme', icon: 'moon', run: () => document.getElementById('tb-theme').click() },
   ];
@@ -234,11 +235,24 @@ async function boot() {
   registerApp(terminal);
   registerApp(projectsApp);
   registerApp(githubApp);
+  registerApp(studio);
   registerApp(vault);
-  registerApp(mindmap);
+  registerApp(learn);
   registerApp(planner);
   registerApp(settings);
-  renderDock(['home', '|', 'chat', 'agent', 'research', 'jobsearch', 'files', 'terminal', '|', 'projects', 'vault', 'mindmap', '|', 'settings']);
+  renderDock(['home', '|', 'chat', 'agent', 'research', 'jobsearch', '|', 'planner', 'github', 'studio', 'vault', 'learn', '|', 'files', 'terminal', 'projects', '|', 'settings']);
+
+  // PWA: installable from the pairing link; the SW is a plain passthrough
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => { });
+
+  // mobile: hamburger toggles the active app's side panel as an overlay
+  const menuBtn = document.getElementById('tb-menu');
+  menuBtn?.addEventListener('click', () => document.body.classList.toggle('show-side'));
+  document.getElementById('views')?.addEventListener('click', (e) => {
+    if (document.body.classList.contains('show-side') && !e.target.closest('.side, .set-nav')) {
+      document.body.classList.remove('show-side');
+    }
+  });
   initTopbar();
 
   try {

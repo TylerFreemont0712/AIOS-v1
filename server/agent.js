@@ -7,11 +7,12 @@ import os from 'node:os';
 import { DATA, loadConfig, contextBudget } from './config.js';
 import { streamChat } from './llm.js';
 import { toolSchemas, runTool, isWriteTool, isWikiScopedCall, diffPreview } from './tools.js';
-import { checkFile, checkFiles } from './checks.js';
+import { checkFile, checkFiles, runProjectTests } from './checks.js';
 import { skillsPrompt } from './skills.js';
 import { id as genId, now, readJSON, writeJSON, estTokens, safePath, clampMiddle } from './util.js';
 import { getProject } from './projects.js';
 import { promptContext as gitContext } from './git.js';
+import { appContext } from './context.js';
 
 const DIR = path.join(DATA, 'agent');
 const live = new Map(); // sessionId -> { abort, approvals: Map, running }
@@ -120,6 +121,8 @@ export async function userMessage(sid, text, attachments) {
   // run bookkeeping: files touched (self-check), mistakes (memory reflection), loop guards
   const touched = new Set();
   let fixRounds = 0;
+  let testRounds = 0;
+  let testedClean = false;
   let denied = 0;
   let editsMade = 0;
   let memoryWrites = 0;
@@ -177,7 +180,25 @@ export async function userMessage(sid, text, attachments) {
           touched.clear();
         }
 
-        // 2) Memory round: substantial run and nothing recorded → one bounded nudge
+        // 2) Verify v2: syntax is clean and files changed — run the project's real
+        // tests (when it has any) and bounce failures back, bounded like self-check.
+        if (agentCfg.runTests !== 'off' && editsMade > 0 && !testedClean && testRounds < maxFix) {
+          const tr = await runProjectTests(s.root, { timeoutMs: Math.max(10_000, Math.min(agentCfg.testTimeoutMs || 120_000, 600_000)) });
+          if (tr) {
+            emit(sid, { type: 'test.report', ok: tr.ok, cmd: tr.cmd, via: tr.via, ms: tr.ms, round: testRounds + 1 });
+            if (!tr.ok) {
+              testRounds++;
+              const text = `[automatic test run ${testRounds}/${maxFix}] The turn ended, but the project's tests FAIL (\`${tr.cmd}\`, from ${tr.via}):\n\n${tr.output || '(no output)'}\n\nFix the failures now: read the failing test/file, make a minimal change, and re-run \`${tr.cmd}\` with bash to confirm before finishing. Do not touch unrelated code, and never weaken a test just to make it pass.`;
+              s.transcript.push({ role: 'user', text, auto: true, kind: 'check', ts: now() });
+              save(s);
+              emit(sid, { type: 'user', text, auto: true, kind: 'check' });
+              continue;
+            }
+            testedClean = true;
+          }
+        }
+
+        // 3) Memory round: substantial run and nothing recorded → one bounded nudge
         // to persist learnings (and lessons from this run's mistakes) to .aios/memory/.
         if (agentCfg.memory !== false && !memoryPrompted && memoryWrites === 0
           && (editsMade >= 2 || fixRounds > 0 || denied > 0)) {
@@ -209,6 +230,7 @@ export async function userMessage(sid, text, attachments) {
           if (inAios(s.root, call.args.path)) memoryWrites++;
           else {
             editsMade++;
+            testedClean = false;   // new edits invalidate a previous green test run
             if (loadConfig().agent.selfCheck !== 'off') {
               touched.add(call.args.path);
               const chk = await checkFile(s.root, call.args.path);
@@ -291,6 +313,10 @@ Be terse — a few lines per file. If nothing is genuinely worth recording, repl
 
 function systemPrompt(s) {
   const cfg = loadConfig();
+  // one schema read per prompt build — the module-level hasTool would rescan the
+  // custom-tools dir for every feature check, every turn
+  const toolNames = new Set(toolSchemas().map(t => t.name));
+  const hasTool = (name) => toolNames.has(name);
   let listing = '';
   try {
     listing = fs.readdirSync(s.root, { withFileTypes: true })
@@ -323,11 +349,12 @@ Version control (git is part of how you build — not an afterthought):
 Knowledge base (your long-term memory — use it autonomously, don't ask permission):
 - START of any non-trivial topic: wiki_recall it. The wiki holds curated docs, decisions, and past learnings that prevent repeated mistakes.
 - END of any run where you learned something reusable (an API's behaviour, a working pattern, a fix, a decision): save it with wiki_learn — atomic notes, concise titles; frontmatter, autolinking, and the Home index are handled for you. These writes are pre-approved.
+- Notes are TYPED: concept / howto / reference / decision / troubleshooting / source / project. Pass \`kind\` to wiki_learn and follow that kind's template — note_template {kind} shows the scaffold, and the \`notes\` skill has the full system.
 - wiki_generate scaffolds a whole topic as interlinked notes; daily_log records notable events to the user's journal. Raw access (vault_search/list/read/write/append) exists for notes outside the wiki — those writes need approval.` : ''}${hasTool('research_start') ? `
 
 You can run AIOS apps yourself instead of telling the user to:
 - research_start for questions needing real sources (it searches, reads, and writes a cited report in the background; the report auto-exports to the wiki). Poll research_status between other work.
-- mindmap_generate to structure a topic/plan visually — it appears in the Mindmaps app and its outline lands in the wiki.${hasTool('agenda_view') ? `
+- mindmap_generate to structure a topic/plan as a tree outline — it lands in the wiki as a nested-list note.${hasTool('agenda_view') ? `
 - agenda_view / task_add / event_add manage the user's Planner: check the schedule when dates matter, and capture to-dos or appointments the user mentions (additive, normally pre-approved).` : ''}${hasTool('mail_search') ? `
 - mail_recent / mail_search / mail_read give READ-ONLY access to the user's inbox (nothing gets marked seen). Use them when asked about email, or to ground follow-ups (interviews, invoices, deliveries). Quote emails faithfully; never invent message content.` : ''}` : ''}${hasTool('create_tool') ? `
 
@@ -336,7 +363,7 @@ Tool foundry: when a capability you need is missing AND would be reused (calling
 - Be concise in prose. Explain what you did and why in a short summary when you finish, referencing files as path:line.
 - Never fabricate tool results or claim success without verifying.
 - If the user asks a question rather than requesting changes, answer it — don't modify files unprompted.
-${projectContext(s)}${skillsPrompt(s.root, s.modelRef)}
+${cfg.defaults.appContext !== false ? (() => { try { const ctx = appContext({ chars: 1100, days: 2 }); return ctx ? '\n' + ctx + '\n(agenda_view has the full planner when you need more.)\n' : ''; } catch { return ''; } })() : ''}${projectContext(s)}${skillsPrompt(s.root, s.modelRef)}
 
 User: ${cfg.user.name}. Approval mode: ${s.mode} (${s.mode === 'edits' ? 'write tools require user approval — if denied, adapt' : s.mode === 'auto' ? 'all tools pre-approved' : 'read-only: write tools are unavailable'}).`;
 }
@@ -365,8 +392,6 @@ function projectContext(s) {
   }
   return out;
 }
-
-const hasTool = (name) => toolSchemas().some(t => t.name === name);
 
 /** Trim transcript to a char budget by dropping oldest exchanges (user → next user). */
 function trimmed(s, budget) {

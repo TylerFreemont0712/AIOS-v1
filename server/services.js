@@ -18,51 +18,43 @@ export function registerService(svc) { extra.push(svc); return svc; }
 
 export async function probeServices() {
   const cfg = loadConfig();
-  const out = [];
 
-  // web search (SearXNG)
-  try {
-    const sx = await searxngStatus();
-    out.push({
-      id: 'searxng', name: 'SearXNG', group: 'Search', settingsTab: 'tools',
-      status: !sx.url ? 'off' : sx.up ? 'up' : 'down',
-      detail: sx.up ? sx.url : (sx.url ? 'not responding' : 'not configured'),
-    });
-  } catch (e) { out.push({ id: 'searxng', name: 'SearXNG', group: 'Search', settingsTab: 'tools', status: 'down', detail: e.message }); }
+  // Each entry resolves to one-or-more chips. Everything runs CONCURRENTLY so a
+  // slow/unreachable service (network timeout) can't stall the whole row, while
+  // the output order stays stable for the dashboard.
+  const searxng = (async () => {
+    try {
+      const sx = await searxngStatus();
+      return [{ id: 'searxng', name: 'SearXNG', group: 'Search', settingsTab: 'tools',
+        status: !sx.url ? 'off' : sx.up ? 'up' : 'down',
+        detail: sx.up ? sx.url : (sx.url ? 'not responding' : 'not configured') }];
+    } catch (e) { return [{ id: 'searxng', name: 'SearXNG', group: 'Search', settingsTab: 'tools', status: 'down', detail: e.message }]; }
+  })();
 
-  // model providers
-  try {
-    const pv = await probeProviders();
-    out.push({
-      id: 'anthropic', name: 'Anthropic', group: 'Models', settingsTab: 'providers',
-      status: pv.anthropic.configured ? 'up' : 'off',
-      detail: pv.anthropic.configured ? 'API key set' : 'no key',
-    });
-    out.push({
-      id: 'ollama', name: 'Ollama', group: 'Models', settingsTab: 'providers',
-      status: pv.ollama.up ? 'up' : 'off',
-      detail: pv.ollama.up ? `${pv.ollama.models} model${pv.ollama.models === 1 ? '' : 's'}` : 'not running',
-    });
-    for (const c of pv.custom) out.push({
-      id: 'custom_' + c.id, name: c.name, group: 'Models', settingsTab: 'providers',
-      status: c.up ? 'up' : 'down', detail: c.up ? 'reachable' : 'unreachable',
-    });
-  } catch (e) { out.push({ id: 'models', name: 'Model providers', group: 'Models', settingsTab: 'providers', status: 'down', detail: e.message }); }
+  const providers = (async () => {
+    try {
+      const pv = await probeProviders();
+      return [
+        { id: 'anthropic', name: 'Anthropic', group: 'Models', settingsTab: 'providers', status: pv.anthropic.configured ? 'up' : 'off', detail: pv.anthropic.configured ? 'API key set' : 'no key' },
+        { id: 'ollama', name: 'Ollama', group: 'Models', settingsTab: 'providers', status: pv.ollama.up ? 'up' : 'off', detail: pv.ollama.up ? `${pv.ollama.models} model${pv.ollama.models === 1 ? '' : 's'}` : 'not running' },
+        ...pv.custom.map(c => ({ id: 'custom_' + c.id, name: c.name, group: 'Models', settingsTab: 'providers', status: c.up ? 'up' : 'down', detail: c.up ? 'reachable' : 'unreachable' })),
+      ];
+    } catch (e) { return [{ id: 'models', name: 'Model providers', group: 'Models', settingsTab: 'providers', status: 'down', detail: e.message }]; }
+  })();
 
-  // second brain (vault)
-  const vpath = cfg.vault?.path;
-  const vaultOk = vpath && fs.existsSync(vpath);
-  out.push({
-    id: 'vault', name: 'Second brain', group: 'Data', settingsTab: 'vault',
-    status: !vpath ? 'off' : vaultOk ? 'up' : 'down',
-    detail: !vpath ? 'not connected' : vaultOk ? 'connected' : 'path missing',
-  });
+  const vault = (async () => {
+    const vpath = cfg.vault?.path;
+    const vaultOk = vpath && fs.existsSync(vpath);
+    return [{ id: 'vault', name: 'Second brain', group: 'Data', settingsTab: 'vault',
+      status: !vpath ? 'off' : vaultOk ? 'up' : 'down',
+      detail: !vpath ? 'not connected' : vaultOk ? 'connected' : 'path missing' }];
+  })();
 
-  // future services
-  for (const s of extra) {
-    try { const r = await s.probe(cfg); out.push({ id: s.id, name: s.name, group: s.group || 'Service', settingsTab: s.settingsTab, status: r.status || 'unknown', detail: r.detail || '' }); }
-    catch (e) { out.push({ id: s.id, name: s.name, group: s.group || 'Service', settingsTab: s.settingsTab, status: 'down', detail: e.message }); }
-  }
+  const extras = extra.map(s => (async () => {
+    try { const r = await s.probe(cfg); return [{ id: s.id, name: s.name, group: s.group || 'Service', settingsTab: s.settingsTab, status: r.status || 'unknown', detail: r.detail || '' }]; }
+    catch (e) { return [{ id: s.id, name: s.name, group: s.group || 'Service', settingsTab: s.settingsTab, status: 'down', detail: e.message }]; }
+  })());
 
-  return out;
+  const groups = await Promise.all([searxng, providers, vault, ...extras]);
+  return groups.flat();
 }

@@ -38,14 +38,50 @@ const defaults = () => ({
   weather: { lat: null, lon: null, place: '', units: 'c' },
   // GitHub app. token is optional — when empty, the server borrows the gh CLI's login.
   github: { token: '' },
+  // AIOS owns the local llama.cpp server (approved 2026-07-11). 'big' is the GPU
+  // daily driver; 'tiny' runs CPU-only so ComfyUI gets the whole GPU (Studio mode).
+  llm: {
+    managed: true,
+    binary: '/home/joejin/llama.cpp/build/bin/llama-server',
+    // the PyQt launcher (Whisper/MusicGen/manual llama tinkering) — AIOS can open it
+    launcher: '/home/joejin/ai/llama-launcher/launch_llama_server.sh',
+    port: 8080,
+    profiles: {
+      big: {
+        model: '/home/joejin/ai/models/ornith-1.0-9b-Q5_K_M.gguf', alias: 'ornith-9b',
+        args: ['--ctx-size', '32758', '-ngl', 'auto', '--batch-size', '2048', '--ubatch-size', '512', '--threads', '8', '--parallel', '1', '--cache-reuse', '256', '--flash-attn', 'on', '--cache-type-k', 'q8_0', '--cache-type-v', 'q8_0'],
+      },
+      tiny: {
+        // lives in AIOS's data dir — ~/ai/models is root-owned on this machine
+        model: path.join(DATA, 'llm', 'models', 'Qwen3-1.7B-Q8_0.gguf'), alias: 'tiny',
+        args: ['--ctx-size', '8192', '-ngl', '0', '--threads', '8'],
+      },
+    },
+  },
+  // ComfyUI connector (Studio app). autoSwap: generating while the big LLM holds
+  // VRAM swaps to the tiny profile first. autoFree: release Comfy VRAM after jobs.
+  // dir/python: AIOS can start/stop the ComfyUI server itself (Studio header).
+  comfy: {
+    url: 'http://127.0.0.1:8188', autoSwap: true, autoFree: true, autoStart: true,
+    // listen 0.0.0.0 so the full ComfyUI UI is reachable from other LAN devices too
+    // --enable-manager loads ComfyUI's built-in Manager (the pip `comfyui_manager`
+    // package, pinned by ComfyUI's manager_requirements.txt). Without the flag the
+    // Manager silently does not load — there is no custom_nodes entry for it since
+    // v0.28. Its API lives under /api/v2/... ; the old /api/manager/* routes are V3.
+    dir: '/home/joejin/comfyui/ComfyUI', python: '/home/joejin/venv/bin/python', listen: '0.0.0.0',
+    args: ['--enable-manager'],
+  },
   // autoApprove: agent writes scoped to the wiki/daily note skip the approval gate.
   // autoExport: finished deep-research reports are saved into the wiki automatically.
   vault: { path: '', wikiFolder: 'AI Wiki', dailyFolder: 'Daily', autoApprove: true, autoExport: true },
   // selfCheck: 'off' = trust the model, 'syntax' = check every written file,
   // 'review' = also re-check everything when the agent says it's done and bounce failures back.
+  // runTests: 'review' = after a clean self-check, run the project's own test command
+  // (package.json/pytest/Makefile/cargo/go, or a "verify:" line in .aios/instructions.md)
+  // and bounce failures back; 'off' disables.
   // skills: inject stack-matched coding playbooks (skills/*.md) into the agent prompt.
   // memory: per-project persistent memory in <project>/.aios/memory/ + end-of-run record loop.
-  agent: { maxTurns: 40, bashTimeoutMs: 60000, maxOutputChars: 30000, selfCheck: 'review', maxFixRounds: 2, skills: true, memory: true },
+  agent: { maxTurns: 40, bashTimeoutMs: 60000, maxOutputChars: 30000, selfCheck: 'review', maxFixRounds: 2, runTests: 'review', testTimeoutMs: 120000, skills: true, memory: true },
   tools: {
     disabled: [],                                   // tool names the agent may not use
     searxng: { url: 'http://127.0.0.1:8890' },      // bundled metasearch instance (npm run searxng)
@@ -106,7 +142,7 @@ export function publicConfig() {
 /** Apply a partial update from the client. Secrets arrive via explicit fields. */
 export function updateConfig(patch) {
   const c = loadConfig();
-  const allowed = ['user', 'appearance', 'defaults', 'projectsRoot', 'vault', 'agent', 'tools', 'sampling', 'weather'];
+  const allowed = ['user', 'appearance', 'defaults', 'projectsRoot', 'vault', 'agent', 'tools', 'sampling', 'weather', 'llm', 'comfy'];
   for (const k of allowed) if (patch[k] !== undefined) c[k] = deepMerge(c[k], patch[k]);
   if (patch.mail) {
     const m = patch.mail, M = c.mail;
