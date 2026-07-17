@@ -108,6 +108,13 @@ graded answer — that record, not your impression, decides what comes next.
   conspicuously longest).
 - **multi**: 4-6 choices, 2+ correct. Only when the skill genuinely is "pick all that apply".
   Partial credit applies, but a wrong pick zeroes the question — so distractors still matter.
+- **shortanswer**: the student TYPES the answer — a term, a command, a predicted output.
+  Use when recognition would give it away: recalling `git rebase -i` is a different skill
+  from picking it out of four options. List EVERY acceptable spelling/alias in the answer
+  array; grading is exact-match after lowercasing and space-collapsing.
+- **order**: 3-6 items arranged into the correct sequence, partial credit for mostly-right.
+  Use when sequence IS the skill — pipelines, precedence, lifecycle stages, chronology.
+  Present the items scrambled; never in the correct order.
 - **open**: the student writes prose or code, and you grade it against a rubric. Use these
   for anything where the reasoning matters more than the answer. The rubric goes in the
   answer field: 3-5 CONCRETE checkpoints a full-credit response must hit, not "explains it well".

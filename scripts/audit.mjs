@@ -475,12 +475,19 @@ await hard('learn: subject tree + roadmap/lesson state', async () => {
   const j = L.extractJSON('noise {"modules":[{"title":"a","topics":["t",]}]} tail');
   assert(j?.modules?.[0]?.title === 'a', 'extractJSON should survive noise + trailing commas');
 
-  // deleting a parent cascades to descendants (FK ON DELETE CASCADE)
-  L.deleteSubject(s.id);
+  // a subject with content refuses to die without its name typed back…
+  let guarded = false;
+  try { L.deleteSubject(s.id); } catch { guarded = true; }
+  assert(guarded, 'delete of a subject with content must demand confirmation');
+  let wrongName = false;
+  try { L.deleteSubject(s.id, { confirm: 'not the name' }); } catch { wrongName = true; }
+  assert(wrongName, 'a wrong confirmation name must be rejected');
+  // …and with the right name it cascades to descendants (FK ON DELETE CASCADE)
+  L.deleteSubject(s.id, { confirm: 'Audit Subject' });
   const ids = new Set(L.listSubjects().map(x => x.id));
   assert(!ids.has(s.id) && !ids.has(kid.id) && !ids.has(grandkid.id), 'delete must cascade to sub-subjects');
   assert(DB.one('SELECT COUNT(*) c FROM modules WHERE subject_id = ?', s.id).c === 0, 'cascade must not orphan modules');
-  return 'seed · CRUD · nesting + cascade · module/lesson toggles · tolerant JSON';
+  return 'seed · CRUD · nesting + cascade · guarded delete · module/lesson toggles · tolerant JSON';
 });
 
 await hard('learn: lesson health checker', async () => {
@@ -526,28 +533,41 @@ await hard('learn: assessments, scoring + mastery', async () => {
   L.addQuestion(a.id, { kind: 'mcq', prompt: 'p1', choices: ['a', 'b', 'c', 'd'], answer: '1', topic: 'alpha', points: 1 });
   L.addQuestion(a.id, { kind: 'multi', prompt: 'p2', choices: ['a', 'b', 'c', 'd'], answer: '[0,2]', topic: 'beta', points: 2 });
   L.addQuestion(a.id, { kind: 'mcq', prompt: 'p3', choices: ['a', 'b'], answer: '0', topic: 'alpha', points: 1 });
+  L.addQuestion(a.id, { kind: 'shortanswer', prompt: 'p4', answer: '["O(log n)","log n"]', topic: 'gamma', points: 1 });
+  L.addQuestion(a.id, { kind: 'order', prompt: 'p5', choices: ['fetch', 'parse', 'render', 'paint'], answer: '[0,1,2,3]', topic: 'delta', points: 2 });
 
   // the student-facing paper must never leak answers
   const paper = L.getAssessment(s.id, a.id);
-  assert(paper.questions.length === 3, 'questions stored');
+  assert(paper.questions.length === 5, 'questions stored');
   assert(!paper.questions.some(q => 'answer' in q || 'explanation' in q), 'answers must not reach the student');
   assert(L.getAssessment(s.id, a.id, { withAnswers: true }).questions[0].answer === '1', 'answers available server-side');
 
-  // a malformed mcq (too few choices) is demoted rather than shipped unanswerable
+  // malformed questions are rejected at authoring, not shipped unanswerable
   let bad = false;
   try { L.addQuestion(a.id, { kind: 'mcq', prompt: 'x', choices: ['only'], answer: '0' }); } catch { bad = true; }
   assert(bad, 'mcq with <2 choices must be rejected');
+  let badOrder = false;
+  try { L.addQuestion(a.id, { kind: 'order', prompt: 'x', choices: ['a', 'b', 'c'], answer: '[0,0,1]' }); } catch { badOrder = true; }
+  assert(badOrder, 'order answer must be a real permutation');
 
-  const [q1, q2, q3] = paper.questions;
+  const [q1, q2, q3, q4, q5] = paper.questions;
   const at = L.startAttempt(s.id, a.id);
   // q1 right (1/1) · q2 half-picked, no wrong pick → partial 1/2 · q3 wrong (0/1)
-  L.submitAttempt({ subjectId: s.id, assessmentId: a.id, attemptId: at.id, answers: { [q1.id]: '1', [q2.id]: ['0'], [q3.id]: '1' } });
+  // q4 typed with stray case/space → still right (1/1) · q5 two items swapped → LCS partial (1.33/2)
+  L.submitAttempt({
+    subjectId: s.id, assessmentId: a.id, attemptId: at.id,
+    answers: { [q1.id]: '1', [q2.id]: ['0'], [q3.id]: '1', [q4.id]: '  O(LOG N) ', [q5.id]: ['0', '2', '1', '3'] },
+  });
   const deadline = Date.now() + 4000;
   let t = L.getAttempt(s.id, at.id);
   while (!t.submittedAt && Date.now() < deadline) { await new Promise(r => setTimeout(r, 60)); t = L.getAttempt(s.id, at.id); }
   assert(t.submittedAt, 'attempt should grade without a model when there are no open questions');
-  assert(t.score === 2 && t.maxScore === 4, `score should be 2/4, got ${t.score}/${t.maxScore}`);
-  assert(t.passed === false, '50% must fail a 70% bar');
+  assert(t.score === 4.33 && t.maxScore === 7, `score should be 4.33/7, got ${t.score}/${t.maxScore}`);
+  assert(t.passed === false, '62% must fail a 70% bar');
+  const r4 = t.responses.find(x => x.questionId === q4.id);
+  const r5 = t.responses.find(x => x.questionId === q5.id);
+  assert(r4.correct === true, 'shortanswer must grade case/space-insensitively');
+  assert(r5.correct === false && r5.points === 1.33, 'order must give LCS partial credit');
 
   // every graded answer moves per-topic mastery — the adaptive spine
   const weak = L.getWeakTopics(s.id);
@@ -562,8 +582,8 @@ await hard('learn: assessments, scoring + mastery', async () => {
 
   L.recordTopicResult(s.id, 'alpha', true);
   assert(L.getWeakTopics(s.id).find(w => w.topic === 'alpha').seen === 3, 'conversational grading moves mastery too');
-  L.deleteSubject(s.id);
-  return 'authoring · answer hiding · mcq/multi partial credit · pass bar · mastery · replay guard';
+  L.deleteSubject(s.id, { confirm: 'Audit Quiz Subject' });   // has attempts → guarded
+  return 'authoring · answer hiding · mcq/multi/shortanswer/order grading · pass bar · mastery · replay guard';
 });
 
 await hard('llmctl: profiles + launcher config', async () => {

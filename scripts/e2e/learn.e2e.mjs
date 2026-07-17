@@ -68,12 +68,17 @@ const mock = http.createServer((req, res) => {
         paths: [{ title: 'Path Z', horizon: '3 months', why: 'Because.', steps: ['a', 'b', 'c'] }],
       });
     } else if (/Write about \d+ questions/i.test(userText)) {
-      // assessment/drill author — also contains "STRICT JSON", so it must match first
+      // assessment/drill author — also contains "STRICT JSON", so it must match first.
+      // One of each objective kind, plus a broken order (bad permutation) that the
+      // sanitizer must demote to open instead of shipping unanswerable.
       out = JSON.stringify({ title: 'Mock paper', blurb: 'b', questions: [
         { kind: 'mcq', prompt: 'Q1', choices: ['a', 'b', 'c', 'd'], answer: '0', explanation: 'e', topic: 't1', difficulty: 'core', points: 1 },
-        { kind: 'mcq', prompt: 'Q2', choices: ['a', 'b', 'c', 'd'], answer: '1', explanation: 'e', topic: 't2', difficulty: 'warmup', points: 1 },
-        { kind: 'mcq', prompt: 'Q3', choices: ['a', 'b', 'c', 'd'], answer: '2', explanation: 'e', topic: 't1', difficulty: 'core', points: 1 },
+        { kind: 'shortanswer', prompt: 'Q2', answer: '["yield"]', explanation: 'e', topic: 't2', difficulty: 'warmup', points: 1 },
+        { kind: 'order', prompt: 'Q3', choices: ['x', 'y', 'z'], answer: '[2,0,1]', explanation: 'e', topic: 't1', difficulty: 'core', points: 1 },
+        { kind: 'order', prompt: 'Q4-broken', choices: ['x', 'y', 'z'], answer: '[0,0,1]', explanation: 'e', topic: 't3', difficulty: 'core', points: 1 },
       ] });
+    } else if (/You are grading \d+ written answer/i.test(userText)) {
+      out = JSON.stringify({ grades: [{ n: 1, points: 1, correct: true, feedback: 'fine' }] });
     } else if (/Output STRICT JSON only/i.test(userText)) {
       out = '{"modules":[{"title":"Language fundamentals","summary":"Can write small scripts.","topics":["variables","functions","control flow"]},{"title":"Tooling","summary":"Can use git and a debugger.","topics":["git basics","debugging"]},{"title":"Project: CLI tool","summary":"Ships a small CLI.","topics":["argument parsing","packaging"]}]}';
     } else if (/YOU ARE REWRITING/i.test(userText)) {
@@ -232,10 +237,26 @@ ok(subj.advice?.paths?.[0]?.steps?.length === 3, 'path suggestion persisted with
 // ---- drill kind ----
 const drillEvents = await streamRun(() => j('POST', `/learn/${id}/assessment`, { kind: 'drill', modelRef: 'mock:m1' }));
 const drillDone = drillEvents.find(e => e.ev.type === 'done');
-ok(drillDone?.ev.kind === 'assessment' && drillDone.ev.count === 3, 'drill generated with questions');
+ok(drillDone?.ev.kind === 'assessment' && drillDone.ev.count === 4, 'drill generated with questions');
 subj = (await j('GET', '/learn/' + id)).data;
 const drillA = subj.assessments.find(a => a.kind === 'drill');
-ok(drillA && drillA.passPct === 0 && drillA.questions === 3, 'drill stored with no pass bar');
+ok(drillA && drillA.passPct === 0 && drillA.questions === 4, 'drill stored with no pass bar');
+// the paper carries every kind correctly, and the broken order was demoted to open
+const drillPaper = (await j('GET', `/learn/${id}/assessment/${drillA.id}`)).data;
+ok(drillPaper.questions.map(q => q.kind).join(',') === 'mcq,shortanswer,order,open', 'kinds preserved; invalid order demoted to open');
+// submit through the real API: mcq right, shortanswer right (messy case), order right
+const dAt = (await j('POST', `/learn/${id}/assessment/${drillA.id}/start`, {})).data;
+const [dq1, dq2, dq3, dq4] = drillPaper.questions;
+await j('POST', `/learn/${id}/assessment/${drillA.id}/submit`, {
+  attemptId: dAt.id,
+  answers: { [dq1.id]: '0', [dq2.id]: ' YIELD ', [dq3.id]: ['2', '0', '1'], [dq4.id]: 'prose answer' },
+  modelRef: 'mock:m1',   // the open question routes to the mock grader
+});
+await new Promise(r => setTimeout(r, 1200));
+const dT = (await j('GET', `/learn/${id}/attempt/${dAt.id}`)).data;
+ok(dT.submittedAt, 'drill attempt graded');
+ok(dT.responses.find(x => x.questionId === dq2.id)?.correct === true, 'typed answer graded case-insensitively over the API');
+ok(dT.responses.find(x => x.questionId === dq3.id)?.correct === true, 'order arrangement graded over the API');
 
 // ---- offline regenerate (the escape hatch when web search is what derails it) ----
 const offEvents = await streamRun(() => j('POST', `/learn/${id}/lessons/${lesson.id}/regenerate`, { modelRef: 'mock:m1', useWeb: false }));

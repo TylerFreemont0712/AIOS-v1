@@ -498,15 +498,15 @@ export const TOOL_DEFS = [
   },
   {
     name: 'learn_add_question', write: true, group: 'learning',
-    description: 'Add one question to an assessment. kind "mcq": exactly one correct — pass choices and set answer to the 0-based index as a string ("2"). kind "multi": several correct — answer is a JSON array of indices ("[0,2]"). kind "open": no choices, the student writes prose/code and the model grades it — answer holds the RUBRIC (what a full-credit response must contain). Always set topic: it is the key mastery is tracked under, so a typo silently splits the student\'s record.',
+    description: 'Add one question to an assessment. kind "mcq": one correct — answer is the 0-based index as a string ("2"). kind "multi": several correct — answer is a JSON index array ("[0,2]"). kind "shortanswer": the student TYPES it — answer is a JSON array of every accepted spelling/alias, graded case/space-insensitively. kind "order": choices are items in scrambled display order — answer is the JSON permutation giving the correct sequence ("[2,0,1]"), partial credit for mostly-right. kind "open": no choices, the model grades against the rubric in answer. Always set topic: it is the key mastery is tracked under, so a typo silently splits the student\'s record.',
     parameters: {
       type: 'object',
       properties: {
         assessment_id: { type: 'string' },
-        kind: { type: 'string', description: 'mcq | multi | open (default mcq)' },
+        kind: { type: 'string', description: 'mcq | multi | shortanswer | order | open (default mcq)' },
         prompt: { type: 'string' },
-        choices: { type: 'array', items: { type: 'string' }, description: 'mcq: exactly 4; multi: 4-6. Distractors must be plausible misconceptions.' },
-        answer: { type: 'string', description: 'mcq: "2" · multi: "[0,2]" · open: the rubric' },
+        choices: { type: 'array', items: { type: 'string' }, description: 'mcq: exactly 4; multi: 4-6; order: 3-8 in scrambled order. Distractors must be plausible misconceptions.' },
+        answer: { type: 'string', description: 'mcq: "2" · multi: "[0,2]" · shortanswer: \'["alias1","alias2"]\' · order: "[2,0,1]" · open: the rubric' },
         explanation: { type: 'string', description: 'Why the answer is right AND why the tempting wrong one is wrong' },
         topic: { type: 'string', description: '2-4 words; match a roadmap topic where possible' },
         difficulty: { type: 'string', description: 'warmup | core | stretch' },
@@ -1343,18 +1343,19 @@ const impls = {
 
 const learnMod = () => import('./learn.js');
 
-/** Render a stored MCQ/multi response back into readable choice text. */
+/** Render a stored objective response back into readable text, per question kind. */
+const tryParse = (v, fb) => { try { return JSON.parse(v); } catch { return fb; } };
 function renderGiven(r) {
-  const idxs = r.kind === 'multi'
-    ? (() => { try { return JSON.parse(r.given); } catch { return []; } })()
-    : [(() => { try { return JSON.parse(r.given); } catch { return r.given; } })()];
+  if (r.kind === 'shortanswer') return String(tryParse(r.given, r.given));
+  if (r.kind === 'order') return (tryParse(r.given, []) || []).map(i => r.choices[Number(i)] ?? '?').join(' → ');
+  const idxs = r.kind === 'multi' ? (tryParse(r.given, []) || []) : [tryParse(r.given, r.given)];
   return idxs.filter(i => i !== '' && i !== null && i !== undefined)
     .map(i => `${i}) ${r.choices[Number(i)] ?? '?'}`).join(', ');
 }
 function renderAnswer(r) {
-  const idxs = r.kind === 'multi'
-    ? (() => { try { return JSON.parse(r.answer); } catch { return []; } })()
-    : [r.answer];
+  if (r.kind === 'shortanswer') { const a = tryParse(r.answer, null); return Array.isArray(a) ? a.join(' / ') : String(r.answer); }
+  if (r.kind === 'order') return (tryParse(r.answer, []) || []).map(i => r.choices[Number(i)] ?? '?').join(' → ');
+  const idxs = r.kind === 'multi' ? (tryParse(r.answer, []) || []) : [r.answer];
   return idxs.map(i => `${i}) ${r.choices[Number(i)] ?? '?'}`).join(', ');
 }
 

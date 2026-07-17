@@ -253,9 +253,21 @@ export function updateSubject(id, { name, goal, level, parentId } = {}) {
 
 const isDescendant = (maybeChild, ancestor) => pathOf(maybeChild).some(p => p.id === ancestor);
 
-export function deleteSubject(id) {
+/** Deleting a subject cascades to everything under it — lessons, questions, attempts,
+ *  mastery, sub-subjects. That's months of study history in one keypress, so a subject
+ *  with real content demands its exact name as confirmation. An empty shell doesn't. */
+export function deleteSubject(id, { confirm } = {}) {
   cancel(id);
   getDb();
+  const s = one('SELECT name FROM subjects WHERE id = ?', id);
+  if (!s) return;
+  const contents = one(
+    `SELECT (SELECT COUNT(*) FROM lessons  WHERE subject_id = ?)
+          + (SELECT COUNT(*) FROM attempts WHERE subject_id = ?)
+          + (SELECT COUNT(*) FROM subjects WHERE parent_id  = ?) AS c`, id, id, id)?.c || 0;
+  if (contents > 0 && String(confirm || '') !== s.name) {
+    throw err(`"${s.name}" has lessons, graded attempts or sub-subjects — deleting is permanent (a daily backup exists, but still). Pass the subject's exact name as confirmation.`, 409);
+  }
   run('DELETE FROM subjects WHERE id = ?', id); // FK cascade clears the rest
 }
 
@@ -807,10 +819,11 @@ Roughly: 2 warmup, 9 core, 7 stretch. Include at least 3 open-ended questions.`,
     label: 'Drill', pass: 0, n: 8,
     // pass 0: a drill is PRACTICE, not judgment — reps against weak spots. It still
     // moves mastery (that's the point), it just never gates anything.
-    brief: `A rapid-fire PRACTICE drill — reps, not an exam. All mcq/multi, no open-ended
-(speed matters). Aim at least two thirds of the questions at the student's measured weak
-topics, each phrased differently from how they were asked before. The rest: quick recall
-of recently taught material. Keep every question answerable in under 30 seconds.`,
+    brief: `A rapid-fire PRACTICE drill — reps, not an exam. Use mcq, multi, shortanswer
+and order only — no open-ended (speed matters). Aim at least two thirds of the questions
+at the student's measured weak topics, each phrased differently from how they were asked
+before. The rest: quick recall of recently taught material. Keep every question
+answerable in under 30 seconds.`,
   },
 };
 
@@ -879,6 +892,14 @@ Write about ${spec.n} questions. Rules:
   the answer a student holding a specific misconception would pick. No joke options,
   no "all of the above", no giveaway length tells.
 - "multi": 4-6 choices, 2+ correct. Use when the skill really is "pick all that apply".
+- "shortanswer": no choices. The student TYPES the answer — a term, a command, a value,
+  a predicted output. "answer" is a JSON array of every acceptable spelling/alias
+  (e.g. "[\\"O(log n)\\",\\"log n\\",\\"logarithmic\\"]"). Grading is exact-match after
+  lowercasing and space-collapsing, so list all reasonable variants. Great for recall
+  that mcq would give away.
+- "order": 3-6 items in "choices" listed in SCRAMBLED order; "answer" is the JSON array
+  of choice indices in the CORRECT sequence (e.g. "[2,0,1,3]"). Use for processes,
+  pipelines, precedence, chronology — anything where sequence IS the skill.
 - "open": no choices. The student writes prose/code. Give a rubric in "answer" describing
   what a full-credit response must contain (3-5 concrete checkpoints).
 - Every question needs "topic" (2-4 words, matching a roadmap topic where possible) and
@@ -905,11 +926,15 @@ Output STRICT JSON only (no fences, no commentary):
         String(j.blurb || '').slice(0, 300), JSON.stringify(scope), spec.pass, modelRef, now());
 
       qs.slice(0, 30).forEach((q, i) => {
-        const kindQ = ['mcq', 'multi', 'open'].includes(q.kind) ? q.kind : 'mcq';
-        const choices = kindQ === 'open' ? [] : (Array.isArray(q.choices) ? q.choices.map(c => String(c).slice(0, 400)) : []);
-        // A malformed MCQ (no choices) would be unanswerable — demote it to open
-        // rather than shipping a broken radio group.
-        const finalKind = kindQ !== 'open' && choices.length < 2 ? 'open' : kindQ;
+        const kindQ = ['mcq', 'multi', 'open', 'shortanswer', 'order'].includes(q.kind) ? q.kind : 'mcq';
+        const choices = (kindQ === 'open' || kindQ === 'shortanswer') ? [] : (Array.isArray(q.choices) ? q.choices.map(c => String(c).slice(0, 400)) : []);
+        // Malformed structured questions would be unanswerable — demote to open (the
+        // answer text becomes the rubric) rather than shipping a broken widget:
+        // mcq/multi with <2 choices, or an order whose answer isn't a real permutation.
+        let finalKind = kindQ;
+        if (['mcq', 'multi'].includes(kindQ) && choices.length < 2) finalKind = 'open';
+        if (kindQ === 'order' && (choices.length < 3 || !validOrderAnswer(q.answer, choices.length))) finalKind = 'open';
+        if (kindQ === 'shortanswer' && !String(q.answer ?? '').trim()) finalKind = 'open';
         run(`INSERT INTO questions (id, assessment_id, idx, kind, prompt, choices, answer, explanation, topic, difficulty, points)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           genId(6), aid, i, finalKind, String(q.prompt).slice(0, 2000),
@@ -950,13 +975,46 @@ export function startAttempt(subjectId, assessmentId) {
   return { id, startedAt: now() };
 }
 
-/** Auto-grade MCQ/multi. Returns {correct, points}. */
+/** Normalization for typed answers: case, surrounding space and internal runs of
+ *  whitespace never decide correctness — spelling does. */
+const normAnswer = (s) => String(s ?? '').toLowerCase().trim().replace(/\s+/g, ' ');
+
+/** Longest common subsequence length — partial credit for a nearly-right ordering. */
+function lcsLen(a, b) {
+  const dp = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] + 1 : Math.max(dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  return dp[a.length][b.length];
+}
+
+/** Auto-grade every objective kind (everything but 'open'). Returns {correct, points}. */
 function gradeObjective(q, given) {
   if (q.kind === 'mcq') {
     const want = String(q.answer).trim();
     const got = String(given ?? '').trim();
     const ok = got !== '' && got === want;
     return { correct: ok, points: ok ? q.points : 0 };
+  }
+  if (q.kind === 'shortanswer') {
+    // answer = JSON array of accepted spellings/aliases (or a bare string)
+    const accepted = (parseJSON(q.answer, null) ?? [q.answer]).map(normAnswer).filter(Boolean);
+    const got = normAnswer(given);
+    const ok = got !== '' && accepted.includes(got);
+    return { correct: ok, points: ok ? q.points : 0 };
+  }
+  if (q.kind === 'order') {
+    // answer = the correct sequence of choice indices; given = the student's arrangement
+    const want = (parseJSON(q.answer, []) || []).map(Number);
+    const got = (Array.isArray(given) ? given : parseJSON(given, []) || []).map(Number);
+    if (!want.length || got.length !== want.length) return { correct: false, points: 0 };
+    if (want.every((v, i) => got[i] === v)) return { correct: true, points: q.points };
+    // partial credit by longest common subsequence: mostly-right order earns most of the
+    // points; (lcs-1)/(n-1) so a random single coincidence doesn't score
+    const frac = Math.max(0, lcsLen(got, want) - 1) / Math.max(1, want.length - 1);
+    return { correct: false, points: Math.round(frac * q.points * 100) / 100 };
   }
   // multi: set equality, partial credit for a subset with no wrong picks
   const want = new Set((parseJSON(q.answer, []) || []).map(String));
@@ -1025,7 +1083,9 @@ Output STRICT JSON only:
       const grades = Array.isArray(gj?.grades) ? gj.grades : [];
       open.forEach((q, i) => {
         const g = grades.find(x => Number(x.n) === i + 1) || {};
-        const pts = Math.max(0, Math.min(q.points, Number(g.points) ?? 0));
+        // || not ?? — Number(garbage) is NaN, which ?? happily passes through and
+        // NaN-poisons the whole attempt score
+        const pts = Math.max(0, Math.min(q.points, Number(g.points) || 0));
         graded.push({
           q, given: String(answers[q.id] ?? ''),
           correct: !!g.correct, points: pts,
@@ -1257,12 +1317,23 @@ Output STRICT JSON only (no fences):
 
 // ---------- programmatic surface for the agent's tools ----------
 
+/** Does `answer` describe a valid ordering of n choices (a permutation of 0..n-1)? */
+function validOrderAnswer(answer, n) {
+  const seq = parseJSON(answer, null);
+  return Array.isArray(seq) && seq.length === n && [...seq].map(Number).sort((a, b) => a - b).every((v, i) => v === i);
+}
+
 export function addQuestion(assessmentId, q = {}) {
   const a = one('SELECT id FROM assessments WHERE id = ?', assessmentId);
   if (!a) throw err('assessment not found', 404);
-  const kind = ['mcq', 'multi', 'open'].includes(q.kind) ? q.kind : 'mcq';
-  const choices = kind === 'open' ? [] : (Array.isArray(q.choices) ? q.choices : []);
-  if (kind !== 'open' && choices.length < 2) throw err('mcq/multi questions need at least 2 choices');
+  const kind = ['mcq', 'multi', 'open', 'shortanswer', 'order'].includes(q.kind) ? q.kind : 'mcq';
+  const choices = (kind === 'open' || kind === 'shortanswer') ? [] : (Array.isArray(q.choices) ? q.choices : []);
+  if (['mcq', 'multi'].includes(kind) && choices.length < 2) throw err('mcq/multi questions need at least 2 choices');
+  if (kind === 'order') {
+    if (choices.length < 3 || choices.length > 8) throw err('order questions need 3-8 items in choices');
+    if (!validOrderAnswer(q.answer, choices.length)) throw err(`order answer must be a JSON permutation of 0..${choices.length - 1}, e.g. "[2,0,1]"`);
+  }
+  if (kind === 'shortanswer' && !String(q.answer || '').trim()) throw err('shortanswer needs an answer (string or JSON array of accepted aliases)');
   const idx = (one('SELECT COALESCE(MAX(idx), -1) AS i FROM questions WHERE assessment_id = ?', assessmentId)?.i ?? -1) + 1;
   const id = genId(6);
   run(`INSERT INTO questions (id, assessment_id, idx, kind, prompt, choices, answer, explanation, topic, difficulty, points)

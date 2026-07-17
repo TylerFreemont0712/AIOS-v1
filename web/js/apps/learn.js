@@ -181,9 +181,27 @@ export default {
       if (!S.id) return;
       const s = S.subjects.find(x => x.id === S.id);
       const kids = S.subjects.filter(x => x.parentId === S.id).length;
-      if (!await confirmBox(`Delete "${s?.name || 'this subject'}"?`,
-        `Its roadmap, lessons, quizzes and scores go too${kids ? `, along with ${kids} sub-subject${kids > 1 ? 's' : ''} beneath it` : ''}. Vault exports stay.`)) return;
-      try { await del('/learn/' + S.id); } catch (e) { toast(e.message, 'err'); return; }
+      const name = s?.name || 'this subject';
+      const hasContent = (s?.lessons || 0) + (s?.assessments || 0) + kids > 0;
+
+      let confirm = '';
+      if (hasContent) {
+        // Real study history dies with this — a single OK is too cheap. Type the name.
+        const input = el('input', { class: 'input', placeholder: name });
+        const ok = await modal({
+          title: `Delete "${name}"?`,
+          sub: `${s.lessons} lesson${s.lessons === 1 ? '' : 's'}, ${s.assessments} assessment${s.assessments === 1 ? '' : 's'} with every graded attempt${kids ? `, and ${kids} sub-subject${kids > 1 ? 's' : ''}` : ''} are permanently removed. Vault exports and the daily DB backup stay. Type the subject's name to confirm.`,
+          body: input,
+          actions: [{ label: 'Cancel', value: null }, { label: 'Delete forever', kind: 'danger', value: true }],
+        });
+        if (!ok) return;
+        confirm = input.value.trim();
+        if (confirm !== name) { toast('name didn\'t match — nothing deleted', 'err'); return; }
+      } else if (!await confirmBox(`Delete "${name}"?`, 'It\'s empty — nothing of substance is lost.')) {
+        return;
+      }
+      try { await del('/learn/' + S.id + (confirm ? '?confirm=' + encodeURIComponent(confirm) : '')); }
+      catch (e) { toast(e.message, 'err'); return; }
       S.id = null; S.subject = null;
       const subjects = await refreshList();
       if (subjects[0]) load(subjects[0].id); else { ui.road.innerHTML = ''; ui.main.innerHTML = ''; }
@@ -649,9 +667,46 @@ export default {
             class: 'input learn-q-open', rows: 5,
             placeholder: 'Write your answer — the tutor grades it against a rubric, so reasoning counts.',
             disabled: !!result,
-            oninput: (e) => { S.quiz.answers[q.id] = e.target.value; },
+            // paintProgress here too — without it, a quiz of only written answers never
+            // enabled the Submit button no matter how much was typed
+            oninput: (e) => { S.quiz.answers[q.id] = e.target.value; paintProgress(); },
           }, r ? r.given : (S.quiz.answers[q.id] || ''));
           card.append(ta);
+        } else if (q.kind === 'shortanswer') {
+          card.append(el('input', {
+            class: 'input learn-q-short', type: 'text',
+            placeholder: 'Type your answer — case and spacing don\'t matter, spelling does.',
+            disabled: !!result,
+            value: r ? safeVal(r.given) : (S.quiz.answers[q.id] || ''),
+            oninput: (e) => { S.quiz.answers[q.id] = e.target.value; paintProgress(); },
+          }));
+        } else if (q.kind === 'order') {
+          // arrangement = original choice indices in the student's current order.
+          // Initialized at render: the displayed (scrambled) order IS an answer.
+          if (!r && !S.quiz.answers[q.id]) S.quiz.answers[q.id] = q.choices.map((_, i) => String(i));
+          const list = el('div', { class: 'learn-order' });
+          const rebuild = () => {
+            list.innerHTML = '';
+            const arrangement = r ? safeArr(r.given).map(String) : S.quiz.answers[q.id];
+            const correctSeq = r ? safeArr(r.answer).map(String) : null;
+            arrangement.forEach((orig, pos) => {
+              const rightHere = correctSeq ? correctSeq[pos] === orig : false;
+              list.append(el('div', { class: 'learn-order-item' + (r ? (rightHere ? ' right' : ' wrongpick') : '') },
+                el('span', { class: 'learn-order-pos' }, String(pos + 1)),
+                el('span', { class: 'grow' }, q.choices[Number(orig)] ?? '?'),
+                !r ? el('span', { class: 'row', style: { gap: '3px', flex: 'none' } },
+                  el('button', {
+                    class: 'btn sm ghost', title: 'Move up', disabled: pos === 0,
+                    onclick: () => { const a2 = S.quiz.answers[q.id]; [a2[pos - 1], a2[pos]] = [a2[pos], a2[pos - 1]]; rebuild(); paintProgress(); },
+                  }, '↑'),
+                  el('button', {
+                    class: 'btn sm ghost', title: 'Move down', disabled: pos === arrangement.length - 1,
+                    onclick: () => { const a2 = S.quiz.answers[q.id]; [a2[pos + 1], a2[pos]] = [a2[pos], a2[pos + 1]]; rebuild(); paintProgress(); },
+                  }, '↓')) : null));
+            });
+          };
+          rebuild();
+          card.append(el('div', { class: 'muted small', style: { marginBottom: '4px' } }, 'Arrange into the correct order — partial credit for mostly right.'), list);
         } else {
           const group = el('div', { class: 'learn-choices' });
           q.choices.forEach((c, ci) => {
@@ -690,6 +745,8 @@ export default {
           card.append(el('div', { class: 'learn-q-why' },
             el('div', { class: 'learn-lbl' }, r.correct ? 'WHY THIS IS RIGHT' : 'WHAT WENT WRONG'),
             r.kind === 'open' && r.feedback ? el('div', { class: 'learn-q-grader' }, r.feedback) : null,
+            r.kind === 'shortanswer' ? el('div', { class: 'muted small' }, 'accepted: ' + (safeArr(r.answer).join(' · ') || r.answer)) : null,
+            r.kind === 'order' && !r.correct ? el('div', { class: 'muted small' }, 'correct order: ' + safeArr(r.answer).map(i => r.choices[Number(i)] ?? '?').join(' → ')) : null,
             r.explanation ? el('div', {}, r.explanation) : null,
             el('div', { class: 'muted small', style: { marginTop: '5px' } }, `scored ${r.points}/${r.worth}`)));
         }
