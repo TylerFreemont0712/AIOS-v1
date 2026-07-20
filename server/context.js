@@ -1,14 +1,13 @@
 // Live app context: a compact, always-fresh brief of the user's life inside
-// AIOS — planner (events, birthdays, tasks), important mail, weather, and the
-// job pipeline — injected into chat (and the agent prompt) so "what's going on
-// tomorrow?" answers from the calendar without any tool calling. Fully sync:
-// every source is a local read (weather comes from its cache and self-refreshes).
+// AIOS — planner (events, birthdays, tasks), important mail, and weather —
+// injected into chat (and the agent prompt) so "what's going on tomorrow?"
+// answers from the calendar without any tool calling. Fully sync: every source
+// is a local read (weather comes from its cache and self-refreshes).
 
 import { loadConfig } from './config.js';
 import * as planner from './planner.js';
 import { notifications } from './mail.js';
 import { cachedWeather } from './weather.js';
-import { stats as jobStats } from './jobs.js';
 
 const CAT_EMOJI = { work: '💼', birthday: '🎂', trip: '✈️', holiday: '🎉', major: '⭐', health: '🏥', social: '🎭' };
 const dstr = (off) => planner.todayStr(new Date(Date.now() + off * 86400_000));
@@ -57,12 +56,6 @@ export function appContext({ chars = 1900, days = 3 } = {}) {
       const d0 = w.days?.[0], d1 = w.days?.[1];
       lines.push(`Weather${w.place ? ` (${w.place})` : ''}: ${w.current.emoji} ${w.current.temp}° ${w.current.label}${d0 ? ` · H ${d0.hi}° L ${d0.lo}°` : ''}${d1 ? ` · tomorrow ${d1.emoji} ${d1.hi}°/${d1.lo}°` : ''}`);
     }
-  } catch { }
-
-  try {
-    const s = jobStats();
-    const active = Object.entries(s.counts || {}).filter(([k, v]) => v > 0 && !['rejected', 'ghosted', 'withdrawn'].includes(k));
-    if (active.length) lines.push('Job pipeline: ' + active.map(([k, v]) => `${v} ${k}`).join(' · ') + (s.needsReply ? ` · ${s.needsReply} need a reply` : ''));
   } catch { }
 
   if (!lines.length) return '';

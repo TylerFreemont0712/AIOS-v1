@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DATA, loadConfig, contextBudget } from './config.js';
 import { streamChat } from './llm.js';
-import { webSearch, fetchReadable } from './tools.js';
+import { webSearch, fetchReadable, fetchPdfText, canReadPdf } from './tools.js';
 import { writeNote } from './vault.js';
 import { id as genId, now, readJSON, writeJSON } from './util.js';
 
@@ -116,6 +116,17 @@ async function run(r, ctl) {
       },
     });
     r.usage.input += res.usage.input; r.usage.output += res.usage.output;
+    // A research run is dozens of model calls; report the aggregate throughput
+    // (tokens generated / seconds spent generating) rather than the last call's.
+    const p = res.perf || {};
+    r.perf = {
+      tokens: (r.perf?.tokens || 0) + (p.outTokens || 0),
+      genMs: (r.perf?.genMs || 0) + Math.max(1, (p.totalMs || 0) - (p.ttftMs || 0)),
+      calls: (r.perf?.calls || 0) + 1,
+      lastTokS: p.tokS || 0,
+    };
+    r.perf.tokS = r.perf.genMs ? Math.round((r.perf.tokens / (r.perf.genMs / 1000)) * 10) / 10 : 0;
+    emit(r.id, { type: 'perf', ...r.perf });
     return res.text || '';
   };
   // surface the model's live thinking during the current phase (into the timeline)
@@ -170,7 +181,9 @@ async function run(r, ctl) {
         const key = url.replace(/[#?].*$/, '').replace(/\/$/, '');
         // skip only URLs already READ (in `seen`); NOT ones merely listed earlier —
         // otherwise a same-query retry round would find an empty pool and dead-end.
-        if (roundSeen.has(key) || seen.has(key) || !/^https?:/.test(url) || /\.(pdf|zip|png|jpg|jpeg|gif|mp4|xml|csv)($|\?)/i.test(url)) continue;
+        // PDFs are kept when a PDF toolchain is present (they read via fetchPdfText).
+        const isBinaryMedia = /\.(zip|png|jpg|jpeg|gif|mp4|xml|csv)($|\?)/i.test(url) || (/\.pdf($|[?#])/i.test(url) && !canReadPdf());
+        if (roundSeen.has(key) || seen.has(key) || !/^https?:/.test(url) || isBinaryMedia) continue;
         roundSeen.add(key);
         let dom = ''; try { dom = new URL(url).hostname.replace(/^www\./, ''); } catch { continue; }
         const perDom = domains.get(dom) || 0;
@@ -197,9 +210,17 @@ async function run(r, ctl) {
         // Prefer the full page; fall back to the search snippet when a page is
         // JS-rendered/blocked/thin, so those sources still contribute instead of
         // being dropped entirely.
-        let text = '';
-        try { text = (await fetchReadable(c.url, 500_000)).text.slice(0, pageCap); } catch { }
-        let material = text, basis = 'page';
+        let text = '', fromPdf = false;
+        try {
+          if (/\.pdf($|[?#])/i.test(c.url)) {
+            text = (await fetchPdfText(c.url, 500_000)).text.slice(0, pageCap); fromPdf = true;
+          } else {
+            text = (await fetchReadable(c.url, 500_000)).text.slice(0, pageCap);
+            // Some PDFs are served without a .pdf extension — the raw bytes start with %PDF-.
+            if (text.startsWith('%PDF-') && canReadPdf()) { text = (await fetchPdfText(c.url, 500_000)).text.slice(0, pageCap); fromPdf = true; }
+          }
+        } catch { }
+        let material = text, basis = fromPdf ? 'pdf' : 'page';
         if (text.length < 400 && c.snippet) {
           material = `Title: ${c.title || ''}\nSearch summary: ${c.snippet}${text ? `\n\nPartial page text:\n${text}` : ''}`;
           basis = text ? 'partial page + snippet' : 'search snippet';

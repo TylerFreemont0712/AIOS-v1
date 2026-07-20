@@ -6,7 +6,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { DATA, loadConfig, contextBudget } from './config.js';
 import { streamChat } from './llm.js';
-import { toolSchemas, runTool, isWriteTool, isWikiScopedCall, diffPreview } from './tools.js';
+import { toolSchemas, toolGroups, toolDirectory, runTool, isWriteTool, isWikiScopedCall, diffPreview } from './tools.js';
 import { checkFile, checkFiles, runProjectTests } from './checks.js';
 import { skillsPrompt } from './skills.js';
 import { id as genId, now, readJSON, writeJSON, estTokens, safePath, clampMiddle } from './util.js';
@@ -32,20 +32,24 @@ export function listSessions(projectId) {
     if (!f.endsWith('.json')) continue;
     const s = readJSON(path.join(DIR, f));
     if (!s || (projectId && s.projectId !== projectId)) continue;
-    out.push({ id: s.id, projectId: s.projectId, title: s.title, modelRef: s.modelRef, mode: s.mode, updatedAt: s.updatedAt, usage: s.usage, messages: s.transcript.length, running: live.get(s.id)?.running || false });
+    out.push({ id: s.id, projectId: s.projectId, title: s.title, modelRef: s.modelRef, mode: s.mode, planMode: !!s.planMode, updatedAt: s.updatedAt, usage: s.usage, messages: s.transcript.length, running: live.get(s.id)?.running || false });
   }
   return out.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
 }
 
-export function createSession({ projectId, modelRef, mode }) {
+export function createSession({ projectId, modelRef, mode, planMode }) {
   const cfg = loadConfig();
   const proj = getProject(projectId);
   if (!proj) throw Object.assign(new Error('unknown project'), { status: 404 });
   const s = {
     id: genId(8), projectId, root: proj.path, title: 'New session',
     modelRef: modelRef || cfg.defaults.agentModel, mode: mode || cfg.defaults.agentMode || 'edits',
+    planMode: planMode !== undefined ? !!planMode : !!cfg.defaults.agentPlanMode,
     createdAt: now(), updatedAt: now(),
     transcript: [], usage: { input: 0, output: 0 }, allowedTools: [],
+    // lean-context state: extra tool groups the model activated, notes it pinned,
+    // messages moved out of the live window by checkpoints, checkpoint count
+    toolGroups: [], pins: [], archive: [], checkpoints: 0,
   };
   writeJSON(file(s.id), s);
   return s;
@@ -61,6 +65,7 @@ export function getSession(id) {
 export function updateSession(id, patch) {
   const s = getSession(id);
   for (const k of ['modelRef', 'mode', 'title']) if (patch[k] !== undefined) s[k] = patch[k];
+  if (patch.planMode !== undefined) s.planMode = !!patch.planMode;
   save(s);
   return s;
 }
@@ -80,6 +85,7 @@ export function cancel(sid) {
   st.abort.abort();
   for (const [, resolve] of st.approvals) resolve('deny');
   st.approvals.clear();
+  if (st.planResolve) { const r = st.planResolve; st.planResolve = null; r({ decision: 'reject' }); }
   return true;
 }
 
@@ -90,6 +96,132 @@ export function approve(sid, callId, decision) {
   st.approvals.delete(callId);
   emit(sid, { type: 'approval.resolved', callId, decision });
   resolve(decision);
+  return true;
+}
+
+/** Resolve a pending plan-mode proposal: 'approve' (optionally with edited text) or 'reject'. */
+export function resolvePlan(sid, decision, text) {
+  const st = live.get(sid);
+  if (!st?.planResolve) return false;
+  const resolve = st.planResolve;
+  st.planResolve = null;
+  resolve({ decision: decision === 'approve' ? 'approve' : 'reject', text: typeof text === 'string' ? text : undefined });
+  return true;
+}
+
+// ---------- lean tool loadout ----------
+//
+// 60+ full tool schemas cost ~29KB (~7k tokens) on EVERY call — a third of a 32k local
+// model's window gone before the conversation starts, and empirically the thing that
+// makes small models lose the plot on long tasks. In lean mode only the core groups'
+// schemas ship; everything else appears as a one-line directory entry, and the model
+// activates a group with load_tools the moment a task needs it.
+
+const CORE_GROUPS = ['files', 'system', 'git'];
+
+function leanEnabled(s) {
+  const mode = loadConfig().agent.leanTools ?? 'auto';
+  if (mode === true || mode === 'on') return true;
+  if (mode === false || mode === 'off') return false;
+  // auto: big-context cloud models can afford the full loadout; local models can't
+  return !String(s.modelRef || '').startsWith('anthropic:');
+}
+
+const activeGroupsFor = (s) => [...new Set([...CORE_GROUPS, ...(s.toolGroups || [])])]
+  .filter(g => toolGroups().includes(g));
+
+const META_LOAD = {
+  name: 'load_tools',
+  description: 'Activate additional tool GROUPS from the directory in your system prompt (e.g. web, vault, learning). Their full tools become callable on your next turn and stay active for this session. Load a group the moment the task needs it — not speculatively.',
+  parameters: { type: 'object', properties: { groups: { type: 'array', items: { type: 'string' }, description: 'Group names from the directory' } }, required: ['groups'] },
+};
+const META_REMEMBER = {
+  name: 'remember',
+  description: 'Pin a short note (≤300 chars) to your system prompt for the rest of this session. Pins survive context compaction, so use this for anything that must never be lost on a long task: key decisions, IDs, ports, tricky paths, the user\'s exact requirements.',
+  parameters: { type: 'object', properties: { note: { type: 'string' } }, required: ['note'] },
+};
+
+function doLoadTools(s, args) {
+  const known = toolGroups();
+  const want = (Array.isArray(args?.groups) ? args.groups : []).map(g => String(g).toLowerCase().trim());
+  const good = want.filter(g => known.includes(g));
+  const bad = want.filter(g => !known.includes(g));
+  s.toolGroups = [...new Set([...(s.toolGroups || []), ...good])];
+  if (!good.length) return `No valid groups in ${JSON.stringify(want)}. Available: ${known.join(', ')}.`;
+  return `Activated: ${good.join(', ')}. Their tools are callable from your next turn onward.`
+    + (bad.length ? ` (Unknown: ${bad.join(', ')} — available groups: ${known.join(', ')}.)` : '');
+}
+
+function doRemember(s, args) {
+  const note = String(args?.note || '').trim().slice(0, 300);
+  if (!note) return 'Nothing to pin — pass a non-empty note.';
+  s.pins = [...(s.pins || []), note].slice(-12);   // cap: pins must stay cheap
+  return `Pinned (${s.pins.length}/12): ${note}`;
+}
+
+// ---------- context checkpoints ----------
+//
+// When the transcript outgrows the window, the old behavior silently dropped the oldest
+// messages — continuity lost, the model re-derives what it already knew. Instead: compact
+// the older portion into a structured checkpoint (task / done / facts / next) written BY
+// the model FOR its next instance, keep the recent messages verbatim, and archive the
+// originals so nothing is destroyed. The crude trim remains as the fallback safety net.
+
+const sizeOf = (msgs) => msgs.reduce((n, m) => n + JSON.stringify(m).length, 0);
+const clip = (t, n) => { t = String(t || ''); return t.length > n ? t.slice(0, n) + '…' : t; };
+
+/** Keep the last few messages verbatim; never split an assistant/tool-results pair. */
+function checkpointCut(msgs) {
+  let cut = Math.max(0, msgs.length - 6);
+  if (msgs[cut]?.role === 'tools') cut -= 1;   // keep the calling assistant with its results
+  return Math.max(0, cut);
+}
+
+async function compactTranscript(s, st) {
+  const msgs = s.transcript;
+  const cut = checkpointCut(msgs);
+  const head = msgs.slice(0, cut);
+  if (head.length < 4) return false;   // too little to be worth a model call
+
+  const lines = head.map(m => {
+    if (m.role === 'user') return `USER${m.kind === 'checkpoint' ? ' (previous checkpoint)' : ''}: ${clip(m.text, 700)}`;
+    if (m.role === 'assistant') {
+      const calls = m.toolCalls?.length ? ` [called: ${m.toolCalls.map(c => `${c.name} ${clip(JSON.stringify(c.args), 120)}`).join('; ')}]` : '';
+      return `ASSISTANT: ${clip(m.text, 500)}${calls}`;
+    }
+    return `RESULTS: ${(m.results || []).map(r => `${r.name}${r.isError ? ' (ERROR)' : ''} → ${clip(r.content, 240)}`).join(' | ')}`;
+  }).join('\n');
+
+  const res = await streamChat({
+    modelRef: s.modelRef, maxTokens: 1400, signal: st.abort.signal,
+    system: 'You compress an AI agent\'s session history into a checkpoint the NEXT model instance resumes from. It sees ONLY your checkpoint plus the last few messages — anything you omit is gone. Output the checkpoint directly, no preamble.',
+    messages: [{
+      role: 'user',
+      text: `Write the checkpoint for this session history. Format EXACTLY:
+TASK: the user's actual goal, in their words where possible
+DONE: completed steps — files changed (paths!), commands run and their outcomes
+FACTS: hard-won knowledge the next instance must not re-derive — paths, names, versions, decisions, gotchas, error messages already solved
+NEXT: what remains, in order, starting with the immediate next action
+
+Max ~350 words. Include EVERY pinned or user-stated requirement.
+
+History:
+${clampMiddle(lines, 24000)}`,
+    }],
+  });
+  const summary = (res.text || '').trim();
+  if (summary.length < 120 || !/TASK:/i.test(summary)) return false;   // don't replace history with junk
+
+  s.usage.input += res.usage.input; s.usage.output += res.usage.output;
+  s.checkpoints = (s.checkpoints || 0) + 1;
+  s.archive = [...(s.archive || []), ...head];   // nothing is destroyed — just moved out of the window
+  s.transcript = [
+    {
+      role: 'user', auto: true, kind: 'checkpoint', ts: now(),
+      text: `[checkpoint ${s.checkpoints} — earlier work was compacted to keep your context small]\n${summary}\n\nContinue from NEXT. Trust DONE and FACTS; re-read files when you need exact current content.`,
+    },
+    ...msgs.slice(cut),
+  ];
   return true;
 }
 
@@ -129,15 +261,41 @@ export async function userMessage(sid, text, attachments) {
   let memoryPrompted = false;
 
   try {
+    // Plan mode: propose a plan and wait for approval before any tool runs. On reject
+    // (or Stop) we return; the finally block still emits turn.done and cleans up.
+    if (s.planMode) {
+      if (!(await planGate(s, st))) return;
+    }
     for (let turn = 0; turn < cfg.agent.maxTurns; turn++) {
       if (st.abort.signal.aborted) break;
       emit(sid, { type: 'status', state: 'thinking' });
 
-      // re-read tools + system every turn: a create_tool call mid-run must be callable
-      // immediately, and env context (git branch/dirty state) must track the run
-      const tools = toolSchemas();
-      const system = systemPrompt(s);
+      // re-read tools + system every turn: a create_tool or load_tools call mid-run must
+      // take effect immediately, and env context (git branch/dirty state) must track the run
+      const lean = leanEnabled(s);
+      const activeGroups = lean ? activeGroupsFor(s) : null;
+      const tools = [
+        ...toolSchemas(activeGroups || undefined),
+        ...(lean ? [META_LOAD] : []),
+        META_REMEMBER,
+      ];
+      const system = systemPrompt(s, { lean, activeGroups });
       const historyBudget = Math.max(4000, inputChars - system.length - JSON.stringify(tools).length);
+
+      // Checkpoint before the window overflows: compact old context into a structured
+      // handoff instead of silently dropping it. trimmed() stays as the safety net for
+      // when compaction is disabled, fails, or can't shrink enough.
+      if (cfg.agent.checkpoints !== false && sizeOf(s.transcript) > historyBudget * 0.9) {
+        emit(sid, { type: 'status', state: 'compacting' });
+        const before = estTokens(JSON.stringify(s.transcript));
+        try {
+          if (await compactTranscript(s, st)) {
+            save(s);
+            const after = estTokens(JSON.stringify(s.transcript));
+            emit(sid, { type: 'checkpoint', n: s.checkpoints, tokensBefore: before, tokensAfter: after });
+          }
+        } catch { /* fall through to the crude trim */ }
+      }
       const messages = trimmed(s, historyBudget);
       const res = await streamChat({
         modelRef: s.modelRef, system, messages, tools,
@@ -150,12 +308,12 @@ export async function userMessage(sid, text, attachments) {
       });
 
       s.usage.input += res.usage.input; s.usage.output += res.usage.output;
-      const asst = { role: 'assistant', text: res.text, ts: now() };
+      const asst = { role: 'assistant', text: res.text, ts: now(), perf: res.perf };
       if (res.reasoning) asst.reasoning = res.reasoning;
       if (res.toolCalls.length) asst.toolCalls = res.toolCalls;
       s.transcript.push(asst);
       save(s);
-      emit(sid, { type: 'text.done', text: res.text, reasoning: res.reasoning });
+      emit(sid, { type: 'text.done', text: res.text, reasoning: res.reasoning, perf: res.perf });
 
       if (st.abort.signal.aborted) break;
 
@@ -215,6 +373,15 @@ export async function userMessage(sid, text, attachments) {
       const results = [];
       for (const call of res.toolCalls) {
         if (st.abort.signal.aborted) { results.push({ id: call.id, name: call.name, content: 'Cancelled by user.', isError: true }); continue; }
+        // session-level meta tools: they mutate agent state, not the world — no gate
+        if (call.name === 'load_tools' || call.name === 'remember') {
+          emit(sid, { type: 'tool.start', callId: call.id, name: call.name, args: call.args });
+          const content = call.name === 'load_tools' ? doLoadTools(s, call.args) : doRemember(s, call.args);
+          save(s);
+          results.push({ id: call.id, name: call.name, content, isError: false });
+          emit(sid, { type: 'tool.end', callId: call.id, name: call.name, ok: true, content, ms: 0 });
+          continue;
+        }
         const verdict = await gate(s, st, call);
         if (verdict !== 'allow') {
           denied++;
@@ -255,6 +422,53 @@ export async function userMessage(sid, text, attachments) {
     emit(sid, { type: 'turn.done', usage: s.usage, cancelled: st.abort.signal.aborted });
     emit(sid, { type: 'status', state: 'idle' });
   }
+}
+
+/** Plan mode: a dedicated no-tools turn that proposes a numbered plan, then blocks
+ *  for the user to approve/edit/reject before any tool runs. Returns true to proceed
+ *  with execution (plan committed to the transcript) or false to stop the turn.
+ *  The model is free to adapt the plan once executing — it's a guardrail, not a cage. */
+async function planGate(s, st) {
+  const lean = leanEnabled(s);
+  const activeGroups = lean ? activeGroupsFor(s) : null;
+  const { inputChars } = contextBudget({ modelRef: s.modelRef, wantOutput: 2000 });
+  const system = systemPrompt(s, { lean, activeGroups })
+    + `\n\n[PLAN MODE] Do NOT take any action or call any tool yet. Read the request (and rely on what you already know) and propose a concise, numbered plan of the concrete steps you will take — files to create/edit, commands to run, checks to make. One short line per step, roughly 3-8 steps. End with a one-line "Risks:" note for anything destructive or worth confirming. The user will approve, edit, or reject this plan before you execute anything.`;
+  const messages = trimmed(s, Math.max(4000, inputChars - system.length));
+
+  emit(s.id, { type: 'status', state: 'planning' });
+  const res = await streamChat({
+    modelRef: s.modelRef, system, messages, tools: [],
+    signal: st.abort.signal, maxTokens: 1600,
+    onEvent: (ev) => {
+      if (ev.type === 'text') emit(s.id, { type: 'plan.delta', delta: ev.delta });
+      else if (ev.type === 'reasoning') emit(s.id, { type: 'reasoning.delta', delta: ev.delta });
+    },
+  });
+  s.usage.input += res.usage.input; s.usage.output += res.usage.output;
+  if (st.abort.signal.aborted) return false;
+  const planText = (res.text || '').trim();
+  if (!planText) return true;   // model offered no plan to review — just proceed normally
+
+  emit(s.id, { type: 'plan.proposed', text: planText });
+  emit(s.id, { type: 'status', state: 'waiting-plan' });
+  const decision = await new Promise((resolve) => {
+    st.planResolve = resolve;
+    setTimeout(() => { if (st.planResolve === resolve) { st.planResolve = null; resolve({ decision: 'reject' }); } }, 30 * 60 * 1000);
+  });
+  st.planResolve = null;
+  if (st.abort.signal.aborted) return false;
+
+  const approved = decision && decision.decision === 'approve';
+  const finalPlan = (approved && decision.text && decision.text.trim()) || planText;
+  // Commit the (possibly edited) plan as the model's own committed plan either way, so
+  // the transcript records what was proposed; only an approval adds the go-ahead + runs.
+  s.transcript.push({ role: 'assistant', text: finalPlan, ts: now(), kind: 'plan' });
+  emit(s.id, { type: 'plan.resolved', decision: approved ? 'approve' : 'reject', text: finalPlan });
+  if (!approved) { save(s); return false; }
+  s.transcript.push({ role: 'user', text: 'Approved. Execute this plan step by step. If you find a step is wrong or unnecessary, adapt and briefly say why — otherwise follow it.', auto: true, kind: 'plan', ts: now() });
+  save(s);
+  return true;
 }
 
 /** Is this path inside the project's .aios/ folder (memory, instructions)? */
@@ -311,11 +525,13 @@ Be terse — a few lines per file. If nothing is genuinely worth recording, repl
 
 // ---------- context ----------
 
-function systemPrompt(s) {
+function systemPrompt(s, { lean = false, activeGroups = null } = {}) {
   const cfg = loadConfig();
   // one schema read per prompt build — the module-level hasTool would rescan the
-  // custom-tools dir for every feature check, every turn
-  const toolNames = new Set(toolSchemas().map(t => t.name));
+  // custom-tools dir for every feature check, every turn. In lean mode hasTool sees
+  // only ACTIVE tools, so feature guidance for unloaded groups drops out of the
+  // prompt too — the directory line is their only (cheap) footprint.
+  const toolNames = new Set(toolSchemas(activeGroups || undefined).map(t => t.name));
   const hasTool = (name) => toolNames.has(name);
   let listing = '';
   try {
@@ -353,8 +569,7 @@ Knowledge base (your long-term memory — use it autonomously, don't ask permiss
 - wiki_generate scaffolds a whole topic as interlinked notes; daily_log records notable events to the user's journal. Raw access (vault_search/list/read/write/append) exists for notes outside the wiki — those writes need approval.` : ''}${hasTool('research_start') ? `
 
 You can run AIOS apps yourself instead of telling the user to:
-- research_start for questions needing real sources (it searches, reads, and writes a cited report in the background; the report auto-exports to the wiki). Poll research_status between other work.
-- mindmap_generate to structure a topic/plan as a tree outline — it lands in the wiki as a nested-list note.${hasTool('agenda_view') ? `
+- research_start for questions needing real sources (it searches, reads, and writes a cited report in the background; the report auto-exports to the wiki). Poll research_status between other work.${hasTool('agenda_view') ? `
 - agenda_view / task_add / event_add manage the user's Planner: check the schedule when dates matter, and capture to-dos or appointments the user mentions (additive, normally pre-approved).` : ''}${hasTool('mail_search') ? `
 - mail_recent / mail_search / mail_read give READ-ONLY access to the user's inbox (nothing gets marked seen). Use them when asked about email, or to ground follow-ups (interviews, invoices, deliveries). Quote emails faithfully; never invent message content.` : ''}` : ''}${hasTool('create_tool') ? `
 
@@ -363,7 +578,18 @@ Tool foundry: when a capability you need is missing AND would be reused (calling
 - Be concise in prose. Explain what you did and why in a short summary when you finish, referencing files as path:line.
 - Never fabricate tool results or claim success without verifying.
 - If the user asks a question rather than requesting changes, answer it — don't modify files unprompted.
-${cfg.defaults.appContext !== false ? (() => { try { const ctx = appContext({ chars: 1100, days: 2 }); return ctx ? '\n' + ctx + '\n(agenda_view has the full planner when you need more.)\n' : ''; } catch { return ''; } })() : ''}${projectContext(s)}${skillsPrompt(s.root, s.modelRef)}
+${cfg.defaults.appContext !== false ? (() => { try { const ctx = appContext({ chars: 1100, days: 2 }); return ctx ? '\n' + ctx + '\n(agenda_view has the full planner when you need more.)\n' : ''; } catch { return ''; } })() : ''}${projectContext(s)}${skillsPrompt(s.root, s.modelRef)}${lean ? `
+
+Tool loadout (context-lean mode — only ${activeGroups.join(', ')} are fully loaded):
+More tool groups exist. The moment a task needs one, call load_tools {"groups":["<name>"]} — its tools become callable on your NEXT turn. Directory:
+${toolDirectory(activeGroups)}` : ''}
+
+Long-task continuity:
+- On long runs your older context is automatically compacted into a checkpoint (task/done/facts/next). This is normal — trust the checkpoint and keep going; re-read files for exact content.
+- Use the remember tool to pin anything that must NEVER be lost to compaction: the user's exact requirements, key decisions, ports, IDs, tricky paths. Pin early, not after it's gone.${s.pins?.length ? `
+
+Pinned notes (you saved these — they survive compaction):
+${s.pins.map(p => '- ' + p).join('\n')}` : ''}
 
 User: ${cfg.user.name}. Approval mode: ${s.mode} (${s.mode === 'edits' ? 'write tools require user approval — if denied, adapt' : s.mode === 'auto' ? 'all tools pre-approved' : 'read-only: write tools are unavailable'}).`;
 }

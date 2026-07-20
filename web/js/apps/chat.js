@@ -1,6 +1,6 @@
 // Chat: streaming conversations with any configured model.
 
-import { el, icon, icons, toast, confirmBox, askText, modelPicker, timeAgo, throttle, thinkingPanel, attachTray, attachmentView } from '../ui.js';
+import { el, icon, icons, toast, confirmBox, askText, modelPicker, timeAgo, throttle, thinkingPanel, attachTray, attachmentView, perfBadge } from '../ui.js';
 import { get, post, patch, del, wsSend, sub, uploadFile } from '../api.js';
 import { renderMd } from '../markdown.js';
 import { openApp } from '../wm.js';
@@ -80,7 +80,7 @@ export default {
       ui.msgs.innerHTML = '';
       for (const m of c.messages) {
         if (m.role === 'user') appendMsg('user', m.text, m.attachments);
-        else appendAsst(m.text, m.reasoning);
+        else appendAsst(m.text, m.reasoning, m.perf);
       }
       scrollDown(true);
       win.chatState.unsub = sub('chat:' + id, onEvent);
@@ -104,10 +104,12 @@ export default {
     }
 
     // A persisted assistant turn: collapsed reasoning panel (if any) + answer bubble.
-    function appendAsst(text, reasoning) {
+    function appendAsst(text, reasoning, perf) {
       const content = el('div', { class: 'msg-content' });
       if (reasoning) { const t = thinkingPanel({ collapsed: true, doneLabel: 'Thought process' }); t.setText(reasoning); content.append(t.node); }
       content.append(el('div', { class: 'msg-bubble' }, renderMd(text)));
+      const badge = perfBadge(perf);
+      if (badge) content.append(el('div', { class: 'msg-perf' }, badge));
       ui.msgs.append(el('div', { class: 'msg asst' }, el('div', { class: 'msg-role' }, 'assistant'), content));
     }
 
@@ -147,6 +149,8 @@ export default {
         if (live?.think?.live) live.think.done();
         if (live?.bubble) { live.bubble.innerHTML = ''; live.bubble.append(renderMd(ev.text || win.chatState.buf)); }
         else if ((ev.text || win.chatState.buf) && live) live.content.append(el('div', { class: 'msg-bubble' }, renderMd(ev.text || win.chatState.buf)));
+        const badge = perfBadge(ev.perf);
+        if (badge && live) live.content.append(el('div', { class: 'msg-perf' }, badge));
         live = null;
         setSending(false);
         refreshList();
@@ -216,10 +220,28 @@ export default {
       refreshList();
     }
 
+    /** Open with a message already on its way — the dashboard quick-ask lands here. */
+    async function seedChat(text) {
+      if (!ui.model.getValue()) { toast('pick a model first — then ask again', 'err'); return; }
+      if (win.chatState.streaming) { toast('already generating — wait or stop first', 'err'); return; }
+      const c = await post('/chats', { modelRef: ui.model.getValue() });
+      win.chatState.unsub?.();
+      win.chatState.chatId = c.id;
+      win.chatState.unsub = sub('chat:' + c.id, onEvent);
+      ui.head.querySelector('.ttl').textContent = 'New chat';
+      ui.msgs.innerHTML = '';
+      appendMsg('user', text);
+      scrollDown(true);
+      setSending(true);
+      wsSend({ t: 'chat.send', chatId: c.id, text, modelRef: ui.model.getValue(), attachments: [] });
+      refreshList();
+    }
+
     refreshList();
     if (opts.fresh) newChat();
+    if (opts.seed) seedChat(String(opts.seed));
     setTimeout(() => ui.input.focus(), 50);
-    this.reopen = (w, o) => { if (o?.fresh) newChat(); };
+    this.reopen = (w, o) => { if (o?.seed) seedChat(String(o.seed)); else if (o?.fresh) newChat(); };
   },
 
   unmount(win) { win.chatState?.unsub?.(); },

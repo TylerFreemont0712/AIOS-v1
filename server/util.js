@@ -53,6 +53,32 @@ export function isBinary(buf) {
 
 export function estTokens(str) { return Math.ceil((str?.length || 0) / 4); }
 
+/** Pull the first JSON object out of model output, tolerating fences and trailing prose.
+ *  String-aware brace walker with a trailing-comma repair fallback. */
+export function extractJSON(text) {
+  if (!text) return null;
+  const cleaned = text.replace(/```(?:json)?/gi, '');
+  const start = cleaned.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (esc) { esc = false; continue; }
+    if (ch === '\\') { esc = true; continue; }
+    if (ch === '"') inStr = !inStr;
+    else if (!inStr && ch === '{') depth++;
+    else if (!inStr && ch === '}') {
+      depth--;
+      if (depth === 0) {
+        const cand = cleaned.slice(start, i + 1);
+        try { return JSON.parse(cand); } catch { }
+        try { return JSON.parse(cand.replace(/,\s*([}\]])/g, '$1')); } catch { return null; }  // strip trailing commas
+      }
+    }
+  }
+  return null;
+}
+
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css',
   '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',

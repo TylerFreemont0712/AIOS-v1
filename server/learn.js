@@ -354,7 +354,7 @@ function makeLlm(subjectId, ctl, modelRef, usage) {
   };
 }
 
-/** String-aware first-JSON-object extractor (same approach as jobai.extractJSON). */
+/** String-aware first-JSON-object extractor (same approach as util.extractJSON). */
 function extractJSON(text) {
   let t = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
   const start = t.indexOf('{');

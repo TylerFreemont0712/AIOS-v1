@@ -10,7 +10,6 @@ import dashboard from './apps/dashboard.js';
 import chat from './apps/chat.js';
 import agent from './apps/agent.js';
 import research from './apps/research.js';
-import jobsearch from './apps/jobsearch.js';
 import files from './apps/files.js';
 import terminal from './apps/terminal.js';
 import projectsApp from './apps/projects.js';
@@ -18,6 +17,8 @@ import githubApp from './apps/github.js';
 import studio from './apps/studio.js';
 import vault from './apps/vault.js';
 import learn from './apps/learn.js';
+import benchApp from './apps/bench.js';
+import modelsApp from './apps/models.js';
 import planner from './apps/planner.js';
 import settings from './apps/settings.js';
 
@@ -152,11 +153,10 @@ function openPalette() {
     { group: 'Actions', label: 'New chat', icon: 'chat', run: () => openApp('chat', { fresh: true }) },
     { group: 'Actions', label: 'New agent session', icon: 'agent', run: () => openApp('agent', { fresh: true }) },
     { group: 'Actions', label: 'New deep research', icon: 'research', run: () => openApp('research', { fresh: true }) },
-    { group: 'Actions', label: 'Search jobs', icon: 'briefcase', run: () => openApp('jobsearch') },
-    { group: 'Actions', label: 'Job application board', icon: 'briefcase', run: () => openApp('jobsearch', { view: 'board' }) },
-    { group: 'Actions', label: 'Daily note capture', icon: 'daily', run: quickCapture },
     { group: 'Actions', label: 'Today\'s agenda', icon: 'daily', run: () => openApp('planner') },
     { group: 'Actions', label: 'Learning corner', icon: 'learn', run: () => openApp('learn') },
+    { group: 'Actions', label: 'Benchmark models', icon: 'graph', run: () => openApp('bench') },
+    { group: 'Actions', label: 'Model routing & serving', icon: 'cpu', run: () => openApp('models') },
     { group: 'Actions', label: 'Agent tools & web search', icon: 'wrench', run: () => openApp('settings', { tab: 'tools' }) },
     { group: 'Actions', label: 'Toggle theme', icon: 'moon', run: () => document.getElementById('tb-theme').click() },
   ];
@@ -210,14 +210,6 @@ function openPalette() {
   render();
 }
 
-async function quickCapture() {
-  const text = await askText({ title: 'Daily capture', sub: 'Appends a timestamped bullet to today\'s daily note.', placeholder: 'What\'s on your mind?', multiline: true, ok: 'Capture' });
-  if (!text) return;
-  try {
-    await post('/vault/daily', { text });
-    toast('captured to daily note', 'ok');
-  } catch (e) { toast(e.message, 'err'); }
-}
 
 document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openPalette(); }
@@ -230,7 +222,6 @@ async function boot() {
   registerApp(chat);
   registerApp(agent);
   registerApp(research);
-  registerApp(jobsearch);
   registerApp(files);
   registerApp(terminal);
   registerApp(projectsApp);
@@ -238,9 +229,11 @@ async function boot() {
   registerApp(studio);
   registerApp(vault);
   registerApp(learn);
+  registerApp(benchApp);
+  registerApp(modelsApp);
   registerApp(planner);
   registerApp(settings);
-  renderDock(['home', '|', 'chat', 'agent', 'research', 'jobsearch', '|', 'planner', 'github', 'studio', 'vault', 'learn', '|', 'files', 'terminal', 'projects', '|', 'settings']);
+  renderDock(['home', '|', 'chat', 'agent', 'research', '|', 'planner', 'github', 'studio', 'vault', 'learn', 'bench', 'models', '|', 'files', 'terminal', 'projects', '|', 'settings']);
 
   // PWA: installable from the pairing link; the SW is a plain passthrough
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => { });

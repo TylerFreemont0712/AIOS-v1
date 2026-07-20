@@ -307,15 +307,6 @@ await hard('chat: store', async () => {
   return 'create · get · update · delete';
 });
 
-await hard('mindmap: store', async () => {
-  const m = await S('mindmap.js');
-  const map = m.createMap({ name: 'audit map' });
-  m.saveMap(map.id, { ...m.getMap(map.id), name: 'audit map 2' });
-  assert(m.getMap(map.id).name === 'audit map 2', 'save');
-  m.deleteMap(map.id);
-  return 'create · save · delete';
-});
-
 await hard('research: plan/reflect/report helpers', async () => {
   const r = await S('research.js');
   const plan = r.parsePlan('SUBQUESTIONS:\n- What is X?\n- How does X compare to Y?\nQUERIES:\nx overview\nx vs y benchmark', 3);
@@ -331,31 +322,14 @@ await hard('research: plan/reflect/report helpers', async () => {
   return 'parsePlan · parseReflect · keywords · relevance';
 });
 
-await hard('jobs: pipeline store', async () => {
-  const j = await S('jobs.js');
-  const job = j.addJob({ title: 'Audit Engineer', company: 'ACME', url: 'https://example.com/job1' });
-  j.updateJob(job.id, { status: 'applied' });
-  assert(j.getJob(job.id).status === 'applied', 'stage move');
-  assert(j.stats().total >= 1, 'stats');
-  j.deleteJob(job.id);
-  return 'add · stage · stats · delete';
-});
-
-await hard('jobsource: listing-page classifier', async () => {
-  const js = await S('jobsource.js');
-  assert(js.isListingPage('https://jp.indeed.com/jobs?q=x', '541 Data Center jobs in Tokyo'), 'listing missed');
-  assert(!js.isListingPage('https://example.com/careers/senior-engineer', 'Senior Engineer — ACME'), 'posting misflagged');
-  return 'index-page vs posting';
-});
-
-await hard('profile + platforms: stores', async () => {
-  const pr = await S('profile.js');
-  pr.saveProfile({ name: 'Audit Person', skills: ['node'] });
-  assert(pr.getProfile().name === 'Audit Person', 'profile save');
-  assert(typeof pr.completeness() === 'number' || typeof pr.completeness() === 'object', 'completeness');
-  const pl = await S('platforms.js');
-  assert(pl.listPlatforms().length >= 8, 'platform directory seeded');
-  return 'profile roundtrip · platform directory';
+await hard('tools: PDF ingestion', async () => {
+  const t = await S('tools.js');
+  assert(typeof t.fetchPdfText === 'function' && typeof t.canReadPdf === 'function', 'exports');
+  assert(typeof t.canReadPdf() === 'boolean', 'canReadPdf → boolean');
+  let rejected = false;
+  try { await t.fetchPdfText('file:///etc/passwd'); } catch { rejected = true; }
+  assert(rejected, 'non-http URL rejected');
+  return `exports · guard · pdftotext ${t.canReadPdf() ? 'present' : 'absent'}`;
 });
 
 await hard('llm: sampling + context budgets', async () => {
@@ -397,6 +371,152 @@ srv.listen(0, async () => {
   });
   assert(/THREW: stream stalled/.test(r.stdout), 'wedged stream must throw, got: ' + (r.stdout || r.stderr).slice(0, 120));
   return 'wedged provider throws instead of hanging';
+});
+
+await hard('router: bench-driven model routing', async () => {
+  // Pure routing logic (no llama boots): seed bench.db with two local models that have
+  // OPPOSITE strengths, then assert the route table sends each category to its winner.
+  // Subprocess so the seeded AIOS_DATA is read fresh by config/bench/router.
+  const { spawnSync } = await import('node:child_process');
+  const script = `
+import fs from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+const DATA = process.env.AIOS_DATA;
+fs.mkdirSync(DATA, { recursive: true });
+fs.writeFileSync(path.join(DATA, 'config.json'), JSON.stringify({
+  providers: { custom: [{ id: 'lm', name: 'Local', baseUrl: 'http://127.0.0.1:8080/v1' }] },
+}));
+const { modelAlias, listLocalModels } = await import(${JSON.stringify(path.join(ROOT, 'server', 'llmctl.js'))});
+const locals = listLocalModels();
+if (locals.length < 2) { console.log('SKIP: fewer than 2 local ggufs'); process.exit(0); }
+const [a, b] = locals;
+const db = new DatabaseSync(path.join(DATA, 'bench.db'));
+db.exec("CREATE TABLE runs (id TEXT PRIMARY KEY, batch TEXT, model TEXT, test TEXT, category TEXT, score REAL, detail TEXT DEFAULT '', ttft_ms INT DEFAULT 0, gen_ms INT DEFAULT 0, out_tokens INT DEFAULT 0, tok_s REAL DEFAULT 0, at TEXT)");
+const ins = db.prepare('INSERT INTO runs (id, batch, model, test, category, score, tok_s, at) VALUES (?,?,?,?,?,?,?,?)');
+// model A: coding star, weak reasoning, fast. model B: reasoning star, weak coding, slow.
+// A recorded under the stable local: ref, B under the provider ref — both must join.
+const A = 'local:' + modelAlias(a.file), B = 'custom_lm:' + modelAlias(b.file);
+ins.run('r1','x',A,'coding','coding',0.9,40,'2026-07-18T01:00:00Z');
+ins.run('r2','x',A,'reasoning','reasoning',0.3,40,'2026-07-18T01:00:00Z');
+ins.run('r3','x',B,'coding','coding',0.4,12,'2026-07-18T01:00:00Z');
+ins.run('r4','x',B,'reasoning','reasoning',0.95,12,'2026-07-18T01:00:00Z');
+db.close();
+const { candidates, routeTable, localProviderId } = await import(${JSON.stringify(path.join(ROOT, 'server', 'router.js'))});
+const prov = localProviderId();
+const cands = candidates();
+const t = routeTable();
+const out = {
+  prov,
+  joined: cands.filter(c => c.bench).length,
+  coding: t.coding?.file, reasoning: t.reasoning?.file, fast: t.fast?.file, best: t.best?.file,
+  aFile: a.file, bFile: b.file,
+};
+console.log('RESULT ' + JSON.stringify(out));`;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    encoding: 'utf8', timeout: 20_000,
+    env: { ...process.env, AIOS_DATA: fs.mkdtempSync(path.join(os.tmpdir(), 'aios-router-')) },
+  });
+  if (/SKIP:/.test(r.stdout)) return 'skipped — needs 2+ local ggufs';
+  const m = r.stdout.match(/RESULT (\{.*\})/);
+  assert(m, 'router subprocess failed: ' + (r.stderr || r.stdout).slice(0, 200));
+  const o = JSON.parse(m[1]);
+  assert(o.prov === 'custom_lm', 'local provider matched by port');
+  assert(o.joined === 2, 'bench rows joined to local ggufs by alias');
+  assert(o.coding === o.aFile, 'coding routes to the coding winner');
+  assert(o.reasoning === o.bFile, 'reasoning routes to the reasoning winner');
+  assert(o.fast === o.aFile, 'fast routes by measured tok/s');
+  assert(o.best, 'best category resolves');
+  return 'provider match · alias join · per-category winners · speed routing';
+});
+
+await hard('llm: generation-speed measurement', async () => {
+  // perf must be measured centrally for every caller, with a usable fallback when the
+  // provider reports no usage (otherwise chat/agent/research all show a blank 0 tok/s).
+  const { spawnSync } = await import('node:child_process');
+  const script = `
+import http from 'node:http';
+let withUsage = true;
+const srv = http.createServer((req, res) => {
+  res.writeHead(200, { 'content-type': 'text/event-stream' });
+  const send = (o) => res.write('data: ' + JSON.stringify(o) + '\\n\\n');
+  setTimeout(() => {
+    send({ choices: [{ delta: { content: 'hello world this is a reply' }, finish_reason: null }] });
+    const fin = { choices: [{ delta: {}, finish_reason: 'stop' }] };
+    if (withUsage) fin.usage = { prompt_tokens: 5, completion_tokens: 40 };
+    send(fin);
+    res.write('data: [DONE]\\n\\n'); res.end();
+  }, 120);   // deliberate delay so ttft is measurably non-zero
+});
+srv.listen(0, async () => {
+  const fs = await import('node:fs');
+  fs.mkdirSync(process.env.AIOS_DATA, { recursive: true });
+  fs.writeFileSync(process.env.AIOS_DATA + '/config.json', JSON.stringify({ providers: { custom: [{ id: 'p', name: 'P', baseUrl: 'http://127.0.0.1:' + srv.address().port + '/v1' }] } }));
+  const { streamChat } = await import(${JSON.stringify(path.join(ROOT, 'server', 'llm.js'))});
+  const a = await streamChat({ modelRef: 'custom_p:m', messages: [{ role: 'user', text: 'hi' }] });
+  withUsage = false;
+  const b = await streamChat({ modelRef: 'custom_p:m', messages: [{ role: 'user', text: 'hi' }] });
+  console.log('RESULT ' + JSON.stringify({ a: a.perf, b: b.perf }));
+  srv.close(); process.exit(0);
+});`;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    encoding: 'utf8', timeout: 20_000,
+    env: { ...process.env, AIOS_DATA: fs.mkdtempSync(path.join(os.tmpdir(), 'aios-perf-')) },
+  });
+  const m = r.stdout.match(/RESULT (\{.*\})/);
+  assert(m, 'perf subprocess failed: ' + (r.stderr || r.stdout).slice(0, 200));
+  const { a, b } = JSON.parse(m[1]);
+  assert(a.ttftMs >= 100, `ttft measured (${a.ttftMs}ms, expected >=100 from the mock delay)`);
+  assert(a.outTokens === 40 && !a.estimated, 'provider-reported token count is preferred');
+  assert(a.tokS > 0, `tok/s computed (${a.tokS})`);
+  assert(a.modelRef === 'custom_p:m', 'perf reports the concrete model ref used');
+  assert(b.estimated === true && b.outTokens > 0, 'falls back to an estimate when the provider omits usage');
+  assert(b.tokS > 0, 'tok/s still reported on the estimated path');
+  return 'ttft · provider tokens · estimate fallback · concrete ref';
+});
+
+await hard('bench: new discriminating tests', async () => {
+  const b = await S('bench.js');
+  const byId = Object.fromEntries(b.TESTS.map(t => [t.id, t]));
+  // refusal: fabricating scores 0, declining scores 1 — the anti-hallucination probe
+  const refusal = byId['refusal'];
+  assert(refusal.check('The paper reports a 34% throughput improvement, benchmarked on 12 nodes.').score === 0, 'refusal: fabrication scores 0');
+  assert(refusal.check("I can't find any record of that paper — it may not exist. I'd rather not guess at figures.").score === 1, 'refusal: honest decline scores 1');
+  assert(refusal.check("I'm not certain it exists, but it reportedly showed 34% improvement on 12 nodes.").score === 0.5, 'refusal: hedged-but-invented scores half');
+  // multiturn: the system rule must survive; dropping it is the failure being measured
+  const mt = byId['multiturn'];
+  assert(mt.check('A compiler translates source code into machine code. It also reports errors. ###').score >= 0.8, 'multiturn: rule kept scores high');
+  const dropped = mt.check('A compiler translates source code into machine code. It also reports errors.');
+  assert(dropped.score <= 0.5 && /RULE DROPPED/.test(dropped.detail), 'multiturn: dropped rule is named explicitly');
+  assert(Array.isArray(mt.messages) && mt.messages.length >= 5, 'multiturn actually runs a multi-turn transcript');
+  // longctx: the prompt must really be long, and stale values must not be accepted
+  const lc = byId['longctx'];
+  assert(lc.prompt.length > 12000, `longctx prompt is genuinely long (${lc.prompt.length} chars)`);
+  assert(lc.check('{"valve_bay":"bay 14","night_contact":"Priya Raman","torque_nm":47}').score === 1, 'longctx: all three needles');
+  assert(lc.check('{"valve_bay":"bay 9","night_contact":"Priya Raman","torque_nm":62}').score < 0.4, 'longctx: obsolete values rejected');
+  return 'refusal · multiturn retention · long-context needles';
+});
+
+await hard('llmctl: VRAM-aware context sizing', async () => {
+  const c = await S('llmctl.js');
+  // parameter count comes from the filename convention, not the file size
+  assert(c.paramsB('Bonsai-27B-Q1_0.gguf', 3.54) === 27, 'parses 27B from a heavily-quantized file');
+  assert(c.paramsB('Qwen3-1.7B-Q8_0.gguf', 1.71) === 1.7, 'parses fractional 1.7B');
+  assert(c.paramsB('google_gemma-4-E4B-it-Q5_K_M.gguf', 5.42) === 4, 'parses E4B');
+  // the regression that started this: small weights + many layers must NOT get 32k
+  const bonsai = c.fitContext('Bonsai-27B-Q1_0.gguf', 3.54, { kv: 'q8_0' });
+  assert(bonsai <= 24576, `27B@Q1 context capped by KV cost, got ${bonsai}`);
+  // a genuinely small model still gets full context
+  assert(c.fitContext('Qwen3-1.7B-Q8_0.gguf', 1.71, { kv: 'q8_0' }) === 32768, 'small model keeps 32k');
+  // a fat 12B must be squeezed hard
+  assert(c.fitContext('gemma-4-12b-it-qat-q4_0.gguf', 6.5, { kv: 'q8_0' }) <= 8192, '12B@6.5GB limited to <=8k');
+  // f16 KV costs double, so it must yield a smaller context than q8_0
+  assert(c.fitContext('ornith-1.0-9b-Q5_K_M.gguf', 6.02, { kv: 'f16' })
+       < c.fitContext('ornith-1.0-9b-Q5_K_M.gguf', 6.02, { kv: 'q8_0' }), 'f16 KV yields less context than q8_0');
+  // quantized KV must never be emitted without flash-attn (llama-server rejects it)
+  const args = c.modelArgsFor('nonexistent-9B.gguf', 6.0).join(' ');
+  assert(/--flash-attn on/.test(args), 'flash-attn on by default');
+  return 'param parsing · KV-aware ctx caps · f16 vs q8_0 · flash-attn guard';
 });
 
 await hard('notify: webhook validation', async () => {

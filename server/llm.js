@@ -21,7 +21,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import { loadConfig } from './config.js';
-import { id as genId } from './util.js';
+import { id as genId, estTokens } from './util.js';
 import { readUpload } from './uploads.js';
 
 const ANTHROPIC_FALLBACK_MODELS = [
@@ -72,7 +72,15 @@ export async function listModels() {
     })());
   }
 
+  // The managed local provider is special: asking llama /v1/models only reveals the
+  // model that HAPPENS to be loaded (and llama answers under any name you send — a
+  // stale picker entry silently runs the wrong model). Instead, every local gguf is
+  // listed as a stable `local:<alias>` ref; picking one auto-serves it on demand.
+  let managedId = null;
+  try { managedId = (await import('./router.js')).localProviderId(); } catch { }
+
   for (const c of cfg.providers.custom) {
+    if (managedId === `custom_${c.id}`) continue;   // replaced by the local: entries below
     jobs.push((async () => {
       try {
         const headers = c.apiKey ? { Authorization: `Bearer ${c.apiKey}` } : {};
@@ -83,6 +91,26 @@ export async function listModels() {
   }
 
   await Promise.allSettled(jobs);
+
+  try {
+    const { AUTO_CATEGORIES } = await import('./router.js');
+    const { listLocalModels, servingAlias, modelAlias } = await import('./llmctl.js');
+    if (managedId) {
+      const current = servingAlias();
+      // stable per-gguf refs — same list no matter what is loaded right now
+      for (const m of listLocalModels().reverse()) {
+        const alias = modelAlias(m.file);
+        out.unshift({
+          ref: `local:${alias}`, provider: 'local', model: alias,
+          label: `${m.file.replace(/\.gguf$/i, '')} (${m.sizeGB}GB local${alias === current ? ' · serving' : ''})`,
+        });
+      }
+      // routed pseudo-models: the bench-driven router picks per request
+      for (const [c, why] of [...AUTO_CATEGORIES].reverse()) {
+        out.unshift({ ref: `auto:${c}`, provider: 'auto', model: c, label: `⚡ Auto — ${c} (${why})` });
+      }
+    }
+  } catch { /* router unavailable — plain model list */ }
   return out;
 }
 
@@ -220,11 +248,47 @@ export function samplingParams(kind, overrides) {
 // ---------- streaming chat ----------
 
 export async function streamChat({ modelRef, system, messages, tools, onEvent, signal, maxTokens = 8192, sampling }) {
+  // auto:<category> → routed to the bench-best local model; local:<alias> → that exact
+  // model, auto-served on demand. Either way the managed llama-server may be swapped
+  // first (never mid-generation). Dynamic import: router → bench → this module.
+  if (String(modelRef || '').startsWith('auto:')) {
+    const { resolveAuto } = await import('./router.js');
+    modelRef = await resolveAuto(modelRef.slice(5));
+  } else if (String(modelRef || '').startsWith('local:')) {
+    const { resolveLocal } = await import('./router.js');
+    modelRef = await resolveLocal(modelRef.slice(6));
+  }
   const { providerId, model } = resolveModelRef(modelRef);
   const p = providerFor(providerId);
-  if (p.kind === 'anthropic') return anthropicStream({ p, model, system, messages, tools, onEvent, signal, maxTokens, sampling });
-  if (p.kind === 'ollama') return ollamaStream({ p, model, system, messages, tools, onEvent, signal, sampling });
-  return openaiStream({ p, model, system, messages, tools, onEvent, signal, maxTokens, sampling });
+
+  // Generation speed, measured once here so EVERY caller (chat, agent, research,
+  // learn, bench…) reports it without its own stopwatch. Time-to-first-token is
+  // split out because on local hardware it's dominated by prompt PROCESSING — slow
+  // TTFT with fast tok/s means the prompt is too big, not the model too weak.
+  const t0 = Date.now();
+  let ttftMs = 0;
+  const timed = (ev) => {
+    if (!ttftMs && (ev.type === 'text' || ev.type === 'reasoning' || ev.type === 'toolCall')) ttftMs = Date.now() - t0;
+    onEvent?.(ev);
+  };
+
+  const res = p.kind === 'anthropic' ? await anthropicStream({ p, model, system, messages, tools, onEvent: timed, signal, maxTokens, sampling })
+    : p.kind === 'ollama' ? await ollamaStream({ p, model, system, messages, tools, onEvent: timed, signal, sampling })
+      : await openaiStream({ p, model, system, messages, tools, onEvent: timed, signal, maxTokens, sampling });
+
+  const totalMs = Date.now() - t0;
+  // Prefer the provider's own token count; fall back to an estimate when it reports
+  // none (some OpenAI-compatible servers omit usage) and flag it rather than show 0.
+  const reported = res.usage?.output || 0;
+  const outTokens = reported || estTokens((res.text || '') + (res.reasoning || ''));
+  const decodeMs = Math.max(1, totalMs - ttftMs);
+  res.perf = {
+    ttftMs, totalMs, outTokens,
+    tokS: outTokens ? Math.round((outTokens / (decodeMs / 1000)) * 10) / 10 : 0,
+    estimated: !reported,
+    modelRef,   // the CONCRETE ref actually used — auto:/local: are resolved above
+  };
+  return res;
 }
 
 // ---------- attachments ----------

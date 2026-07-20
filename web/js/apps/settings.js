@@ -19,7 +19,6 @@ export default {
       ['appearance', 'Appearance', 'sun'],
       ['providers', 'AI Providers', 'cpu'],
       ['tools', 'Tools', 'wrench'],
-      ['jobsearch', 'Job Search', 'briefcase'],
       ['vault', 'Vault', 'vault'],
       ['github', 'GitHub', 'github'],
       ['mail', 'Mail & Alerts', 'send'],
@@ -287,36 +286,6 @@ export default {
             ui.panel.append(row(el('span', { class: 'mono', style: t.enabled ? {} : { opacity: .5 } }, t.name), t.description, ctl));
           }
         }
-      }
-
-      if (S.tab === 'jobsearch') {
-        ui.panel.append(el('h2', {}, 'Job Search'), el('div', { class: 'desc' }, 'Where job data comes from. The source is pluggable — start free with SearXNG, add Firecrawl for real scraping, or a SerpApi key for the most reliable Indeed results.'));
-
-        const j = c.jobsearch;
-        const srcSeg = el('div', { class: 'seg' }, ...[['searxng', 'SearXNG'], ['firecrawl', 'Firecrawl'], ['jobapi', 'Job API']].map(([v, label]) =>
-          el('button', {
-            class: 'seg-btn' + (j.source === v ? ' on' : ''),
-            onclick: async () => { await save({ jobsearch: { source: v } }); renderPanel(); },
-          }, label)));
-        ui.panel.append(row('Active source', 'Which connector the Discover search uses', srcSeg));
-
-        const country = el('input', { class: 'input', value: j.country || 'jp', style: { width: '90px' } });
-        country.addEventListener('change', () => save({ jobsearch: { country: country.value.trim().toLowerCase() || 'jp' } }));
-        ui.panel.append(row('Country', 'Region for job boards — "jp" targets indeed.jp / TokyoDev / Japan Dev', country));
-
-        const fcUrl = el('input', { class: 'input', value: j.firecrawl.url || '', placeholder: 'http://127.0.0.1:8899', style: { width: '220px' } });
-        const fcSave = el('button', { class: 'btn sm', onclick: async () => { if (await save({ jobsearch: { firecrawl: { url: fcUrl.value.trim() } } })) renderPanel(); } }, 'Save');
-        ui.panel.append(row('Firecrawl URL', 'Self-hosted scraping engine — start it with `npm run firecrawl`', el('div', { class: 'row' }, fcUrl, fcSave)));
-
-        const fcKey = el('input', { class: 'input', type: 'password', placeholder: j.firecrawl.hasKey ? '•••••••• (key set)' : 'fc-… (cloud, optional)', style: { width: '190px' } });
-        const fcKeyBtn = el('button', { class: 'btn sm', onclick: async () => { if (fcKey.value.trim() && await save({ jobsearch: { firecrawl: { apiKey: fcKey.value.trim() } } }, 'key saved')) { fcKey.value = ''; renderPanel(); } } }, 'Save');
-        const fcKeyClear = j.firecrawl.hasKey ? el('button', { class: 'btn sm ghost danger', onclick: async () => { await save({ jobsearch: { firecrawl: { apiKey: null } } }, 'key removed'); renderPanel(); } }, 'remove') : null;
-        ui.panel.append(row('Firecrawl cloud key', 'Optional — cloud handles anti-bot better than self-host', el('div', { class: 'row' }, fcKey, fcKeyBtn, fcKeyClear)));
-
-        const apiKey = el('input', { class: 'input', type: 'password', placeholder: j.jobapi.hasKey ? '•••••••• (key set)' : 'SerpApi key…', style: { width: '190px' } });
-        const apiBtn = el('button', { class: 'btn sm', onclick: async () => { if (apiKey.value.trim() && await save({ jobsearch: { jobapi: { apiKey: apiKey.value.trim() } } }, 'key saved')) { apiKey.value = ''; renderPanel(); } } }, 'Save');
-        const apiClear = j.jobapi.hasKey ? el('button', { class: 'btn sm ghost danger', onclick: async () => { await save({ jobsearch: { jobapi: { apiKey: null } } }, 'key removed'); renderPanel(); } }, 'remove') : null;
-        ui.panel.append(row('Job API key (SerpApi)', 'Google Jobs engine — aggregates Indeed.jp reliably; ~100 free searches/mo', el('div', { class: 'row' }, apiKey, apiBtn, apiClear)));
       }
 
       if (S.tab === 'vault') {

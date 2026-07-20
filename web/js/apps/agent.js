@@ -1,7 +1,7 @@
 // Agent: Claude-Code-style coding sessions on the active project.
 // Streams text + tool calls, renders diffs, and handles approval requests.
 
-import { el, icon, icons, toast, confirmBox, modal, modelPicker, timeAgo, throttle, thinkingPanel, attachTray, attachmentView } from '../ui.js';
+import { el, icon, icons, toast, confirmBox, modal, modelPicker, timeAgo, throttle, thinkingPanel, attachTray, attachmentView, perfBadge } from '../ui.js';
 import { get, post, patch, del, wsSend, sub, uploadFile } from '../api.js';
 import { renderMd } from '../markdown.js';
 import { state, on } from '../state.js';
@@ -13,7 +13,7 @@ export default {
   id: 'agent', title: 'Agent', icon: 'agent', width: 1060, height: 700,
 
   mount(body, opts, win) {
-    const S = win.agentState = { sessionId: null, projectId: null, unsub: null, running: false, liveText: null, liveThink: null, buf: '', cards: new Map(), offs: [] };
+    const S = win.agentState = { sessionId: null, projectId: null, unsub: null, running: false, planMode: false, livePlan: null, liveText: null, liveThink: null, buf: '', cards: new Map(), offs: [] };
     const ui = {};
 
     const side = el('div', { class: 'side' },
@@ -24,13 +24,14 @@ export default {
 
     ui.modeSeg = el('div', { class: 'seg' }, ...MODES.map(([v, label]) =>
       el('button', { class: 'seg-btn', dataset: { mode: v }, onclick: () => setMode(v) }, label)));
+    ui.planToggle = el('button', { class: 'seg-btn plan-toggle', title: 'Plan mode — the agent proposes a numbered step plan and waits for your approval (you can edit it) before running anything', onclick: () => setPlanMode(!S.planMode) }, icon('check'), 'Plan');
     ui.model = modelPicker({ storageKey: 'agent', onchange: (ref) => S.sessionId && patch('/agent/sessions/' + S.sessionId, { modelRef: ref }) });
     ui.usage = el('span', { class: 'chip usage-chip', title: 'tokens in / out' }, '—');
     ui.stop = el('button', { class: 'btn sm danger', style: { display: 'none' }, onclick: () => wsSend({ t: 'agent.cancel', sessionId: S.sessionId }) }, icon('stop'), 'Stop');
 
     ui.head = el('div', { class: 'pane-head' },
       el('span', { class: 'ttl' }, projectLabel()),
-      ui.modeSeg, ui.model, ui.usage, ui.stop,
+      ui.modeSeg, el('div', { class: 'seg' }, ui.planToggle), ui.model, ui.usage, ui.stop,
       el('button', { class: 'btn sm ghost danger', title: 'Delete session', onclick: deleteSession }, icon('trash')));
 
     ui.events = el('div', { class: 'agent-events' });
@@ -300,9 +301,16 @@ export default {
       S.cards.clear(); S.liveText = null; S.liveThink = null; S.buf = ''; S.justSent = false;
       if (s.modelRef) ui.model.setValue(s.modelRef);
       paintMode(s.mode);
+      paintPlan(s.planMode);
       paintUsage(s.usage);
       setRunning(s.running);
       ui.events.innerHTML = '';
+      // archived messages = what checkpoints moved out of the model's window. Still the
+      // user's history, so still rendered — with a divider marking the live boundary.
+      if (s.archive?.length) {
+        renderTranscript(s.archive);
+        ui.events.append(el('div', { class: 'check-line' }, icon('save'), 'everything above was compacted out of the model\'s context — it works from the checkpoint below'));
+      }
       renderTranscript(s.transcript);
       scrollDown(true);
       S.unsub = sub('agent:' + id, onEvent);
@@ -322,6 +330,14 @@ export default {
     }
     function paintMode(mode) {
       for (const b of ui.modeSeg.children) b.classList.toggle('on', b.dataset.mode === mode);
+    }
+    async function setPlanMode(on) {
+      paintPlan(on);
+      if (S.sessionId) await patch('/agent/sessions/' + S.sessionId, { planMode: on });
+    }
+    function paintPlan(on) {
+      S.planMode = !!on;
+      ui.planToggle.classList.toggle('on', S.planMode);
     }
     function paintUsage(u) { ui.usage.textContent = u ? `${fmtK(u.input)} in · ${fmtK(u.output)} out` : '—'; }
     const fmtK = (n) => n > 9999 ? (n / 1000).toFixed(1) + 'k' : String(n || 0);
@@ -344,6 +360,7 @@ export default {
         else if (m.role === 'assistant') {
           if (m.reasoning) { const t = thinkingPanel({ collapsed: true, doneLabel: 'Thought process' }); t.setText(m.reasoning); ui.events.append(t.node); }
           if (m.text) ui.events.append(el('div', { class: 'ev-text' }, renderMd(m.text)));
+          { const b = perfBadge(m.perf, { compact: true }); if (b) ui.events.append(el('div', { class: 'msg-perf' }, b)); }
           for (const tc of m.toolCalls || []) {
             const card = toolCard(tc.id, tc.name, tc.args);
             const r = resultsById.get(tc.id);
@@ -377,7 +394,7 @@ export default {
 
     const iconFor = (name) => name.startsWith('git_') ? 'git' : name.startsWith('comfy_') ? 'image'
       : name.startsWith('mail_') ? 'send' : name.startsWith('wiki_') ? 'vault'
-        : ({ bash: 'terminal', read_file: 'file', write_file: 'save', edit_file: 'edit', list_dir: 'folder', glob: 'search', grep: 'search', delete_path: 'trash', move_path: 'files', fetch_url: 'network', web_search: 'globe', skill: 'star', vault_search: 'vault', vault_list: 'vault', vault_read: 'vault', vault_write: 'vault', vault_append: 'vault', agenda_view: 'daily', task_add: 'daily', event_add: 'daily', research_start: 'research', research_status: 'research', mindmap_generate: 'mindmap' }[name] || 'code');
+        : ({ bash: 'terminal', read_file: 'file', write_file: 'save', edit_file: 'edit', list_dir: 'folder', glob: 'search', grep: 'search', delete_path: 'trash', move_path: 'files', fetch_url: 'network', web_search: 'globe', skill: 'star', vault_search: 'vault', vault_list: 'vault', vault_read: 'vault', vault_write: 'vault', vault_append: 'vault', agenda_view: 'daily', task_add: 'daily', event_add: 'daily', research_start: 'research', research_status: 'research' }[name] || 'code');
 
     function summarizeArgs(name, args = {}) {
       if (name === 'bash') return args.command || '';
@@ -425,8 +442,32 @@ export default {
           break;
         case 'status':
           ui.status.style.display = ev.state === 'idle' ? 'none' : '';
-          ui.statusText.textContent = ev.state === 'waiting-approval' ? 'waiting for your approval…' : ev.state === 'thinking' ? 'thinking…' : 'working…';
+          ui.statusText.textContent = ev.state === 'waiting-approval' ? 'waiting for your approval…'
+            : ev.state === 'waiting-plan' ? 'waiting for you to approve the plan…'
+            : ev.state === 'planning' ? 'drafting a plan…'
+            : ev.state === 'thinking' ? 'thinking…'
+            : ev.state === 'compacting' ? 'compacting context into a checkpoint…' : 'working…';
           setRunning(ev.state !== 'idle');
+          break;
+        case 'plan.delta':
+          if (S.liveThink?.live) S.liveThink.done();
+          S.liveThink = null;
+          if (!S.livePlan) S.livePlan = planCard();
+          S.livePlan.appendDelta(ev.delta);
+          scrollDown();
+          break;
+        case 'plan.proposed':
+          if (!S.livePlan) S.livePlan = planCard();
+          S.livePlan.propose(ev.text);
+          scrollDown(true);
+          break;
+        case 'plan.resolved':
+          if (S.livePlan) { S.livePlan.resolve(ev.decision, ev.text); S.livePlan = null; }
+          break;
+        case 'checkpoint':
+          ui.events.append(el('div', { class: 'check-line' }, icon('save'),
+            `checkpoint ${ev.n}: context compacted ${(ev.tokensBefore / 1000).toFixed(1)}k → ${(ev.tokensAfter / 1000).toFixed(1)}k tokens — earlier work is archived, the run continues`));
+          scrollDown();
           break;
         case 'reasoning.delta':
           if (!S.liveThink) { S.liveThink = thinkingPanel({ label: 'Thinking' }); ui.events.append(S.liveThink.node); }
@@ -440,13 +481,16 @@ export default {
           S.buf += ev.delta;
           rerenderLive();
           break;
-        case 'text.done':
+        case 'text.done': {
           if (S.liveThink?.live) S.liveThink.done();
           S.liveThink = null;
           if (S.liveText) { S.liveText.innerHTML = ''; if (ev.text) S.liveText.append(renderMd(ev.text)); else S.liveText.remove(); }
           S.liveText = null; S.buf = '';
+          const badge = perfBadge(ev.perf, { compact: true });
+          if (badge) ui.events.append(el('div', { class: 'msg-perf' }, badge));
           scrollDown();
           break;
+        }
         case 'tool.request':
           if (S.liveThink?.live) S.liveThink.done();
           S.liveThink = null;
@@ -486,14 +530,62 @@ export default {
       ui.events.append(node);
     }
 
+    // Plan-mode card: streams the proposed plan, then turns editable with approve/reject.
+    function planCard() {
+      const pre = el('pre', { class: 'plan-stream mono' });
+      const body = el('div', { class: 'plan-body' }, pre);
+      const actions = el('div', { class: 'plan-actions', style: { display: 'none' } });
+      const statusPill = el('span', { class: 't-state' });
+      const node = el('div', { class: 'plan-card' },
+        el('div', { class: 'plan-head' }, icon('check'), el('span', { class: 't-name' }, 'Plan'),
+          el('span', { class: 't-arg' }, 'review — the agent runs this only after you approve'), statusPill),
+        body, actions);
+      ui.events.append(node);
+      let buf = '', textarea = null, decided = false;
+      const lock = (label, ok) => {
+        if (textarea) textarea.disabled = true;
+        actions.querySelectorAll('button').forEach(b => b.disabled = true);
+        statusPill.textContent = label; statusPill.classList.add(ok ? 'ok' : 'warn');
+      };
+      const send = (decision) => {
+        if (decided) return; decided = true;
+        wsSend({ t: 'agent.plan', sessionId: S.sessionId, decision, text: textarea ? textarea.value : buf });
+        lock(decision === 'approve' ? 'approved — running…' : 'rejected', decision === 'approve');
+      };
+      return {
+        node,
+        appendDelta(d) { buf += d; if (!textarea) pre.textContent = buf; },
+        propose(text) {
+          buf = text || buf;
+          textarea = el('textarea', { class: 'plan-edit mono', rows: Math.min(18, Math.max(4, buf.split('\n').length + 1)) });
+          textarea.value = buf;
+          body.innerHTML = ''; body.append(textarea);
+          actions.innerHTML = '';
+          actions.append(
+            el('button', { class: 'btn primary sm', onclick: () => send('approve') }, icon('check'), 'Approve & run'),
+            el('span', { class: 'muted small' }, 'edit above before approving if you like'),
+            el('span', { class: 'grow' }),
+            el('button', { class: 'btn sm danger', onclick: () => send('reject') }, icon('x'), 'Reject'));
+          actions.style.display = '';
+        },
+        resolve(decision, text) {
+          if (textarea && typeof text === 'string' && !decided) textarea.value = text;
+          lock(decision === 'approve' ? 'approved — running…' : 'rejected', decision === 'approve');
+        },
+      };
+    }
+
     function checkCard(text, kind) {
       const isMem = kind === 'memory' || /^\[automatic memory\]/.test(text);
+      const isCp = kind === 'checkpoint' || /^\[checkpoint/.test(text);
+      const isPlan = kind === 'plan';
       const bodyEl = el('div', { class: 'tool-body', style: { display: 'none' } }, el('pre', {}, text));
       const head = el('div', { class: 'tool-head', onclick: () => { bodyEl.style.display = bodyEl.style.display === 'none' ? '' : 'none'; } },
-        icon(isMem ? 'vault' : 'shield'), el('span', { class: 't-name' }, isMem ? 'memory' : 'self-check'),
-        el('span', { class: 't-arg' }, isMem ? 'asked the agent to record what it learned in .aios/memory/' : 'syntax problems found — asked the agent to fix them'),
+        icon(isCp ? 'save' : isMem ? 'vault' : isPlan ? 'check' : 'shield'),
+        el('span', { class: 't-name' }, isCp ? 'checkpoint' : isMem ? 'memory' : isPlan ? 'plan' : 'self-check'),
+        el('span', { class: 't-arg' }, isCp ? 'older context compacted into a handoff — click to read it' : isMem ? 'asked the agent to record what it learned in .aios/memory/' : isPlan ? 'plan approved — the agent executed these steps' : 'syntax problems found — asked the agent to fix them'),
         el('span', { class: 't-state warn' }, 'auto'));
-      return el('div', { class: 'tool-card ' + (isMem ? 'memory-card' : 'check-card') }, head, bodyEl);
+      return el('div', { class: 'tool-card ' + (isCp ? 'checkpoint-card' : isMem ? 'memory-card' : 'check-card') }, head, bodyEl);
     }
 
     function diffEl(diff) {
@@ -526,10 +618,11 @@ export default {
       if (!S.sessionId) {
         if (!state.project) { toast('register a project first', 'err'); openApp('projects'); return; }
         if (!ui.model.getValue()) { toast('pick a model first', 'err'); return; }
-        const s = await post('/agent/sessions', { projectId: state.project.id, modelRef: ui.model.getValue() });
+        const s = await post('/agent/sessions', { projectId: state.project.id, modelRef: ui.model.getValue(), planMode: S.planMode });
         S.sessionId = s.id;
         S.projectId = s.projectId;
         paintMode(s.mode);
+        paintPlan(s.planMode);
         S.unsub = sub('agent:' + s.id, onEvent);
       }
       setRunning(true);

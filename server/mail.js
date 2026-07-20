@@ -12,9 +12,8 @@ import path from 'node:path';
 import tls from 'node:tls';
 import { DATA, loadConfig } from './config.js';
 import { streamChat, listModels } from './llm.js';
-import { extractJSON } from './jobai.js';
 import { notifyDiscord } from './notify.js';
-import { now, readJSON, writeJSON } from './util.js';
+import { now, readJSON, writeJSON, extractJSON } from './util.js';
 
 const FILE = path.join(DATA, 'mail', 'state.json');
 const loadState = () => {

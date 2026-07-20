@@ -308,7 +308,7 @@ export async function expandPrompt({ idea, style = 'anime' } = {}) {
   if (!ref) throw err('no model available for prompt expansion', 502);
 
   const { streamChat } = await import('./llm.js');
-  const { extractJSON } = await import('./jobai.js');
+  const { extractJSON } = await import('./util.js');
   const res = await streamChat({
     modelRef: ref, maxTokens: 1600,   // reasoning models think before they answer
     system: 'You write Stable Diffusion prompts for SDXL anime models (Animagine). Think briefly if needed, then output ONLY the JSON.',

@@ -225,7 +225,7 @@ More than ~100 lines, needs arrays-of-objects, JSON manipulation beyond \`jq\`, 
     content: `**AIOS is a zero-build personal AI hub: plain ESM on both sides, an Express + WebSocket server on port 7777, and a web shell of page-views (not windows).**
 
 ## Layout
-- \`server/\` — one module per concern: \`llm.js\` (provider abstraction, \`provider:model\` refs, streaming + reasoning split), \`agent.js\` (tool loop + approval gate), \`tools.js\` (tool belt; path-confined to the project root), \`vault.js\`/\`wiki.js\` (second brain), \`research.js\`, \`mindmap.js\`, \`jobsource.js\`, \`toolforge.js\` (AI-forged custom tools), \`config.js\` (data/config.json, deep-merged defaults).
+- \`server/\` — one module per concern: \`llm.js\` (provider abstraction, \`provider:model\` refs, streaming + reasoning split), \`agent.js\` (tool loop + approval gate), \`tools.js\` (tool belt; path-confined to the project root), \`vault.js\`/\`wiki.js\` (second brain), \`research.js\`, \`learn.js\`/\`learndb.js\` (Learning Corner), \`bench.js\`/\`router.js\` (model benchmarking + auto-routing), \`toolforge.js\` (AI-forged custom tools), \`config.js\` (data/config.json, deep-merged defaults).
 - \`web/js/apps/*.js\` — one file per app, mounted once by \`wm.js\`; \`web/css/apps.css\` styles them.
 - No bundler, no TypeScript, no framework: verify changes with \`npm run check\` (esbuild parse + bundle dry-run).
 

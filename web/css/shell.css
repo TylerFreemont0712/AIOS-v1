@@ -119,6 +119,22 @@
     transform: translateX(-105%); transition: transform .18s ease;
   }
   body.show-side .page.active .side { transform: none; }
+
+  /* iOS zooms the page when a focused input's font is under 16px — pin it there */
+  .input, .composer-input, select.input, textarea.input { font-size: 16px; }
+
+  /* the home-indicator bar (viewport-fit=cover) must not cover the dock */
+  .dock { bottom: calc(6px + env(safe-area-inset-bottom, 0px)); }
+  #views { inset: 0 0 calc(60px + env(safe-area-inset-bottom, 0px)) 0; }
+}
+
+/* touch devices regardless of width: finger-sized targets, no hover-only affordances */
+@media (pointer: coarse) {
+  .btn.sm { padding: 7px 12px; min-height: 34px; }
+  .side-item { padding: 10px 12px; }
+  .learn-choice { padding: 11px 12px; }
+  .tool-head { min-height: 36px; }
+  .learn-mod-menu { opacity: 1; }   /* revealed-on-hover is unreachable on touch */
 }
 
 /* ---------- command palette ---------- */

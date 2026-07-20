@@ -75,11 +75,13 @@ export default {
           .filter(Boolean).join(' · ') || 'no providers configured yet — open Settings'
         : '';
 
-      const capture = el('input', { class: 'input', placeholder: 'Quick capture to today\'s daily note…' });
-      capture.addEventListener('keydown', async (e) => {
+      // Quick ask: one line straight into a fresh Chat conversation. (Daily-note capture
+      // still exists via the agent's daily_log tool — this box earns its keep as AI access.)
+      const capture = el('input', { class: 'input', placeholder: 'Ask the AI anything — Enter opens the chat…' });
+      capture.addEventListener('keydown', (e) => {
         if (e.key !== 'Enter' || !capture.value.trim()) return;
-        try { await post('/vault/daily', { text: capture.value.trim() }); capture.value = ''; toast('captured', 'ok'); }
-        catch (err) { toast(err.message, 'err'); }
+        openApp('chat', { seed: capture.value.trim() });
+        capture.value = '';
       });
 
       const card = (ic, title, sub, app, opts2) => {
@@ -307,9 +309,10 @@ export default {
             card('chat', 'Chat', 'Talk to any local or cloud model', 'chat'),
             card('research', 'Research', 'Deep, cited web research on any question', 'research'),
             card('daily', 'Planner', 'Calendar, tasks, and your day at a glance', 'planner'),
-            card('briefcase', 'Job Search', 'Find jobs and track your applications', 'jobsearch'),
             card('vault', 'Second Brain', cfg.vault?.path ? 'Browse, ask, and grow your Obsidian vault' : 'Connect your Obsidian vault', 'vault'),
             card('learn', 'Learning', 'Roadmaps and AI-tutored lessons, web-grounded', 'learn'),
+            card('graph', 'Bench', 'Measure which model is best at which task', 'bench'),
+            card('cpu', 'Models', 'Local model garage, auto-routing, one-click serving', 'models'),
             card('files', 'Files', 'Explore and edit project files', 'files'),
             card('terminal', 'Terminal', 'A real shell, right in your hub', 'terminal'),
             card('projects', 'Projects', 'Register, create, and manage workspaces', 'projects'),

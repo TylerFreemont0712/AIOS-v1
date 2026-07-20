@@ -24,7 +24,7 @@ const defaults = () => ({
   },
   // contextTokens: the context window of your local models (llama.cpp/Ollama). AIOS
   // keeps prompts under this so a ~32k model never overflows. Anthropic uses its own large window.
-  defaults: { chatModel: '', agentModel: '', agentMode: 'edits', contextTokens: 32000 },
+  defaults: { chatModel: '', agentModel: '', agentMode: 'edits', agentPlanMode: false, contextTokens: 32000 },
   // Sampling knobs sent with every model call. null = leave it to the provider's default.
   // temperature/top_p/top_k are universal-ish; presence/frequency penalties are
   // OpenAI-compat; repeat_penalty is Ollama/llama.cpp; seed + stop where supported.
@@ -86,17 +86,6 @@ const defaults = () => ({
     disabled: [],                                   // tool names the agent may not use
     searxng: { url: 'http://127.0.0.1:8890' },      // bundled metasearch instance (npm run searxng)
   },
-  // Job Search add-on. source picks the active job connector; secrets (firecrawl/jobapi
-  // keys, email password) are redacted in publicConfig and only set via explicit fields.
-  jobsearch: {
-    source: 'searxng',                              // 'searxng' | 'firecrawl' | 'jobapi'
-    country: 'jp',                                  // default region (indeed.jp)
-    firecrawl: { url: 'http://127.0.0.1:8899', apiKey: '' },  // self-host url and/or cloud key
-    jobapi: { provider: 'serpapi', apiKey: '' },    // reliable Indeed via SerpApi when set
-    email: { enabled: false, kind: 'imap', host: '', port: 993, user: '', password: '' }, // 1d
-    savedSearches: [],                              // [{ id, label, query, location, type }]
-    defaultModel: '',                               // model ref for summaries / cover letters
-  },
 });
 
 let cfg = null;
@@ -126,12 +115,6 @@ export function publicConfig() {
   const c = JSON.parse(JSON.stringify(loadConfig()));
   c.providers.anthropic = { enabled: c.providers.anthropic.enabled, hasKey: !!c.providers.anthropic.apiKey };
   c.providers.custom = c.providers.custom.map(p => ({ ...p, apiKey: undefined, hasKey: !!p.apiKey }));
-  if (c.jobsearch) {
-    const j = c.jobsearch;
-    j.firecrawl = { ...j.firecrawl, apiKey: undefined, hasKey: !!j.firecrawl.apiKey };
-    j.jobapi = { ...j.jobapi, apiKey: undefined, hasKey: !!j.jobapi.apiKey };
-    j.email = { ...j.email, password: undefined, hasPassword: !!j.email.password };
-  }
   if (c.mail) c.mail = { ...c.mail, password: undefined, hasPassword: !!c.mail.password };
   if (c.github) c.github = { hasToken: !!c.github.token };
   if (c.notify) c.notify = { ...c.notify, discordWebhook: undefined, hasDiscordWebhook: !!c.notify.discordWebhook };
@@ -179,28 +162,6 @@ export function updateConfig(patch) {
   if (patch.auth) {
     if (['never', 'lan', 'always'].includes(patch.auth.required)) c.auth.required = patch.auth.required;
     if (patch.auth.regenerateToken) c.auth.token = id(18);
-  }
-  if (patch.jobsearch) {
-    const j = patch.jobsearch, J = c.jobsearch;
-    if (['searxng', 'firecrawl', 'jobapi'].includes(j.source)) J.source = j.source;
-    if (typeof j.country === 'string') J.country = j.country;
-    if (typeof j.defaultModel === 'string') J.defaultModel = j.defaultModel;
-    if (Array.isArray(j.savedSearches)) J.savedSearches = j.savedSearches;
-    if (j.firecrawl) {
-      if (typeof j.firecrawl.url === 'string') J.firecrawl.url = j.firecrawl.url;
-      if (typeof j.firecrawl.apiKey === 'string' && j.firecrawl.apiKey !== '') J.firecrawl.apiKey = j.firecrawl.apiKey;
-      if (j.firecrawl.apiKey === null) J.firecrawl.apiKey = '';
-    }
-    if (j.jobapi) {
-      if (typeof j.jobapi.provider === 'string') J.jobapi.provider = j.jobapi.provider;
-      if (typeof j.jobapi.apiKey === 'string' && j.jobapi.apiKey !== '') J.jobapi.apiKey = j.jobapi.apiKey;
-      if (j.jobapi.apiKey === null) J.jobapi.apiKey = '';
-    }
-    if (j.email) {
-      for (const k of ['enabled', 'kind', 'host', 'port', 'user']) if (j.email[k] !== undefined) J.email[k] = j.email[k];
-      if (typeof j.email.password === 'string' && j.email.password !== '') J.email.password = j.email.password;
-      if (j.email.password === null) J.email.password = '';
-    }
   }
   saveConfig();
   return publicConfig();

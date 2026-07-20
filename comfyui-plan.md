@@ -1,7 +1,7 @@
 # ComfyUI × AIOS — Integration Game-Plan
 
 *Written 2026-07-11 after surveying this machine and the MCP ecosystem. Companion to
-`Suggestions.md`; graduates to Roadmap when a phase starts.*
+`Roadmap.md`; graduates into it when a phase starts.*
 
 ---
 
@@ -112,7 +112,7 @@ launcher/simple-workflow layer. Dock icon, Home card, palette entry, Settings ta
 - Agent tools `comfy_generate` / `comfy_status` (group `apps`), gated on the service being
   up; generation results land in the transcript as image attachments (upload plumbing exists).
 - The suggest/triage-style calls automatically use the tiny model while Studio mode is on
-  (model roles from `Suggestions.md` #5 make this clean — worth doing first or together).
+  (the routing-role consolidation in `Roadmap.md` #4 makes this clean — worth doing first or together).
 
 ### Phase 4 — optional extras
 - Install `artokun/comfyui-mcp` for Claude Code sessions (dev tooling).

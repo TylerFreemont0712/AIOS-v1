@@ -2,7 +2,7 @@
 // (plan → search → read → reflect → synthesize); this app streams the progress
 // timeline and renders the final report with sources.
 
-import { el, icon, toast, confirmBox, modelPicker, timeAgo, throttle, thinkingPanel } from '../ui.js';
+import { el, icon, toast, confirmBox, modelPicker, timeAgo, throttle, thinkingPanel, perfBadge } from '../ui.js';
 import { get, post, del, wsSend, sub } from '../api.js';
 import { renderMd } from '../markdown.js';
 
@@ -148,6 +148,15 @@ export default {
           if (ev.phase !== 'done') ui.statusLine = logLine('info', `${ev.phase}${ev.detail ? ` — ${ev.detail.slice(0, 90)}` : ''}…`);
           scrollDown();
           break;
+        case 'perf': {
+          // running aggregate across the run's many model calls
+          if (!ui.perf) { ui.perf = el('span', { class: 'chip usage-chip' }); ui.head?.insertBefore(ui.perf, ui.head.querySelector('.grow')); }
+          ui.perf.innerHTML = '';
+          const b = perfBadge({ tokS: ev.tokS, ttftMs: 0, outTokens: ev.tokens, totalMs: ev.genMs }, { compact: true });
+          if (b) ui.perf.append(b);
+          ui.perf.title = `${ev.tokens} tokens generated across ${ev.calls} model call(s) · ${ev.tokS} tok/s average (last call ${ev.lastTokS})`;
+          break;
+        }
         case 'plan':
           if (ev.subs?.length) logLine('plan', `sub-questions: ${ev.subs.join(' · ')}`);
           logLine('plan', `queries: ${ev.queries.join(' · ')}`);

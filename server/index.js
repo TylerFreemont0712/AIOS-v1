@@ -12,11 +12,6 @@ import { ROOT, DATA, loadConfig, publicConfig, updateConfig } from './config.js'
 import { listModels, probeProviders } from './llm.js';
 import { toolCatalog, searxngStatus, runTool } from './tools.js';
 import { probeServices, registerService } from './services.js';
-import * as jobs from './jobs.js';
-import * as jobsource from './jobsource.js';
-import * as profile from './profile.js';
-import * as jobai from './jobai.js';
-import * as platforms from './platforms.js';
 import * as projects from './projects.js';
 import * as files from './files.js';
 import * as agent from './agent.js';
@@ -25,7 +20,6 @@ import * as uploads from './uploads.js';
 import * as vault from './vault.js';
 import * as wiki from './wiki.js';
 import * as forge from './toolforge.js';
-import * as mindmap from './mindmap.js';
 import * as learn from './learn.js';
 import * as term from './terminal.js';
 import * as research from './research.js';
@@ -37,6 +31,8 @@ import * as git from './git.js';
 import * as github from './github.js';
 import * as comfy from './comfy.js';
 import * as llmctl from './llmctl.js';
+import * as bench from './bench.js';
+import * as router from './router.js';
 import { gpuStats } from './gpu.js';
 
 const cfg = loadConfig();
@@ -99,41 +95,6 @@ app.post('/api/tools/test-search', h(async req => {
   const r = await runTool('web_search', { query: req.body?.query || 'searxng json api', max_results: 5 }, { root: DATA });
   return { ok: !r.isError, output: r.content };
 }));
-
-// ---------- job search ----------
-registerService({
-  id: 'jobsource', name: 'Job source', group: 'Search', settingsTab: 'jobsearch',
-  probe: async () => {
-    const s = await jobsource.jobSourceStatus();
-    const up = s.active === 'searxng' ? s.searxng : s.active === 'firecrawl' ? s.firecrawl : s.jobapi;
-    return { status: up ? 'up' : 'off', detail: up ? s.active : `${s.active} — not ready` };
-  },
-});
-// static subpaths before /:id so they aren't captured as an id.
-app.post('/api/jobs/search', h(req => jobsource.searchJobs(req.body || {})));
-app.get('/api/jobs/source', h(() => jobsource.jobSourceStatus()));
-app.get('/api/jobs/stats', h(() => jobs.stats()));
-app.get('/api/jobs', h(() => jobs.listJobs()));
-app.post('/api/jobs', h(req => jobs.addJob(req.body || {})));
-app.get('/api/jobs/:id', h(req => jobs.getJob(req.params.id)));
-app.patch('/api/jobs/:id', h(req => jobs.updateJob(req.params.id, req.body || {})));
-app.delete('/api/jobs/:id', h(req => { jobs.deleteJob(req.params.id); }));
-
-// profile + job AI (score/coverletter accept untracked feed jobs inline)
-app.get('/api/jobsearch/profile', h(() => ({ profile: profile.getProfile(), completeness: profile.completeness() })));
-app.put('/api/jobsearch/profile', h(req => { const p = profile.saveProfile(req.body || {}); return { profile: p, completeness: profile.completeness(p) }; }));
-app.post('/api/jobsearch/profile/import', h(async req => { const p = await jobai.parseResume(req.body?.text, { modelRef: req.body?.modelRef }); return { profile: p, completeness: profile.completeness(p) }; }));
-app.post('/api/jobsearch/answer', h(async req => ({ text: await jobai.answerQuestions(req.body?.questions, { modelRef: req.body?.modelRef, job: req.body?.job }) })));
-app.post('/api/jobsearch/score', h(req => jobai.scoreJob(req.body?.job || {}, { modelRef: req.body?.modelRef })));
-app.post('/api/jobsearch/coverletter', h(async req => ({ text: await jobai.coverLetter(req.body?.job || {}, { modelRef: req.body?.modelRef, lang: req.body?.lang, kind: req.body?.kind }) })));
-
-// annotation / gig platforms
-app.get('/api/platforms', h(() => platforms.listPlatforms()));
-app.post('/api/platforms', h(req => platforms.addCustomPlatform(req.body || {})));
-app.post('/api/platforms/check-all', h(req => platforms.checkAll({ modelRef: req.body?.modelRef })));
-app.post('/api/platforms/:id/check', h(req => platforms.checkPlatform(req.params.id, { modelRef: req.body?.modelRef })));
-app.patch('/api/platforms/:id', h(req => platforms.updatePlatform(req.params.id, req.body || {})));
-app.delete('/api/platforms/:id', h(req => { platforms.removeCustomPlatform(req.params.id); }));
 
 // ---------- projects ----------
 
@@ -343,6 +304,21 @@ app.post('/api/comfy/expand', h(req => comfy.expandPrompt(req.body || {})));
 app.get('/api/llm/status', h(() => ({ ...llmctl.llmStatus(), gpu: gpuStats() })));
 app.post('/api/llm/profile', h(req => llmctl.startProfile(String(req.body?.profile || ''))));
 app.post('/api/llm/launcher', h(() => llmctl.openLauncher()));
+app.get('/api/llm/models', h(() => ({ models: llmctl.listLocalModels() })));
+app.post('/api/llm/model', h(req => llmctl.startModel(String(req.body?.path || ''))));
+app.get('/api/llm/routing', h(() => router.routingInfo()));
+app.post('/api/llm/stop', h(() => llmctl.stopLlama()));
+app.get('/api/llm/log', h(req => ({ log: llmctl.llamaLog(Number(req.query?.lines) || 120) })));
+
+// ---------- LLM benchmark ----------
+
+app.get('/api/bench', h(() => ({ ...bench.leaderboard(), ...bench.benchStatus() })));
+app.get('/api/bench/runs', h(req => ({ runs: bench.recentRuns(Number(req.query?.limit) || 40) })));
+app.post('/api/bench/run', h(req => bench.startBench(req.body || {})));
+app.post('/api/bench/sweep', h(req => bench.startSweep(req.body || {})));
+app.post('/api/bench/stop', h(() => bench.stopBench()));
+app.delete('/api/bench/runs', h(() => bench.clearRuns()));
+app.post('/api/llm/autosetup', h(req => router.autoSetup(req.body || {})));
 
 // ---------- learning corner ----------
 
@@ -395,17 +371,6 @@ app.post('/api/learn/:id/feedback', h(req => learn.generateFeedback({ id: req.pa
 app.post('/api/learn/:id/advise', h(req => learn.generateAdvice({ id: req.params.id, modelRef: req.body?.modelRef })));
 app.get('/api/learn/:id/weak', h(req => learn.getWeakTopics(req.params.id, Number(req.query?.limit) || 8)));
 
-// ---------- mindmaps (headless store — the app was replaced by the Learning Corner;
-// the agent's mindmap_generate tool and vault export still use these) ----------
-
-app.get('/api/mindmaps', h(() => mindmap.listMaps()));
-app.post('/api/mindmaps', h(req => mindmap.createMap(req.body || {})));
-app.get('/api/mindmaps/:id', h(req => mindmap.getMap(req.params.id)));
-app.put('/api/mindmaps/:id', h(req => mindmap.saveMap(req.params.id, req.body || {})));
-app.delete('/api/mindmaps/:id', h(req => { mindmap.deleteMap(req.params.id); }));
-app.post('/api/mindmaps/generate', h(req => mindmap.aiGenerate(req.body || {})));
-app.post('/api/mindmaps/:id/expand', h(req => mindmap.aiExpand({ id: req.params.id, ...req.body })));
-app.post('/api/mindmaps/:id/export', h(req => mindmap.exportToVault(req.params.id, req.body || {})));
 
 // ---------- static shell ----------
 
@@ -426,6 +391,7 @@ function publish(topic, obj) {
 }
 agent.setPublisher(publish);
 chat.setPublisher(publish);
+bench.setPublisher(publish);
 vault.setPublisher(publish);
 research.setPublisher(publish);
 github.setPublisher(publish);
@@ -460,6 +426,7 @@ async function route(client, m) {
     case 'agent.user': agent.userMessage(m.sessionId, String(m.text || ''), uploads.resolveAttachments(m.attachments)); return;
     case 'agent.cancel': agent.cancel(m.sessionId); return;
     case 'agent.approve': agent.approve(m.sessionId, m.callId, m.decision === 'always' ? 'always' : m.decision === 'allow' ? 'allow' : 'deny'); return;
+    case 'agent.plan': agent.resolvePlan(m.sessionId, m.decision === 'approve' ? 'approve' : 'reject', typeof m.text === 'string' ? m.text : undefined); return;
 
     case 'chat.send': chat.sendMessage(m.chatId, String(m.text || ''), { modelRef: m.modelRef, attachments: uploads.resolveAttachments(m.attachments) }); return;
     case 'chat.stop': chat.stop(m.chatId); return;

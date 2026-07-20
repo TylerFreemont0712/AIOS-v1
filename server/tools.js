@@ -2,8 +2,9 @@
 // Tools are classified read/write; write tools go through the approval gate in agent.js.
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { safePath, truncate, isBinary, walk } from './util.js';
 import { loadConfig } from './config.js';
 import { listSkills, getSkill } from './skills.js';
@@ -279,19 +280,6 @@ export const TOOL_DEFS = [
     parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
   },
   {
-    name: 'mindmap_generate', write: true, group: 'apps',
-    description: 'Generate an AI-designed tree outline of a topic (uses the session model); when a vault is connected the outline is saved to the wiki as a nested-list note. Use to structure a topic, plan, or brainstorm.',
-    parameters: {
-      type: 'object',
-      properties: {
-        topic: { type: 'string' },
-        depth: { type: 'number', description: 'Tree depth (default 3)' },
-        breadth: { type: 'number', description: 'Children per node (default 4)' },
-      },
-      required: ['topic'],
-    },
-  },
-  {
     name: 'research_start', write: false, group: 'apps',
     description: 'Start a deep-research run (plan → web search → read sources → cited report) in the background and return its id. The report lands in the Research app and auto-exports to the wiki when done. Use for questions needing multiple sources; poll research_status while doing other work.',
     parameters: {
@@ -417,6 +405,15 @@ export const TOOL_DEFS = [
     name: 'delete_tool', write: true, group: 'system',
     description: 'Delete a custom tool you previously created (e.g. superseded or broken beyond repair).',
     parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
+  },
+
+  {
+    name: 'model_auto_setup', write: true, group: 'apps',
+    description: 'Automatically tag and configure local gguf models: an LLM reads each filename/size, proposes tags + a serving preset sized to this machine (ctx, KV quant, GPU layers, vision-projector pairing) and saves it. Pass file to configure one model; omit it to configure every model that has no preset yet. Use when the user drops in a new model or asks to "set up" their models.',
+    parameters: {
+      type: 'object',
+      properties: { file: { type: 'string', description: 'A .gguf filename from the Models app; omit for all unconfigured' } },
+    },
   },
 
   // ---- Learning Corner ----------------------------------------------------
@@ -657,7 +654,7 @@ export function isWriteTool(name) {
 /** Additive upkeep calls (wiki folder, daily note, generated maps, planner items) —
  *  pre-approved by the gate when vault.autoApprove is on. */
 export function isWikiScopedCall(name, args) {
-  if (['wiki_learn', 'wiki_index', 'wiki_generate', 'daily_log', 'mindmap_generate', 'task_add', 'event_add'].includes(name)) return true;
+  if (['wiki_learn', 'wiki_index', 'wiki_generate', 'daily_log', 'task_add', 'event_add'].includes(name)) return true;
   if (['vault_write', 'vault_append'].includes(name) && typeof args?.path === 'string') return wiki.isWikiPath(args.path);
   return false;
 }
@@ -669,8 +666,33 @@ function vaultNoteExists(rel) {
   try { return fs.existsSync(safePath(loadConfig().vault.path, rel)); } catch { return false; }
 }
 
-/** For the model: enabled defs without our internal flags. */
-export const toolSchemas = () => enabledTools().map(({ name, description, parameters }) => ({ name, description, parameters }));
+/** For the model: enabled defs without our internal flags. Pass `groups` to get only
+ *  those groups' tools — the lean loadout sends full schemas for ACTIVE groups only,
+ *  because 60+ full schemas cost ~7k tokens per call, which a 32k local model can't
+ *  afford on every turn of a long task. */
+export const toolSchemas = (groups) => enabledTools()
+  .filter(t => !groups || groups.includes(t.group))
+  .map(({ name, description, parameters }) => ({ name, description, parameters }));
+
+/** All group names that currently have enabled tools. */
+export const toolGroups = () => [...new Set(enabledTools().map(t => t.group))];
+
+/** Compact per-group directory for the lean loadout's system prompt: one line per
+ *  group, tool names with a clause of description each. ~2KB instead of ~29KB. */
+export function toolDirectory(excludeGroups = []) {
+  const short = (d) => {
+    const s = String(d || '').split(/(?<=[.!?])\s/)[0];
+    return (s.length > 70 ? s.slice(0, 67) + '…' : s).replace(/\.$/, '');
+  };
+  const byGroup = {};
+  for (const t of enabledTools()) {
+    if (excludeGroups.includes(t.group)) continue;
+    (byGroup[t.group] ||= []).push(`${t.name} (${short(t.description)})`);
+  }
+  return Object.entries(byGroup)
+    .map(([g, tools]) => `- ${g} [${tools.length}]: ${tools.join('; ')}`)
+    .join('\n');
+}
 
 /** For the settings UI: every tool with its metadata and current state. */
 export function toolCatalog() {
@@ -1044,26 +1066,6 @@ const impls = {
     return `Logged to ${rel}.`;
   },
 
-  async mindmap_generate({ topic, depth, breadth }, { modelRef, signal: _signal }) {
-    if (!modelRef) throw new Error('no model available in this session');
-    const { aiGenerate, exportToVault } = await import('./mindmap.js');
-    const m = await aiGenerate({
-      topic: String(topic || '').trim(), modelRef,
-      depth: Math.min(Math.max(Math.floor(depth) || 3, 1), 5),
-      breadth: Math.min(Math.max(Math.floor(breadth) || 4, 2), 8),
-    });
-    const count = (function cnt(n) { return n ? 1 + (n.children || []).reduce((s, c) => s + cnt(c), 0) : 0; })(m.root);
-    let vaultNote = '';
-    if (loadConfig().vault?.path) {
-      try {
-        const { path: rel } = exportToVault(m.id, { wikilinks: false });
-        vaultNote = ` Outline saved to ${rel}.`;
-        try { wiki.rebuildIndex(); } catch { }
-      } catch { }
-    }
-    return `Topic outline "${m.name}" generated (${count} nodes).${vaultNote || ' Connect a vault to have outlines saved as notes.'}`;
-  },
-
   async research_start({ question, depth }, { modelRef }) {
     if (!modelRef) throw new Error('no model available in this session');
     const { startResearch } = await import('./research.js');
@@ -1174,6 +1176,15 @@ const impls = {
   async fetch_url({ url }) {
     const { status, text } = await fetchReadable(url);
     return `[${status}] ${url}\n\n${text}`;
+  },
+
+  async model_auto_setup({ file }, { modelRef }) {
+    const { autoSetup } = await import('./router.js');
+    const r = await autoSetup({ file, modelRef });
+    if (!r.configured.length) return r.note || 'nothing to configure';
+    return r.configured.map(c => c.ok
+      ? `${c.file}: tags [${c.tags.join(', ')}] · ctx ${c.ctx}${c.mmproj ? ` · vision: ${c.mmproj}` : ''} — ${c.why}`
+      : `${c.file}: FAILED (${c.error})`).join('\n');
   },
 
   // ---- Learning Corner ----------------------------------------------------
@@ -1430,6 +1441,91 @@ export async function fetchReadable(url, cap = 2_000_000, opts = {}) {
     }
     return { status: r.status, text: body };
   } finally { clearTimeout(t); }
+}
+
+// ---------- PDF ingestion ----------
+// Digital PDFs (papers, specs, reports) carry a text layer that `pdftotext`
+// (poppler) extracts cleanly; scanned/image PDFs have none, so we fall back to
+// OCR (rasterize with pdftoppm → recognize with tesseract) when those binaries
+// are installed. Everything degrades gracefully: no toolchain → a clear throw
+// that the caller turns into a skipped source, never a crash.
+
+const _cmdCache = {};
+function hasCmd(cmd) {
+  if (_cmdCache[cmd] === undefined) {
+    try { _cmdCache[cmd] = spawnSync('which', [cmd], { stdio: 'ignore' }).status === 0; }
+    catch { _cmdCache[cmd] = false; }
+  }
+  return _cmdCache[cmd];
+}
+/** True when at least the pdftotext text-layer path is available. */
+export const canReadPdf = () => hasCmd('pdftotext');
+
+/** Spawn `cmd`, pipe `input` (Buffer|null) to stdin, resolve stdout as UTF-8.
+ *  Tolerant of non-zero exit when usable stdout was produced (pdftotext warns a lot). */
+function runPipe(cmd, args, input, { timeoutMs = 45000, maxOut = 12_000_000 } = {}) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try { child = spawn(cmd, args, { timeout: timeoutMs }); }
+    catch (e) { return reject(e); }
+    const out = []; let outLen = 0; const errc = [];
+    child.stdout.on('data', d => { outLen += d.length; if (outLen <= maxOut) out.push(d); });
+    child.stderr.on('data', d => errc.push(d));
+    child.on('error', reject);
+    child.on('close', (code) => {
+      const text = Buffer.concat(out).toString('utf8');
+      if (text.trim().length || code === 0) resolve(text);
+      else reject(new Error(`${cmd} exited ${code}: ${Buffer.concat(errc).toString('utf8').slice(0, 160)}`));
+    });
+    if (input) { child.stdin.on('error', () => { }); child.stdin.end(input); }
+    else child.stdin.end();
+  });
+}
+
+/** OCR a PDF buffer: pdftoppm → PNG pages → tesseract. Gated on both binaries. */
+async function ocrPdf(buf, opts = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aios-pdf-'));
+  try {
+    const pdfPath = path.join(dir, 'in.pdf');
+    fs.writeFileSync(pdfPath, buf);
+    const pages = Math.max(1, Math.min(opts.ocrPages || 12, 40));
+    await runPipe('pdftoppm', ['-png', '-r', '150', '-l', String(pages), pdfPath, path.join(dir, 'p')], null, { timeoutMs: 90000 });
+    const pngs = fs.readdirSync(dir).filter(f => f.endsWith('.png')).sort();
+    let out = '';
+    for (const png of pngs) {
+      try { out += (await runPipe('tesseract', [path.join(dir, png), 'stdout', '-l', opts.ocrLang || 'eng'], null, { timeoutMs: 40000 })) + '\n\n'; }
+      catch { /* skip a bad page */ }
+    }
+    return out.replace(/\n{3,}/g, '\n\n').trim();
+  } finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { } }
+}
+
+/** Fetch a PDF URL and return its extracted text as { status, text }.
+ *  Text layer via pdftotext first; OCR fallback for scanned PDFs when available. */
+export async function fetchPdfText(url, cap = 500_000, opts = {}) {
+  const u = new URL(url);
+  if (!/^https?:$/.test(u.protocol)) throw new Error('only http(s) URLs');
+  if (!hasCmd('pdftotext')) throw new Error('pdftotext not installed — install poppler-utils to read PDFs');
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), opts.timeoutMs || 30000);
+  let buf;
+  try {
+    const r = await fetch(url, { signal: ctl.signal, redirect: 'follow', headers: { 'user-agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0', ...(opts.headers || {}) } });
+    if (!r.ok) throw new Error(`status ${r.status}`);
+    buf = Buffer.from(await r.arrayBuffer());
+  } finally { clearTimeout(t); }
+  const maxBytes = opts.maxBytes || 25_000_000;
+  if (buf.length > maxBytes) buf = buf.subarray(0, maxBytes);
+  if (buf.subarray(0, 5).toString('latin1') !== '%PDF-') throw new Error('not a PDF (bad header)');
+
+  let text = '';
+  try { text = await runPipe('pdftotext', ['-q', '-layout', '-', '-'], buf); } catch { }
+  text = text.replace(/\f/g, '\n\n').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+
+  if (text.length < 200 && hasCmd('pdftoppm') && hasCmd('tesseract')) {
+    try { const ocr = await ocrPdf(buf, opts); if (ocr.length > text.length) text = ocr; } catch { }
+  }
+  return { status: 200, text: text.slice(0, cap) };
 }
 
 /** Best-effort DuckDuckGo HTML scrape — used only when SearXNG is unavailable. */

@@ -12,7 +12,6 @@
     "audit": "node scripts/audit.mjs",
     "e2e": "node scripts/e2e.mjs",
     "searxng": "node scripts/searxng.mjs",
-    "firecrawl": "node scripts/firecrawl.mjs",
     "seed-wiki": "node scripts/seed-wiki.mjs"
   },
   "dependencies": {

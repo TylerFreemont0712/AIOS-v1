@@ -113,11 +113,11 @@ export async function sendMessage(cid, text, { modelRef, attachments } = {}) {
       },
     });
     c.usage.input += res.usage.input; c.usage.output += res.usage.output;
-    const asst = { role: 'assistant', text: res.text, ts: now() };
+    const asst = { role: 'assistant', text: res.text, ts: now(), perf: res.perf };
     if (res.reasoning) asst.reasoning = res.reasoning;
     c.messages.push(asst);
     save(c);
-    emit(cid, { type: 'done', text: res.text, reasoning: res.reasoning, usage: c.usage });
+    emit(cid, { type: 'done', text: res.text, reasoning: res.reasoning, usage: c.usage, perf: res.perf });
   } catch (e) {
     if (!ctl.signal.aborted) emit(cid, { type: 'error', message: e.message });
     else emit(cid, { type: 'done', text: '', cancelled: true });

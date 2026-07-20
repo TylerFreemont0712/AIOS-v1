@@ -26,7 +26,6 @@ open it on any other computer/tablet on your network and it just works.
 | **Chat** | Streaming conversations with any configured model; markdown, code copy, per-chat system prompts, persistent history, and a collapsible **chain-of-thought** panel when the model reasons |
 | **Agent** | Claude-Code-style coding agent scoped to a project: it explores with `list_dir`/`glob`/`grep`/`read_file`, changes code with `write_file`/`edit_file`, runs `bash`, searches the web with `web_search`, reads docs with `fetch_url`, pulls best-practice **playbooks** with `skill`, and reads/maintains your **knowledge base** with `vault_*` — streaming every step as collapsible tool cards with diffs. Extra guardrails for small local models: a **self-check** loop that syntax-gates everything it writes, injected coding playbooks, and a per-project **memory** it maintains and learns from. Switching the active project re-scopes the agent to that project |
 | **Research** | Deep, cited web research: give it a question and it plans searches, reads real sources through SearXNG, loops on the gaps, and writes a report with inline `[n]` citations and a sources list. Runs entirely server-side (works with any model, no tool-calling needed); export any report into your vault |
-| **Job Search** | A personal, AI-driven job engine. **Discover**: pluggable-source search (SearXNG broad · **Firecrawl** scraping of Indeed + TokyoDev/Japan Dev with AI extraction · optional SerpApi key) with fit-scoring against your profile. **Board**: kanban pipeline (Saved → … → Accepted) with AI cover letters (EN/JP), timelines, follow-up nudges. **Platforms**: annotation/gig directory (Outlier, Alignerr, DataAnnotation, …) with membership status + cookie-based **task-availability checks**. **Profile**: your resume imported by AI into a structured memory that powers fit-scores, cover letters, and questionnaire answers |
 | **Files** | Tree explorer + CodeMirror editor (JS/TS, Python, Markdown, HTML, CSS, JSON), quick search, image preview, markdown preview, conflict detection if the agent edits a file under you |
 | **Terminal** | Real PTYs (node-pty) in xterm.js — colors, vim, resize; one shell per window |
 | **Projects** | The hub's registry: register existing folders, create new ones (README + git init), git branch/dirty badges, favorites, notes, jump straight into Agent/Files/Shell |
@@ -214,8 +213,8 @@ web/               no build step — vanilla ES modules
   vendor/          self-contained bundles (CodeMirror 6, marked+DOMPurify+hljs, xterm)
 skills/            coding playbooks (markdown) injected into the agent by stack
 Roadmap.md         idea bucket for future features
-data/              your stuff (gitignored): config, chats, agent sessions, research, mindmaps
-scripts/           build-vendor.mjs · check.mjs · searxng.mjs · firecrawl.mjs
+data/              your stuff (gitignored): config, chats, agent sessions, research, learn, bench
+scripts/           build-vendor.mjs · check.mjs · searxng.mjs
                    aios-launch.sh + aios.desktop + aios.svg (desktop shortcut)
                    aios.service (systemd unit)
 ```
