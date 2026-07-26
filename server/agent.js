@@ -13,6 +13,7 @@ import { id as genId, now, readJSON, writeJSON, estTokens, safePath, clampMiddle
 import { getProject } from './projects.js';
 import { promptContext as gitContext } from './git.js';
 import { appContext } from './context.js';
+import { profileInjection } from './profile.js';
 
 const DIR = path.join(DATA, 'agent');
 const live = new Map(); // sessionId -> { abort, approvals: Map, running }
@@ -578,7 +579,7 @@ Tool foundry: when a capability you need is missing AND would be reused (calling
 - Be concise in prose. Explain what you did and why in a short summary when you finish, referencing files as path:line.
 - Never fabricate tool results or claim success without verifying.
 - If the user asks a question rather than requesting changes, answer it — don't modify files unprompted.
-${cfg.defaults.appContext !== false ? (() => { try { const ctx = appContext({ chars: 1100, days: 2 }); return ctx ? '\n' + ctx + '\n(agenda_view has the full planner when you need more.)\n' : ''; } catch { return ''; } })() : ''}${projectContext(s)}${skillsPrompt(s.root, s.modelRef)}${lean ? `
+${(() => { try { const p = profileInjection(500); return p ? '\n' + p + '\n' : ''; } catch { return ''; } })()}${cfg.defaults.appContext !== false ? (() => { try { const ctx = appContext({ chars: 1100, days: 2 }); return ctx ? '\n' + ctx + '\n(agenda_view has the full planner when you need more.)\n' : ''; } catch { return ''; } })() : ''}${projectContext(s)}${skillsPrompt(s.root, s.modelRef)}${lean ? `
 
 Tool loadout (context-lean mode — only ${activeGroups.join(', ')} are fully loaded):
 More tool groups exist. The moment a task needs one, call load_tools {"groups":["<name>"]} — its tools become callable on your NEXT turn. Directory:

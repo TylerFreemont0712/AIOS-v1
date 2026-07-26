@@ -1,0 +1,28 @@
+
+export { marked } from 'marked';
+export { default as DOMPurify } from 'dompurify';
+import hljs from 'highlight.js/lib/core';
+import javascript from 'highlight.js/lib/languages/javascript';
+import typescript from 'highlight.js/lib/languages/typescript';
+import python from 'highlight.js/lib/languages/python';
+import bash from 'highlight.js/lib/languages/bash';
+import json from 'highlight.js/lib/languages/json';
+import xml from 'highlight.js/lib/languages/xml';
+import css from 'highlight.js/lib/languages/css';
+import markdown from 'highlight.js/lib/languages/markdown';
+import rust from 'highlight.js/lib/languages/rust';
+import go from 'highlight.js/lib/languages/go';
+import c from 'highlight.js/lib/languages/c';
+import cpp from 'highlight.js/lib/languages/cpp';
+import java from 'highlight.js/lib/languages/java';
+import sql from 'highlight.js/lib/languages/sql';
+import yaml from 'highlight.js/lib/languages/yaml';
+import diff from 'highlight.js/lib/languages/diff';
+for (const [n, l] of Object.entries({ javascript, typescript, python, bash, json, xml, css, markdown, rust, go, c, cpp, java, sql, yaml, diff })) hljs.registerLanguage(n, l);
+hljs.registerAliases(['js','jsx','mjs','cjs'], { languageName: 'javascript' });
+hljs.registerAliases(['ts','tsx'], { languageName: 'typescript' });
+hljs.registerAliases(['sh','shell','zsh'], { languageName: 'bash' });
+hljs.registerAliases(['html'], { languageName: 'xml' });
+hljs.registerAliases(['yml'], { languageName: 'yaml' });
+hljs.registerAliases(['py'], { languageName: 'python' });
+export { hljs };

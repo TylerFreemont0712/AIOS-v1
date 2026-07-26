@@ -202,6 +202,11 @@ export function presetFor(file, sizeGB) {
     batch: Number(saved.batch) || 2048, ubatch: Number(saved.ubatch) || 512,
     flashAttn: saved.flashAttn !== false,
     mmproj: saved.mmproj || '',                     // mmproj file name, '' = text-only
+    // Gemma 4 and other recent releases ship chat templates that llama.cpp's
+    // built-in matcher rejects outright ("this custom template is not supported,
+    // try using --jinja"); without this the server silently falls back to a
+    // generic format and the model answers in the wrong turn syntax.
+    jinja: saved.jinja !== false,
     extra: String(saved.extra || ''),               // raw escape hatch for anything else
     tags: Array.isArray(saved.tags) ? saved.tags : [],
     configured: !!cfg.presets?.[file],              // false = running on size defaults
@@ -226,6 +231,7 @@ export function modelArgsFor(file, sizeGB) {
   // rather than shipping args that fail to boot (the launcher had this same guard)
   if (p.flashAttn && p.kvK !== 'f16') args.push('--cache-type-k', p.kvK);
   if (p.flashAttn && p.kvV !== 'f16') args.push('--cache-type-v', p.kvV);
+  if (p.jinja) args.push('--jinja');
   if (p.mmproj) {
     const mm = listMmproj().find(m => m.file === p.mmproj);
     if (mm) args.push('--mmproj', mm.path);

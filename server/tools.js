@@ -6,13 +6,21 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { safePath, truncate, isBinary, walk } from './util.js';
-import { loadConfig } from './config.js';
+import { loadConfig, DATA } from './config.js';
 import { listSkills, getSkill } from './skills.js';
 import { search as vaultSearch, index as vaultIndex, readNote as vaultReadNote, writeNote as vaultWriteNote, dailyCapture, generateWiki } from './vault.js';
 import * as wiki from './wiki.js';
 import * as forge from './toolforge.js';
 import * as planner from './planner.js';
 import * as git from './git.js';
+import * as geo from './geo.js';
+import * as everyday from './everyday.js';
+import * as finance from './finance.js';
+import * as notify from './notify.js';
+import * as bench from './bench.js';
+import { gpuStats } from './gpu.js';
+import { llmStatus as llmctlStatus } from './llmctl.js';
+import { probeServices } from './services.js';
 import { fetchRecent as mailRecent, searchMail, readMessage as mailRead } from './mail.js';
 
 export const TOOL_DEFS = [
@@ -98,8 +106,15 @@ export const TOOL_DEFS = [
   },
   {
     name: 'move_path', write: true, group: 'files',
-    description: 'Move or rename a file or directory within the project.',
-    parameters: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' } }, required: ['from', 'to'] },
+    description: 'Move or rename a file or directory within the project. Refuses to replace an existing destination unless overwrite is true.',
+    parameters: {
+      type: 'object',
+      properties: {
+        from: { type: 'string' }, to: { type: 'string' },
+        overwrite: { type: 'boolean', description: 'Replace the destination if it already exists (destroys it)' },
+      },
+      required: ['from', 'to'],
+    },
   },
   {
     name: 'delete_path', write: true, group: 'files',
@@ -200,8 +215,121 @@ export const TOOL_DEFS = [
   },
   {
     name: 'fetch_url', write: false, group: 'web',
-    description: 'Fetch a URL and return its text content (HTML is stripped to readable text). Use to read documentation or a web_search result in full.',
-    parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] },
+    description: 'Fetch a URL and return its text content (HTML is stripped to readable text). Use to read documentation or a web_search result in full. Long pages are returned one window at a time — the reply says how to get the next one.',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string' },
+        max_chars: { type: 'number', description: 'Characters to return per call (default 20000, max 100000)' },
+        offset: { type: 'number', description: 'Character offset to resume from — use the value the previous call reported' },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'crawl_site', write: false, group: 'web',
+    description: 'Crawl a website: start at a URL and follow its links (same site) to read SEVERAL pages, returning their readable text. Unlike fetch_url (one page), this surveys a whole section of a site. Give a `query` to keep only the pages relevant to it. Use for docs spread across pages, product/company sites, or "read this site and tell me X".',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Start URL' },
+        query: { type: 'string', description: 'Optional — rank/keep only pages matching these keywords' },
+        max_pages: { type: 'number', description: 'Pages to fetch (default 6, max 20)' },
+        depth: { type: 'number', description: 'How many link-hops from the start page (default 2, max 3)' },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'wikipedia', write: false, group: 'web',
+    description: 'Look something up on Wikipedia and get a concise summary with the article link. Fast and reliable for people, places, history, science, definitions — anything encyclopedic. Prefer this over a general web_search for well-known topics.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Topic or title, e.g. "Suma-ku, Kobe" or "photosynthesis"' },
+        lang: { type: 'string', description: 'Wikipedia language code (default "en"; "ja" for Japanese)' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'directions', write: false, group: 'maps',
+    description: 'Travel time and distance between two places. Origin defaults to the user\'s home when omitted (or say "home"). Modes: driving (default), walking, cycling, transit. Driving/walking/cycling are free; transit (train/bus) needs a Google key in Settings → Tools → Maps. For exact train schedules, also try web_search.',
+    parameters: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'Destination: a place/address ("Suma Station, Kobe") or "lat,lon"' },
+        from: { type: 'string', description: 'Origin; omit or "home" for the user\'s home location' },
+        mode: { type: 'string', enum: ['driving', 'walking', 'cycling', 'transit'], description: 'Default driving' },
+      },
+      required: ['to'],
+    },
+  },
+  {
+    name: 'find_places', write: false, group: 'maps',
+    description: 'Find real places near a location using OpenStreetMap — stations, shops, restaurants, pharmacies, landmarks, addresses. Returns names, addresses and distance from the reference point (the user\'s home by default). Use for everyday local questions like "nearest convenience store" or "where is X".',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'What to look for, e.g. "pharmacy", "Takatsuki station", "ramen"' },
+        near: { type: 'string', description: 'Reference place; omit or "home" for the user\'s home' },
+        limit: { type: 'number', description: 'Max results (default 6, max 15)' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'weather', write: false, group: 'maps',
+    description: 'Current conditions and a multi-day forecast for any place (defaults to the user\'s home). Free, no key (Open-Meteo). Use for "what\'s the weather", "will it rain", trip planning.',
+    parameters: {
+      type: 'object',
+      properties: {
+        place: { type: 'string', description: 'Place name or "lat,lon"; omit or "home" for the user\'s home' },
+        days: { type: 'number', description: 'Forecast days (default 3, max 10)' },
+      },
+    },
+  },
+  {
+    name: 'translate', write: false, group: 'utility',
+    description: 'Translate text between languages (auto-detects the source). Handy for daily life in Japan — read a sign, a menu, an email, or draft a reply in Japanese. Default target is English.',
+    parameters: {
+      type: 'object',
+      properties: {
+        text: { type: 'string' },
+        to: { type: 'string', description: 'Target language code, e.g. "en", "ja", "es" (default "en")' },
+        from: { type: 'string', description: 'Source language code; omit to auto-detect' },
+      },
+      required: ['text'],
+    },
+  },
+  {
+    name: 'calculate', write: false, group: 'utility',
+    description: 'Evaluate a math expression exactly (no guessing arithmetic). Supports + - * / %, ^ power, parentheses, and functions like sqrt, log, ln, sin/cos/tan, round, min, max, fact. Constants pi, e, tau.',
+    parameters: { type: 'object', properties: { expression: { type: 'string', description: 'e.g. "(1200*1.1)/3" or "sqrt(2)*pi"' } }, required: ['expression'] },
+  },
+  {
+    name: 'convert', write: false, group: 'utility',
+    description: 'Convert a value between units — length, mass, volume, speed, data, time, temperature — or between currencies (live rates, ISO codes like USD/JPY). e.g. 10 km→mi, 100 usd→jpy, 25 c→f.',
+    parameters: {
+      type: 'object',
+      properties: {
+        value: { type: 'number' },
+        from: { type: 'string', description: 'Unit or 3-letter currency code, e.g. "km", "kg", "usd"' },
+        to: { type: 'string', description: 'Unit or currency to convert to, e.g. "mi", "lb", "jpy"' },
+      },
+      required: ['value', 'from', 'to'],
+    },
+  },
+  {
+    name: 'datetime', write: false, group: 'utility',
+    description: 'Get the current date/time (optionally in a timezone) and compute time until/since a date. Use for "what time is it in Tokyo/New York", "how many days until X". Local and exact — do not do this math in your head.',
+    parameters: {
+      type: 'object',
+      properties: {
+        tz: { type: 'string', description: 'IANA timezone, e.g. "Asia/Tokyo", "America/New_York" (default: server local)' },
+        until: { type: 'string', description: 'A date (YYYY-MM-DD or ISO) to count down/up to' },
+      },
+    },
   },
   {
     name: 'vault_search', write: false, group: 'vault',
@@ -280,6 +408,19 @@ export const TOOL_DEFS = [
     parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
   },
   {
+    name: 'quick_note', write: true, group: 'vault',
+    description: 'Quickly save a note to the user\'s knowledge base (their Obsidian vault). Files it under "Notes/" by default. Additive and safe: if a note with the same title exists, your text is appended, never overwritten. Use whenever the user says "note this", "save this", "remember that", or wants to jot something down.',
+    parameters: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Short note title (becomes the filename)' },
+        content: { type: 'string', description: 'Markdown body of the note' },
+        folder: { type: 'string', description: 'Vault subfolder (default "Notes")' },
+      },
+      required: ['title', 'content'],
+    },
+  },
+  {
     name: 'research_start', write: false, group: 'apps',
     description: 'Start a deep-research run (plan → web search → read sources → cited report) in the background and return its id. The report lands in the Research app and auto-exports to the wiki when done. Use for questions needing multiple sources; poll research_status while doing other work.',
     parameters: {
@@ -300,6 +441,123 @@ export const TOOL_DEFS = [
     name: 'agenda_view', write: false, group: 'apps',
     description: 'Read the user\'s schedule for a day from the Planner app: calendar events, tasks due, and overdue tasks. Check it when work involves dates, deadlines, or planning.',
     parameters: { type: 'object', properties: { date: { type: 'string', description: 'YYYY-MM-DD (default: today)' } } },
+  },
+  {
+    name: 'finance_summary', write: false, group: 'apps',
+    description: 'Totals from the user\'s Finances ledger for a period: earned, spent, net, savings rate, and the biggest spending categories. Use whenever money, affordability, budgets or "can I" questions come up — do not guess at their finances.',
+    parameters: {
+      type: 'object',
+      properties: {
+        month: { type: 'string', description: 'YYYY-MM. Omit to use `range` instead.' },
+        range: { type: 'string', enum: ['this-month', 'last-month', 'this-year', '30d', '90d', 'all'], description: 'Relative period (default this-month)' },
+      },
+    },
+  },
+  {
+    name: 'finance_search', write: false, group: 'apps',
+    description: 'List individual transactions from the Finances ledger, filtered by period, kind, category or free text. Use to answer "what did I spend at X", "show my subscriptions", or to check something before logging a duplicate.',
+    parameters: {
+      type: 'object',
+      properties: {
+        search: { type: 'string', description: 'Matches merchant, note or category' },
+        kind: { type: 'string', enum: ['income', 'expense'] },
+        category: { type: 'string' },
+        month: { type: 'string', description: 'YYYY-MM' },
+        range: { type: 'string', enum: ['this-month', 'last-month', 'this-year', '30d', '90d', 'all'] },
+        limit: { type: 'number', description: 'Max rows (default 25, max 100)' },
+      },
+    },
+  },
+  {
+    name: 'finance_insights', write: false, group: 'apps',
+    description: 'Analysis of a month\'s spending: change vs the previous month, the categories that moved most, unusually large purchases, budgets under pressure, and goal progress. Use for "why was this month expensive", "how am I doing", or before giving any budgeting advice.',
+    parameters: {
+      type: 'object',
+      properties: { month: { type: 'string', description: 'YYYY-MM (default: this month)' } },
+    },
+  },
+  {
+    name: 'finance_log', write: true, group: 'apps',
+    description: 'Record one transaction in the user\'s Finances ledger. Use when they say they spent or earned something ("log 1200 yen for lunch", "I got paid 50000"). Amounts are positive; `kind` carries the direction. Check finance_search first if a duplicate looks likely.',
+    parameters: {
+      type: 'object',
+      properties: {
+        amount: { type: 'number', description: 'Positive amount, in `currency`' },
+        kind: { type: 'string', enum: ['income', 'expense'], description: 'Default expense' },
+        category: { type: 'string', description: 'Must be one of the app\'s categories — call finance_summary first if unsure' },
+        merchant: { type: 'string', description: 'Shop, employer or payer' },
+        note: { type: 'string' },
+        date: { type: 'string', description: 'YYYY-MM-DD (default: today)' },
+        currency: { type: 'string', description: 'ISO code (default: the user\'s base currency)' },
+      },
+      required: ['amount'],
+    },
+  },
+  {
+    name: 'task_list', write: false, group: 'apps',
+    description: 'List to-dos from the user\'s Planner, newest first, with their ids. Call this before task_done (you need the id), and to check whether something is already tracked instead of adding a duplicate.',
+    parameters: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', enum: ['open', 'done', 'all'], description: 'Default open' },
+        limit: { type: 'number', description: 'Default 25, max 100' },
+      },
+    },
+  },
+  {
+    name: 'task_done', write: true, group: 'apps',
+    description: 'Tick off a Planner to-do (or re-open it). Use when the user says something is finished, or when you have just completed work that a task was tracking. Get the id from task_list.',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Task id from task_list' },
+        done: { type: 'boolean', description: 'Default true; pass false to re-open' },
+      },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'notify', write: true, group: 'apps',
+    description: 'Send the user a push notification (Discord webhook) they will see away from this screen. Use ONLY for something they genuinely need to know now — a long job finished, a build broke, a decision is blocking you. Never for progress chatter; they are already reading the transcript.',
+    parameters: {
+      type: 'object',
+      properties: { message: { type: 'string', description: 'One or two sentences, plain text' } },
+      required: ['message'],
+    },
+  },
+  {
+    name: 'system_status', write: false, group: 'system',
+    description: 'This machine\'s live state: GPU model and free VRAM, which local model llama.cpp is currently serving, and the health of every AIOS service (ComfyUI, SearXNG, mail, …). Check the free VRAM before starting anything GPU-heavy like comfy_generate, and check here first when a local model call fails.',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'bench_best', write: false, group: 'system',
+    description: 'The measured leaderboard of the user\'s LOCAL models, from the Bench app: which model actually scores best per task category (coding, reasoning, extraction, …) with its speed. Use when choosing a local model, or when the user asks which of their models to use for something — this is real measured data, so prefer it over guessing from model names.',
+    parameters: {
+      type: 'object',
+      properties: { category: { type: 'string', description: 'Filter to one task category; omit for the whole board' } },
+    },
+  },
+  {
+    name: 'sql_query', write: false, group: 'system',
+    description: 'Run a read-only SELECT against one of AIOS\'s own SQLite databases: "finance" (transactions, budgets, goals, presets, recurring, receipts), "learn" (subjects, lessons, assessments, mastery) or "bench" (model benchmark runs). Use for questions the purpose-built tools cannot express — cross-table joins, custom groupings, arbitrary date maths. Call with no `sql` to get the schema.',
+    parameters: {
+      type: 'object',
+      properties: {
+        db: { type: 'string', enum: ['finance', 'learn', 'bench'] },
+        sql: { type: 'string', description: 'A single SELECT (or WITH … SELECT). Omit to print the schema instead.' },
+        limit: { type: 'number', description: 'Max rows returned (default 50, max 500)' },
+      },
+      required: ['db'],
+    },
+  },
+  {
+    name: 'github_work', write: false, group: 'git',
+    description: 'The user\'s open GitHub pull requests and issues across their repos (from the configured token). Use when work relates to a PR or issue, or to see what is outstanding before starting something new.',
+    parameters: {
+      type: 'object',
+      properties: { kind: { type: 'string', enum: ['prs', 'issues', 'both'], description: 'Default both' } },
+    },
   },
   {
     name: 'task_add', write: true, group: 'apps',
@@ -654,7 +912,7 @@ export function isWriteTool(name) {
 /** Additive upkeep calls (wiki folder, daily note, generated maps, planner items) —
  *  pre-approved by the gate when vault.autoApprove is on. */
 export function isWikiScopedCall(name, args) {
-  if (['wiki_learn', 'wiki_index', 'wiki_generate', 'daily_log', 'task_add', 'event_add'].includes(name)) return true;
+  if (['wiki_learn', 'wiki_index', 'wiki_generate', 'daily_log', 'task_add', 'event_add', 'finance_log'].includes(name)) return true;
   if (['vault_write', 'vault_append'].includes(name) && typeof args?.path === 'string') return wiki.isWikiPath(args.path);
   return false;
 }
@@ -676,6 +934,35 @@ export const toolSchemas = (groups) => enabledTools()
 
 /** All group names that currently have enabled tools. */
 export const toolGroups = () => [...new Set(enabledTools().map(t => t.group))];
+
+// Plain Chat has no project root and no approval gate, so it only gets READ-ONLY,
+// root-independent info tools — the ones that make an answer more current or grounded
+// (web search/read, the vault, mail, the planner, the learning corner). Files/git/system
+// and every write tool are deliberately excluded; use the Agent for those.
+const CHAT_TOOL_ALLOW = new Set([
+  'web_search', 'fetch_url', 'crawl_site', 'wikipedia',
+  'directions', 'find_places', 'weather',
+  'translate', 'calculate', 'convert', 'datetime',
+  'vault_search', 'vault_list', 'vault_read', 'wiki_recall', 'note_template',
+  'mail_recent', 'mail_search', 'mail_read',
+  'agenda_view',
+  'finance_summary', 'finance_search', 'finance_insights',
+  'learn_subjects', 'learn_subject', 'learn_lesson_read', 'learn_weak_topics',
+  // additive writes Chat is allowed to make (see CHAT_SAFE_WRITES) — jotting notes,
+  // logging the day, adding planner items on request
+  'quick_note', 'vault_append', 'daily_log', 'task_add', 'event_add', 'finance_log',
+]);
+// Chat has no approval gate, so writes are normally Agent-only. These few are the
+// exception: additive and non-destructive (create-or-append a note, log the day, add
+// a task/event), so an errant call can't clobber anything. Everything else that
+// writes stays out of Chat.
+const CHAT_SAFE_WRITES = new Set(['quick_note', 'vault_append', 'daily_log', 'task_add', 'event_add', 'finance_log']);
+export const isChatSafeWrite = (name) => CHAT_SAFE_WRITES.has(name);
+
+/** Enabled chat tools: read-only plus the additive-safe writes above (respects config
+ *  disable + vault/mail availability). */
+export const chatTools = () => enabledTools().filter(t => CHAT_TOOL_ALLOW.has(t.name) && (!isWriteTool(t.name) || CHAT_SAFE_WRITES.has(t.name)));
+export const chatToolSchemas = () => chatTools().map(({ name, description, parameters }) => ({ name, description, parameters }));
 
 /** Compact per-group directory for the lean loadout's system prompt: one line per
  *  group, tool names with a clause of description each. ~2KB instead of ~29KB. */
@@ -803,9 +1090,14 @@ const impls = {
     const lines = buf.toString('utf8').split('\n');
     const start = Math.max(1, offset) - 1;
     const slice = lines.slice(start, start + Math.min(limit, 4000));
+    if (!buf.length) return '(empty file)';
+    if (!slice.length) return `(no lines at offset ${offset} — the file has ${lines.length} lines)`;
     const numbered = slice.map((l, i) => `${String(start + i + 1).padStart(5)}→${l.length > 500 ? l.slice(0, 500) + '…' : l}`).join('\n');
-    const tail = lines.length > start + slice.length ? `\n… (${lines.length} lines total)` : '';
-    return numbered + tail || '(empty file)';
+    const shownTo = start + slice.length;
+    const tail = lines.length > shownTo
+      ? `\n… showing lines ${start + 1}-${shownTo} of ${lines.length}. Continue with offset:${shownTo + 1}.`
+      : '';
+    return numbered + tail;
   },
 
   async write_file({ path: p, content }, { root }) {
@@ -830,15 +1122,20 @@ const impls = {
 
   async list_dir({ path: p = '' }, { root }) {
     const abs = safePath(root, p);
-    const entries = fs.readdirSync(abs, { withFileTypes: true })
-      .sort((a, b) => (b.isDirectory() - a.isDirectory()) || a.name.localeCompare(b.name))
-      .slice(0, 500);
-    return entries.map(e => {
+    const CAP = 500;
+    const all = fs.readdirSync(abs, { withFileTypes: true })
+      .sort((a, b) => (b.isDirectory() - a.isDirectory()) || a.name.localeCompare(b.name));
+    if (!all.length) return '(empty directory)';
+    const body = all.slice(0, CAP).map(e => {
       if (e.isDirectory()) return `${e.name}/`;
       let size = '';
       try { size = `  (${fs.statSync(path.join(abs, e.name)).size} B)`; } catch { }
       return `${e.name}${size}`;
-    }).join('\n') || '(empty directory)';
+    }).join('\n');
+    // A silent cap reads as "this is the whole directory" — say so when it isn't.
+    return all.length > CAP
+      ? `${body}\n… TRUNCATED — showing ${CAP} of ${all.length} entries. Use \`glob\` with a pattern to target what you need.`
+      : body;
   },
 
   async glob({ pattern, path: p = '' }, { root }) {
@@ -858,31 +1155,63 @@ const impls = {
 
   async grep({ pattern, path: p = '', include, ignore_case, max_results = 200 }, { root, signal }) {
     const base = safePath(root, p);
+    const cap = Math.min(Math.max(Math.floor(max_results) || 200, 1), 2000);
     const args = ['-rnE', '--binary-files=without-match', '--exclude-dir=node_modules', '--exclude-dir=.git', '--exclude-dir=dist', '--exclude-dir=.venv'];
     if (ignore_case) args.push('-i');
     if (include) args.push(`--include=${include}`);
     args.push('-e', pattern, '.');
     return await new Promise((resolve) => {
       const child = spawn('grep', args, { cwd: base });
-      let out = '';
-      const timer = setTimeout(() => child.kill('SIGKILL'), 15000);
+      let out = '', errOut = '', capped = false, timedOut = false;
+      const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, 15000);
       signal?.addEventListener('abort', () => child.kill('SIGKILL'), { once: true });
-      child.stdout.on('data', d => { out += d; if (out.split('\n').length > max_results + 10) child.kill('SIGKILL'); });
-      child.stderr.on('data', () => { });
-      child.on('error', e => { clearTimeout(timer); resolve(`grep error: ${e.message}`); });
+      child.stdout.on('data', d => {
+        out += d;
+        // Stop reading once we have more than we will show — but remember that we
+        // did, so the caller is told the result set is incomplete.
+        if (!capped && out.split('\n').length > cap + 1) { capped = true; child.kill('SIGKILL'); }
+      });
+      child.stderr.on('data', d => { if (errOut.length < 2000) errOut += d; });
+      child.on('error', e => { clearTimeout(timer); resolve(`grep could not run: ${e.message}`); });
       child.on('close', () => {
         clearTimeout(timer);
-        const lines = out.split('\n').filter(Boolean).slice(0, max_results);
-        resolve(lines.map(l => l.replace(/^\.\//, p ? p + '/' : '')).join('\n') || '(no matches)');
+        const lines = out.split('\n').filter(Boolean);
+        // grep exits non-zero and writes to stderr for a bad regex or an unreadable
+        // path. Answering "(no matches)" there is actively misleading: the model
+        // concludes the codebase does not contain the string and moves on.
+        if (!lines.length && errOut.trim()) {
+          const first = errOut.trim().split('\n')[0].replace(/^grep:\s*/, '');
+          return resolve(`grep rejected this search: ${first}\n`
+            + 'Note: the pattern is POSIX extended regex (grep -E), so \\d is not supported — use [0-9]. '
+            + 'Escape literal braces, brackets and parentheses.');
+        }
+        if (!lines.length && timedOut) {
+          return resolve('grep timed out after 15s before finding anything. Narrow the search with `path` or `include`.');
+        }
+        if (!lines.length) return resolve(`(no matches for ${JSON.stringify(pattern)})`);
+        const shown = lines.slice(0, cap).map(l => l.replace(/^\.\//, p ? p + '/' : ''));
+        const incomplete = capped || lines.length > cap;
+        return resolve(shown.join('\n') + (incomplete
+          ? `\n… TRUNCATED at ${cap} matches — more exist. Narrow with \`include\`/\`path\`, or raise \`max_results\`.`
+          : ''));
       });
     });
   },
 
-  async move_path({ from, to }, { root }) {
+  async move_path({ from, to, overwrite }, { root }) {
     const a = safePath(root, from), b = safePath(root, to);
+    if (a === path.resolve(root)) throw new Error('refusing to move the project root');
+    if (!fs.existsSync(a)) throw new Error(`source does not exist: ${from}`);
+    // fs.renameSync clobbers the destination without a word. That silently destroyed
+    // whatever was at `to`, so make overwriting explicit.
+    if (fs.existsSync(b) && !overwrite) {
+      const what = fs.statSync(b).isDirectory() ? 'directory' : 'file';
+      throw new Error(`${to} already exists (a ${what}). Pick another name, or pass overwrite:true to replace it.`);
+    }
     fs.mkdirSync(path.dirname(b), { recursive: true });
+    const replaced = fs.existsSync(b);
     fs.renameSync(a, b);
-    return `Moved ${from} → ${to}`;
+    return `Moved ${from} → ${to}${replaced ? ' (replaced the existing file)' : ''}`;
   },
 
   async delete_path({ path: p, recursive }, { root }) {
@@ -1066,6 +1395,25 @@ const impls = {
     return `Logged to ${rel}.`;
   },
 
+  async quick_note({ title, content, folder }) {
+    requireVault();
+    const t = String(title || '').trim();
+    if (!t) throw new Error('title is empty');
+    const safeTitle = t.replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, ' ').trim().slice(0, 120);
+    const fold = String(folder || 'Notes').replace(/^\/+|\/+$/g, '') || 'Notes';
+    const rel = `${fold}/${safeTitle}.md`;
+    if (vaultNoteExists(rel)) {
+      // additive: never clobber an existing note — append a timestamped section
+      let prev = ''; try { prev = vaultReadNote(rel).content; } catch { }
+      const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+      vaultWriteNote(rel, prev.replace(/\s*$/, '') + `\n\n---\n*added ${stamp}*\n\n` + (content || ''));
+      return `Appended to existing note ${rel} (nothing overwritten).`;
+    }
+    const stamp = new Date().toISOString().slice(0, 10);
+    vaultWriteNote(rel, `---\ntitle: ${t}\ncreated: ${stamp}\ntags: [note]\n---\n\n# ${t}\n\n${content || ''}`);
+    return `Saved note ${rel}.`;
+  },
+
   async research_start({ question, depth }, { modelRef }) {
     if (!modelRef) throw new Error('no model available in this session');
     const { startResearch } = await import('./research.js');
@@ -1088,6 +1436,217 @@ const impls = {
     const due = a.tasks.map(t => `- [ ] ${t.title}${t.priority ? ` (P${t.priority})` : ''}`);
     const over = a.overdue.map(t => `- [!] ${t.title} (due ${t.due})`);
     return `Agenda for ${a.date}:\nEvents:\n${ev.join('\n') || '- none'}\nTasks due:\n${due.join('\n') || '- none'}${over.length ? `\nOverdue:\n${over.join('\n')}` : ''}`;
+  },
+
+  async finance_summary({ month, range }) {
+    const s = finance.summary({ month, range });
+    const cats = finance.byCategory({ month, range, kind: 'expense' }).items.slice(0, 6);
+    const m = (n) => `${s.currency} ${Number(n).toLocaleString('en-US')}`;
+    const lines = [
+      `Finances ${s.range.start} → ${s.range.end} (${s.count} transactions)`,
+      `  earned ${m(s.earned)} · spent ${m(s.spent)} · net ${m(s.net)}`,
+      s.savingsRate === null ? '  savings rate: n/a (no income this period)' : `  savings rate ${s.savingsRate}% · avg spend ${m(s.avgSpendPerDay)}/day`,
+      cats.length ? 'Top expense categories:' : 'No expenses recorded in this period.',
+      ...cats.map(c => `  ${c.category}: ${m(c.total)} (${c.pct}%, ${c.count}x)`),
+    ];
+    return lines.join('\n');
+  },
+
+  async finance_search({ search, kind, category, month, range, limit }) {
+    const n = Math.min(Math.max(Number(limit) || 25, 1), 100);
+    const r = finance.listTxns({ search, kind, category, month, range: range || (month ? undefined : 'all'), limit: n });
+    if (!r.items.length) return `No transactions match (${r.range.start} → ${r.range.end}).`;
+    const rows = r.items.map(t => {
+      const sign = t.kind === 'income' ? '+' : '-';
+      const who = t.merchant || t.category;
+      const extra = t.currency !== undefined && t.amount !== t.amountBase ? ` [${t.amount} ${t.currency}]` : '';
+      return `  ${t.date}  ${sign}${Number(t.amountBase).toLocaleString('en-US')}  ${who} · ${t.category}${t.note ? ` — ${t.note}` : ''}${extra}`;
+    });
+    const more = r.total > r.items.length ? `\n  … ${r.total - r.items.length} more (raise limit or narrow the filters)` : '';
+    return `${r.total} transaction(s), ${r.range.start} → ${r.range.end}, amounts in the base currency:\n${rows.join('\n')}${more}`;
+  },
+
+  async finance_insights({ month }) {
+    const i = finance.insights(month ? { month } : {});
+    const m = (n) => `${i.currency} ${Number(n).toLocaleString('en-US')}`;
+    const signed = (n) => (n > 0 ? `+${m(n)}` : m(n));
+    const out = [
+      `Finances ${i.range.start} → ${i.range.end}`,
+      `  earned ${m(i.totals.earned)} · spent ${m(i.totals.spent)} · net ${m(i.totals.net)}` +
+      (i.totals.savingsRate === null ? '' : ` · saved ${i.totals.savingsRate}%`),
+      `  vs ${i.previousMonth.month}: spending ${signed(i.changeVsPrev.spent)}, income ${signed(i.changeVsPrev.earned)}`,
+    ];
+    if (i.biggestMovers.length) {
+      out.push('Biggest category changes:');
+      out.push(...i.biggestMovers.map(x => `  ${x.category}: ${m(x.now)} (was ${m(x.was)}, ${signed(x.delta)})`));
+    }
+    if (i.unusuallyLarge.length) {
+      out.push('Unusually large for their category:');
+      out.push(...i.unusuallyLarge.map(x => `  ${x.date} ${x.merchant} ${m(x.amount)} (${x.category})`));
+    }
+    if (i.budgetPressure.length) {
+      out.push('Budgets at or near the limit:');
+      out.push(...i.budgetPressure.map(b => `  ${b.category}: ${m(b.spent)} of ${m(b.budget)} (${b.pct}%)${b.over ? ' — OVER' : ''}`));
+    }
+    if (i.goal && (i.goal.minGoal || i.goal.majorGoal)) {
+      out.push(`Side-income goal: ${m(i.goal.progress)} so far` +
+        (i.goal.minPct !== null ? ` · minimum ${i.goal.minPct}%` : '') +
+        (i.goal.majorPct !== null ? ` · stretch ${i.goal.majorPct}%` : ''));
+    }
+    if (out.length === 3) out.push('Nothing unusual stands out this period.');
+    return out.join('\n');
+  },
+
+  async finance_log({ amount, kind, category, merchant, note, date, currency }) {
+    const t = finance.addTxn({ amount, kind: kind || 'expense', category, merchant, note, date, currency, source: 'ai' });
+    const conv = t.currency !== finance.settings().baseCurrency
+      ? ` (= ${Number(t.amountBase).toLocaleString('en-US')} ${finance.settings().baseCurrency} at ${t.fxRate})` : '';
+    return `Logged ${t.kind}: ${Number(t.amount).toLocaleString('en-US')} ${t.currency}${conv} · ${t.category}` +
+      `${t.merchant ? ` · ${t.merchant}` : ''} on ${t.date}. Visible in the Finances app (id ${t.id}).`;
+  },
+
+  async task_list({ status = 'open', limit = 25 }) {
+    const n = Math.min(Math.max(Math.floor(limit) || 25, 1), 100);
+    const all = planner.listTasks();
+    const want = ['open', 'done', 'all'].includes(status) ? status : 'open';
+    const rows = all.filter(t => want === 'all' || (want === 'done' ? t.done : !t.done));
+    if (!rows.length) return want === 'open' ? 'No open tasks.' : `No ${want} tasks.`;
+    const shown = rows.slice(0, n).map(t =>
+      `  [${t.done ? 'x' : ' '}] ${t.id}  ${t.title}`
+      + (t.due ? ` (due ${t.due})` : '') + (t.priority ? ` P${t.priority}` : '')
+      + (t.category ? ` #${t.category}` : ''));
+    const more = rows.length > n ? `\n  … ${rows.length - n} more (raise limit)` : '';
+    return `${rows.length} ${want} task(s):\n${shown.join('\n')}${more}`;
+  },
+
+  async task_done({ id, done = true }) {
+    const t = planner.updateTask(String(id || ''), { done: !!done });
+    return `${t.done ? 'Completed' : 'Re-opened'}: "${t.title}"${t.done && t.doneAt ? ` (${t.doneAt.slice(0, 10)})` : ''}`;
+  },
+
+  async notify({ message }) {
+    const text = String(message || '').trim();
+    if (!text) throw new Error('message is empty');
+    const st = notify.notifyStatus();
+    if (!st.discord) throw new Error('no notification channel configured — add a Discord webhook in Settings → Notifications');
+    await notify.sendDiscord(text.slice(0, 1800));
+    return `Notification sent: "${text.slice(0, 120)}${text.length > 120 ? '…' : ''}"`;
+  },
+
+  async system_status() {
+    const [gpu, llm, svcs] = await Promise.all([
+      Promise.resolve(gpuStats()),
+      Promise.resolve(llmctlStatus()),
+      probeServices().catch(e => [{ name: 'services', status: 'down', detail: e.message }]),
+    ]);
+    const lines = [];
+    lines.push(gpu
+      ? `GPU: ${gpu.name} — ${gpu.freeMB} MB free of ${gpu.totalMB} MB (${gpu.usedMB} MB in use)`
+      : 'GPU: no NVIDIA GPU detected (or nvidia-smi unavailable)');
+    if (llm.running) lines.push(`llama.cpp: serving "${llm.profile || 'unknown'}" on port ${llm.port} (pid ${llm.pid})`);
+    else if (llm.foreign) lines.push(`llama.cpp: a server AIOS does not manage is running on port ${llm.port}`);
+    else lines.push(`llama.cpp: not running (managed: ${llm.managed ? 'yes' : 'no'})`);
+    const byStatus = { up: [], down: [], off: [], warn: [], unknown: [] };
+    for (const s of svcs) (byStatus[s.status] ||= []).push(`${s.name}${s.detail ? ` (${s.detail})` : ''}`);
+    lines.push('Services:');
+    for (const [k, list] of Object.entries(byStatus)) {
+      if (list.length) lines.push(`  ${k}: ${list.join(', ')}`);
+    }
+    return lines.join('\n');
+  },
+
+  async bench_best({ category }) {
+    const { models, best, tests } = bench.leaderboard();
+    if (!models.length) return 'No benchmark results yet — the user has not run the Bench app. Nothing measured to recommend from.';
+    if (category) {
+      const cat = String(category).toLowerCase();
+      const known = [...new Set(tests.map(t => t.category))];
+      if (!known.includes(cat)) return `Unknown category "${category}". Measured categories: ${known.join(', ')}.`;
+      const ranked = models.filter(m => m.categories[cat] !== undefined)
+        .sort((a, b) => b.categories[cat] - a.categories[cat]);
+      return `Local models ranked for "${cat}" (score 0-1, higher is better):\n`
+        + ranked.map((m, i) => `  ${i + 1}. ${m.model} — ${m.categories[cat]}${m.tokS ? `, ${m.tokS} tok/s` : ''}`).join('\n');
+    }
+    const lines = [`Measured leaderboard (${models.length} local model(s)):`];
+    for (const m of models.slice(0, 8)) {
+      lines.push(`  ${m.model} — overall ${m.overall}, ${m.tokS || '?'} tok/s, ${m.covered} test(s) covered`);
+    }
+    if (Object.keys(best).length) {
+      lines.push('Best per category:');
+      for (const [cat, b] of Object.entries(best)) lines.push(`  ${cat}: ${b.model} (${b.score})`);
+    }
+    return lines.join('\n');
+  },
+
+  async sql_query({ db: which, sql, limit = 50 }) {
+    const DBS = { finance: 'finance.db', learn: 'learn.db', bench: 'bench.db' };
+    const file = DBS[String(which || '')];
+    if (!file) throw new Error(`unknown database "${which}" — choose one of: ${Object.keys(DBS).join(', ')}`);
+    const abs = path.join(DATA, file);
+    if (!fs.existsSync(abs)) return `The ${which} database does not exist yet — that app has not stored anything.`;
+
+    const { DatabaseSync } = await import('node:sqlite');
+    // readOnly is the real guard; the string checks below just fail fast with a
+    // message the model can act on instead of an opaque SQLITE_READONLY.
+    const conn = new DatabaseSync(abs, { readOnly: true });
+    try {
+      if (!sql || !String(sql).trim()) {
+        const tables = conn.prepare(
+          `SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).all();
+        if (!tables.length) return `The ${which} database has no tables yet.`;
+        return `Schema of the ${which} database:\n\n` + tables.map(t => t.sql).join(';\n\n')
+          + '\n\nRe-call with `sql` to query it.';
+      }
+      const q = String(sql).trim().replace(/;\s*$/, '');
+      if (/;/.test(q)) throw new Error('only one statement per call — remove the semicolon and any trailing statement');
+      if (!/^\s*(select|with)\b/i.test(q)) throw new Error('only SELECT (or WITH … SELECT) is allowed here; use the finance_/learn_ write tools to change data');
+      if (/\b(attach|pragma)\b/i.test(q)) throw new Error('ATTACH and PRAGMA are not allowed');
+
+      const n = Math.min(Math.max(Math.floor(limit) || 50, 1), 500);
+      let rows;
+      try { rows = conn.prepare(q).all(); }
+      catch (e) {
+        // Hand back the schema hint with the error so the next attempt can succeed.
+        const names = conn.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
+          .all().map(t => t.name).join(', ');
+        throw new Error(`${e.message}\nTables in ${which}: ${names}. Call sql_query with no \`sql\` to see full column definitions.`);
+      }
+      if (!rows.length) return '(0 rows)';
+      const cols = Object.keys(rows[0]);
+      const shown = rows.slice(0, n);
+      const head = cols.join(' | ');
+      const body = shown.map(r => cols.map(c => {
+        const v = r[c];
+        return v === null ? '' : String(v).replace(/\n/g, ' ').slice(0, 80);
+      }).join(' | ')).join('\n');
+      const more = rows.length > n ? `\n… TRUNCATED — ${rows.length} rows matched, showing ${n}. Add LIMIT or raise \`limit\`.` : '';
+      return `${head}\n${'-'.repeat(Math.min(head.length, 80))}\n${body}\n(${rows.length} row(s))${more}`;
+    } finally {
+      try { conn.close(); } catch { }
+    }
+  },
+
+  async github_work({ kind = 'both' }) {
+    const { prs: ghPrs, issues: ghIssues } = await import('./github.js');
+    const want = ['prs', 'issues', 'both'].includes(kind) ? kind : 'both';
+    const out = [];
+    if (want !== 'issues') {
+      const p = await ghPrs();
+      const fmt = (list) => list.map(x => `  #${x.number} ${x.repo} — ${x.title}${x.draft ? ' (draft)' : ''} · updated ${String(x.updatedAt).slice(0, 10)}`);
+      out.push('Open pull requests:');
+      if (p.authored.length) out.push(' Yours:', ...fmt(p.authored));
+      if (p.reviewRequested.length) out.push(' Waiting on your review:', ...fmt(p.reviewRequested));
+      if (p.involved.length) out.push(' Involving you:', ...fmt(p.involved));
+      if (!p.authored.length && !p.reviewRequested.length && !p.involved.length) out.push('  (none)');
+    }
+    if (want !== 'prs') {
+      const i = await ghIssues();
+      out.push('Open issues involving you:');
+      out.push(...(i.issues.length
+        ? i.issues.map(x => `  #${x.number} ${x.repo} — ${x.title} · ${x.comments} comment(s)`)
+        : ['  (none)']));
+    }
+    return out.join('\n');
   },
 
   async task_add({ title, due, priority, notes }) {
@@ -1173,9 +1732,100 @@ const impls = {
     return `Web results for "${query}" (${source}):${note ? `\n(${note})` : ''}\n\n${lines.join('\n')}`;
   },
 
-  async fetch_url({ url }) {
+  async fetch_url({ url, max_chars, offset }) {
     const { status, text } = await fetchReadable(url);
-    return `[${status}] ${url}\n\n${text}`;
+    // Without windowing, a long page gets middle-truncated by runTool and the rest
+    // is simply unreachable. Page through it instead.
+    const cap = Math.min(Math.max(Math.floor(max_chars) || 20000, 500), 100000);
+    const from = Math.max(Math.floor(offset) || 0, 0);
+    const body = text.slice(from, from + cap);
+    const head = `[${status}] ${url}`;
+    if (from >= text.length && text.length) {
+      return `${head}\n\n(offset ${from} is past the end — the page is ${text.length} chars)`;
+    }
+    const next = from + body.length;
+    const more = next < text.length
+      ? `\n\n… showing chars ${from}-${next} of ${text.length}. Continue with offset:${next}.`
+      : '';
+    return `${head}\n\n${body}${more}`;
+  },
+
+  async crawl_site({ url, query, max_pages, depth }, { signal }) {
+    return await crawlSite(url, {
+      query: query || '',
+      maxPages: Math.min(Math.max(Math.floor(max_pages) || 6, 1), 20),
+      depth: Math.min(Math.max(Number.isFinite(depth) ? Math.floor(depth) : 2, 0), 3),
+      signal,
+    });
+  },
+
+  async wikipedia({ query, lang }, { signal }) {
+    const r = await everyday.wikipedia(query, { lang: lang || 'en', signal });
+    return `${r.title}${r.description ? ` — ${r.description}` : ''}\n\n${r.extract}\n\n${r.url}`;
+  },
+
+  async directions({ to, from, mode }, { signal }) {
+    const units = geo.mapsUnits();
+    const dest = await geo.resolvePlace(to, { signal });
+    const orig = await geo.resolvePlace(from || 'home', { signal });
+    const r = await geo.route(orig, dest, { mode: mode || 'driving', signal });
+    const modeLabel = r.mode.charAt(0).toUpperCase() + r.mode.slice(1);
+    const lines = [
+      `${geo.placeLabel(orig)} → ${geo.placeLabel(dest)}`,
+      `${modeLabel}${r.estimated ? ' (estimated)' : ''}: ${geo.fmtDuration(r.duration_s)}, ${geo.fmtDistance(r.distance_m, units)} · via ${r.provider}`,
+      `Straight-line: ${geo.fmtDistance(geo.haversineKm(orig, dest) * 1000, units)}`,
+    ];
+    if (r.steps?.length) lines.push('Transit: ' + r.steps.join(' · '));
+    if (r.estimated) lines.push('(walking/cycling time estimated from road distance — add a Google Directions key in Settings → Tools → Maps for exact figures and transit.)');
+    return lines.join('\n');
+  },
+
+  async find_places({ query, near, limit }, { signal }) {
+    const units = geo.mapsUnits();
+    let origin = null;
+    try { origin = await geo.resolvePlace(near || 'home', { signal }); }
+    catch (e) { if (near) throw e; }   // no home set is fine; a bad explicit `near` is not
+    const { places } = await geo.findPlaces(query, { near: origin, limit: Math.min(Math.max(limit || 6, 1), 15), signal });
+    if (!places.length) return `No places found for "${query}"${origin ? ` near ${geo.placeLabel(origin)}` : ''}. Try a broader term or a nearby city.`;
+    const head = origin ? `Places matching "${query}" near ${geo.placeLabel(origin)}:` : `Places matching "${query}":`;
+    return head + '\n' + places.map((p, i) => {
+      const dist = p.distanceKm != null ? ` — ${geo.fmtDistance(p.distanceKm * 1000, units)} away` : '';
+      return `${i + 1}. ${p.name}${p.type ? ` (${p.type})` : ''}${dist}\n   ${p.display}`;
+    }).join('\n');
+  },
+
+  async weather({ place, days }, { signal }) {
+    const w = await geo.forecast(place || 'home', { days: days || 3, signal });
+    const c = w.current, windUnit = w.unit === '°F' ? ' mph' : ' km/h';
+    const head = `Weather for ${w.place}: ${c.emoji} ${c.label}, ${c.temp}${w.unit} (feels ${c.feels}${w.unit}), humidity ${c.humidity}%, wind ${c.wind}${windUnit}.`;
+    const fc = w.days.map(d => `  ${d.date}: ${d.emoji} ${d.label}, ${d.lo}–${d.hi}${w.unit}${d.precip != null ? `, ${d.precip}% precip` : ''}`).join('\n');
+    return `${head}\nForecast:\n${fc}`;
+  },
+
+  async translate({ text, to, from }, { signal }) {
+    const r = await everyday.translate(text, { to: to || 'en', from: from || 'auto', signal });
+    return `(${r.from} → ${r.to})\n${r.text}`;
+  },
+
+  async calculate({ expression }) {
+    const v = everyday.calculate(expression);
+    const out = Number.isInteger(v) ? String(v) : String(Number(v.toPrecision(12)));
+    return `${expression} = ${out}`;
+  },
+
+  async convert({ value, from, to }, { signal }) {
+    const r = await everyday.convert(value, from, to, { signal });
+    const round = (n) => Number.isInteger(n) ? String(n) : String(Number(n.toPrecision(6)));
+    let line = `${value} ${r.from} = ${round(r.value)} ${r.to}`;
+    if (r.dim === 'currency') line += ` (rate ${round(r.rate)}${r.asOf ? `, as of ${r.asOf}` : ''})`;
+    return line;
+  },
+
+  async datetime({ tz, until }) {
+    const r = everyday.datetime({ tz, until });
+    const lines = [`${r.local}${r.tz ? ` (${r.tz})` : ''}`];
+    if (r.until) lines.push(`${r.until.date} is ${r.until.days}d ${r.until.hours}h ${r.until.direction}`);
+    return lines.join('\n');
   },
 
   async model_auto_setup({ file }, { modelRef }) {
@@ -1419,6 +2069,19 @@ export async function webSearch(query, { n = 8, category, time_range } = {}) {
   return { source: 'DuckDuckGo', results, answers: [], note: 'SearXNG not configured — set it up in Settings → Tools for better results' };
 }
 
+const BROWSER_UA = 'Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0';
+
+/** Strip HTML to readable plain text (scripts/styles/tags removed, entities decoded). */
+function htmlToText(html) {
+  return String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<br\s*\/?>(?=.)/gi, '\n').replace(/<\/(p|div|h[1-6]|li|tr)>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
+    .replace(/\n{3,}/g, '\n\n').trim();
+}
+
 /** Fetch a URL and reduce it to readable text (HTML stripped). opts.headers lets
  *  callers pass auth cookies (e.g. platform availability checks). */
 export async function fetchReadable(url, cap = 2_000_000, opts = {}) {
@@ -1427,20 +2090,109 @@ export async function fetchReadable(url, cap = 2_000_000, opts = {}) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 20000);
   try {
-    const r = await fetch(url, { signal: ctl.signal, redirect: 'follow', headers: { 'user-agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0', ...(opts.headers || {}) } });
+    const r = await fetch(url, { signal: ctl.signal, redirect: 'follow', headers: { 'user-agent': BROWSER_UA, ...(opts.headers || {}) } });
     const type = r.headers.get('content-type') || '';
     let body = await r.text();
     if (body.length > cap) body = body.slice(0, cap);
-    if (type.includes('html')) {
-      body = body
-        .replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '')
-        .replace(/<!--[\s\S]*?-->/g, '')
-        .replace(/<br\s*\/?>(?=.)/gi, '\n').replace(/<\/(p|div|h[1-6]|li|tr)>/gi, '\n')
-        .replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
-        .replace(/\n{3,}/g, '\n\n').trim();
-    }
+    if (type.includes('html')) body = htmlToText(body);
     return { status: r.status, text: body };
   } finally { clearTimeout(t); }
+}
+
+// ---------- website crawling ----------
+// crawl_site follows same-host links from a start page (breadth-first) and returns
+// several pages of readable text — the "read a whole section of a site" companion to
+// fetch_url. Native (no external service), polite (small delay + page/time budgets),
+// and query-rankable so only the relevant pages come back.
+
+const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
+
+function extractTitle(html) {
+  const m = String(html).match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return m ? htmlToText(m[1]).slice(0, 200) : '';
+}
+
+function extractLinks(html, base) {
+  const out = [];
+  const rx = /<a\b[^>]*\bhref=["']([^"']+)["']/gi;
+  let m;
+  while ((m = rx.exec(html)) && out.length < 400) {
+    let href = m[1].trim();
+    if (!href || /^(javascript:|mailto:|tel:|data:|#)/i.test(href)) continue;
+    href = href.split('#')[0];
+    if (href) try { out.push(new URL(href, base).href); } catch { /* skip bad href */ }
+  }
+  return out;
+}
+
+const normUrl = (u) => { try { const x = new URL(u); x.hash = ''; return (x.origin + x.pathname).replace(/\/+$/, '') + (x.search || ''); } catch { return u; } };
+
+async function fetchRaw(url, { signal, cap = 800_000 } = {}) {
+  const u = new URL(url);
+  if (!/^https?:$/.test(u.protocol)) throw new Error('only http(s) URLs');
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 15000);
+  const onAbort = () => ctl.abort();
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    const r = await fetch(url, { signal: ctl.signal, redirect: 'follow', headers: { 'user-agent': BROWSER_UA } });
+    const type = r.headers.get('content-type') || '';
+    if (type && !/text|html|xml|json/.test(type)) throw new Error('not a text page');
+    let body = await r.text();
+    if (body.length > cap) body = body.slice(0, cap);
+    return { status: r.status, body };
+  } finally { clearTimeout(t); signal?.removeEventListener('abort', onAbort); }
+}
+
+/** Breadth-first same-host crawl. Returns a readable digest of the pages visited,
+ *  ranked by `query` keywords when given. */
+export async function crawlSite(startUrl, { query = '', maxPages = 6, depth = 2, signal } = {}) {
+  const start = new URL(startUrl);
+  if (!/^https?:$/.test(start.protocol)) throw new Error('only http(s) URLs');
+  const host = start.host;
+  const seen = new Set([normUrl(start.href)]);
+  const queue = [{ url: start.href, d: 0 }];
+  const pages = [];
+  const terms = String(query || '').toLowerCase().split(/\s+/).filter(w => w.length > 2);
+  const deadline = Date.now() + 45_000;
+
+  while (queue.length && pages.length < maxPages) {
+    if (signal?.aborted || Date.now() > deadline) break;
+    const { url, d } = queue.shift();
+    let html;
+    try { ({ body: html } = await fetchRaw(url, { signal })); }
+    catch { continue; }
+    const text = htmlToText(html);
+    if (text.length > 60) {
+      const score = terms.length ? terms.reduce((n, w) => n + (text.toLowerCase().split(w).length - 1), 0) : 1;
+      pages.push({ url, title: extractTitle(html), text, score });
+    }
+    if (d < depth) {
+      for (const link of extractLinks(html, url)) {
+        let lhost; try { lhost = new URL(link).host; } catch { continue; }
+        if (lhost !== host) continue;
+        const key = normUrl(link);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        queue.push({ url: link, d: d + 1 });
+        if (seen.size > 500) break;
+      }
+    }
+    await sleepMs(120);   // be polite to the origin
+  }
+
+  if (!pages.length) return `Crawled ${seen.size} link(s) from ${startUrl} but found no readable pages (the site may require JavaScript — try fetch_url on a specific page).`;
+  let shown = pages;
+  if (terms.length) {
+    const matched = pages.filter(p => p.score > 0).sort((a, b) => b.score - a.score);
+    if (matched.length) shown = matched;
+  }
+  shown = shown.slice(0, maxPages);
+  const perPage = terms.length ? 2500 : 1600;
+  const body = shown.map(p =>
+    `### ${p.title || p.url}\n${p.url}${terms.length ? `  (relevance ${p.score})` : ''}\n\n${p.text.slice(0, perPage)}${p.text.length > perPage ? '\n…[truncated]' : ''}`
+  ).join('\n\n---\n\n');
+  return `Crawled ${pages.length} page(s) from ${host}${terms.length ? `, ranked for "${query}"` : ''} — visited ${seen.size} link(s):\n\n${body}`;
 }
 
 // ---------- PDF ingestion ----------
@@ -1597,6 +2349,19 @@ export function diffPreview(root, name, args) {
         ? (args.content ?? '')
         : (before ? before.replace(/\s*$/, '') + '\n\n' + (args.content ?? '') : (args.content ?? ''));
       return simpleDiff(before, after, args.path);
+    }
+    if (name === 'quick_note') {
+      const v = loadConfig().vault?.path;
+      if (!v) return null;
+      const safeTitle = String(args.title || '').replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, ' ').trim().slice(0, 120);
+      const fold = String(args.folder || 'Notes').replace(/^\/+|\/+$/g, '') || 'Notes';
+      const rel = `${fold}/${safeTitle}.md`;
+      const abs = safePath(v, rel);
+      const before = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '';
+      const after = before
+        ? before.replace(/\s*$/, '') + '\n\n---\n*(appended)*\n\n' + (args.content ?? '')
+        : `# ${args.title}\n\n${args.content ?? ''}`;
+      return simpleDiff(before, after, rel);
     }
     if (name === 'wiki_learn') {
       const v = loadConfig().vault?.path;

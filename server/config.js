@@ -8,8 +8,16 @@ export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 export const DATA = process.env.AIOS_DATA || path.join(ROOT, 'data');
 const CONFIG_FILE = path.join(DATA, 'config.json');
 
+// The base system prompt prepended to EVERY chat (per-chat instructions stack on top).
+// {name}/{date} are filled in at send time. Editable in Settings → Chat.
+export const DEFAULT_CHAT_SYSTEM = `You are Claude inside AIOS, {name}'s personal AI hub. Be direct, warm, and genuinely useful, and match {name}'s tone. Use markdown when it helps. Today is {date}.
+
+Accuracy over recall: when a question depends on current, recent, or time-sensitive facts — news, events, prices, releases, "what happened", anything that could have changed since your training — do NOT answer from memory. Use your tools to check first, then answer from what you find. It is far better to search and be right than to guess.`;
+
 const defaults = () => ({
-  user: { name: os.userInfo().username, email: '' },
+  // home: the user's home location, used as the default origin for directions and the
+  // default reference for find_places/weather. Falls back to the weather location.
+  user: { name: os.userInfo().username, email: '', home: { place: '', lat: null, lon: null } },
   server: { port: Number(process.env.AIOS_PORT) || 7777, host: '0.0.0.0' },
   auth: {
     // 'never' = open, 'lan' = token required for non-localhost, 'always' = token required everywhere
@@ -24,7 +32,10 @@ const defaults = () => ({
   },
   // contextTokens: the context window of your local models (llama.cpp/Ollama). AIOS
   // keeps prompts under this so a ~32k model never overflows. Anthropic uses its own large window.
-  defaults: { chatModel: '', agentModel: '', agentMode: 'edits', agentPlanMode: false, contextTokens: 32000 },
+  defaults: { chatModel: '', agentModel: '', agentMode: 'edits', agentPlanMode: false, chatTools: true, chatSystem: DEFAULT_CHAT_SYSTEM, contextTokens: 32000 },
+  // The AI learns the user's communication style + stable facts from their chat inputs,
+  // keeps a profile note in the vault, and injects a condensed version into chat/agent.
+  profile: { enabled: true, everyN: 6, inject: true, notePath: 'About Me.md' },
   // Sampling knobs sent with every model call. null = leave it to the provider's default.
   // temperature/top_p/top_k are universal-ish; presence/frequency penalties are
   // OpenAI-compat; repeat_penalty is Ollama/llama.cpp; seed + stop where supported.
@@ -42,6 +53,14 @@ const defaults = () => ({
   // daily driver; 'tiny' runs CPU-only so ComfyUI gets the whole GPU (Studio mode).
   llm: {
     managed: true,
+    // Reasoning ("thinking") control for models that support it (e.g. the ornith
+    // reasoning model, Qwen3, DeepSeek-R1). `default` applies when a caller doesn't
+    // specify one; `byModel` overrides per model ref OR alias (e.g. { 'ornith-9b': 'high' }).
+    // Levels: auto | off | low | medium | high. 'auto' (the default) sends nothing and lets
+    // the model's chat template decide — so normal chat is unchanged. off/low/medium/high map,
+    // for local OpenAI-compatible servers, to chat_template_kwargs.enable_thinking +
+    // reasoning_effort; for Ollama to `think`. Cloud endpoints ignore these entirely.
+    reasoning: { default: 'auto', byModel: {} },
     binary: '/home/joejin/llama.cpp/build/bin/llama-server',
     // the PyQt launcher (Whisper/MusicGen/manual llama tinkering) — AIOS can open it
     launcher: '/home/joejin/ai/llama-launcher/launch_llama_server.sh',
@@ -68,7 +87,7 @@ const defaults = () => ({
     // package, pinned by ComfyUI's manager_requirements.txt). Without the flag the
     // Manager silently does not load — there is no custom_nodes entry for it since
     // v0.28. Its API lives under /api/v2/... ; the old /api/manager/* routes are V3.
-    dir: '/home/joejin/comfyui/ComfyUI', python: '/home/joejin/venv/bin/python', listen: '0.0.0.0',
+    dir: '/mnt/projects/comfyui/ComfyUI', python: '/home/joejin/venv/bin/python', listen: '0.0.0.0',
     args: ['--enable-manager'],
   },
   // autoApprove: agent writes scoped to the wiki/daily note skip the approval gate.
@@ -85,6 +104,10 @@ const defaults = () => ({
   tools: {
     disabled: [],                                   // tool names the agent may not use
     searxng: { url: 'http://127.0.0.1:8890' },      // bundled metasearch instance (npm run searxng)
+    // Maps & directions. Keyless by default (OpenStreetMap Nominatim + public OSRM);
+    // a Google Directions key unlocks transit and exact walking/cycling times.
+    // units: metric | imperial (distances in directions/find_places).
+    maps: { nominatimUrl: 'https://nominatim.openstreetmap.org', osrmUrl: 'https://router.project-osrm.org', googleKey: '', units: 'metric' },
   },
 });
 
@@ -118,6 +141,7 @@ export function publicConfig() {
   if (c.mail) c.mail = { ...c.mail, password: undefined, hasPassword: !!c.mail.password };
   if (c.github) c.github = { hasToken: !!c.github.token };
   if (c.notify) c.notify = { ...c.notify, discordWebhook: undefined, hasDiscordWebhook: !!c.notify.discordWebhook };
+  if (c.tools?.maps) c.tools.maps = { ...c.tools.maps, googleKey: undefined, hasGoogleKey: !!c.tools.maps.googleKey };
   delete c.auth.token;
   return c;
 }
@@ -125,7 +149,7 @@ export function publicConfig() {
 /** Apply a partial update from the client. Secrets arrive via explicit fields. */
 export function updateConfig(patch) {
   const c = loadConfig();
-  const allowed = ['user', 'appearance', 'defaults', 'projectsRoot', 'vault', 'agent', 'tools', 'sampling', 'weather', 'llm', 'comfy'];
+  const allowed = ['user', 'appearance', 'defaults', 'projectsRoot', 'vault', 'agent', 'tools', 'sampling', 'weather', 'llm', 'comfy', 'profile', 'finance'];
   for (const k of allowed) if (patch[k] !== undefined) c[k] = deepMerge(c[k], patch[k]);
   if (patch.mail) {
     const m = patch.mail, M = c.mail;
@@ -155,7 +179,9 @@ export function updateConfig(patch) {
     if (Array.isArray(p.custom)) {
       c.providers.custom = p.custom.map(n => {
         const prev = c.providers.custom.find(x => x.id === n.id);
-        return { id: n.id || id(6), name: n.name || 'Custom', baseUrl: n.baseUrl || '', kind: 'openai', apiKey: (typeof n.apiKey === 'string' && n.apiKey !== '') ? n.apiKey : (prev?.apiKey || '') };
+        // optional manual model list — for OpenAI-compatible gateways that don't serve /models
+        const models = Array.isArray(n.models) ? n.models.map(s => String(s).trim()).filter(Boolean) : (prev?.models || []);
+        return { id: n.id || id(6), name: n.name || 'Custom', baseUrl: n.baseUrl || '', kind: 'openai', apiKey: (typeof n.apiKey === 'string' && n.apiKey !== '') ? n.apiKey : (prev?.apiKey || ''), models };
       });
     }
   }

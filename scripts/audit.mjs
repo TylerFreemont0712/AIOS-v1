@@ -273,6 +273,29 @@ await hard('tools: registry + read tools on disk', async () => {
   return `${names.length} tools enabled · runTool ok`;
 });
 
+await hard('chat: read-only tool belt', async () => {
+  const t = await S('tools.js');
+  const names = t.chatTools().map(x => x.name);
+  assert(names.includes('web_search') && names.includes('fetch_url'), 'chat has web tools (news)');
+  assert(!names.some(n => t.isWriteTool(n)), 'chat tools are all read-only');
+  for (const forbidden of ['bash', 'write_file', 'edit_file', 'git_commit', 'delete_path']) {
+    assert(!names.includes(forbidden), `chat must NOT expose ${forbidden}`);
+  }
+  assert(t.chatToolSchemas().every(s => s.name && s.parameters), 'schemas well-formed');
+  return `${names.length} read-only chat tools · web_search present`;
+});
+
+await hard('profile: learned user profile', async () => {
+  const pr = await S('profile.js');
+  assert(pr.profileInjection() === '', 'empty profile injects nothing');
+  pr.setProfile('# About Tester\n- Direct and terse.\n- Prefers concrete examples.');
+  assert(pr.getProfile().text.includes('Direct and terse'), 'setProfile persists');
+  const inj = pr.profileInjection();
+  assert(inj.includes('Direct and terse') && /adapt/i.test(inj), 'injection carries profile + directive');
+  assert(pr.profileInjection(30).length < pr.profileInjection(400).length, 'a smaller cap yields a shorter injection');
+  return 'set · get · inject · cap';
+});
+
 await hard('projects: register/get/remove', async () => {
   const p = await S('projects.js');
   const proj = p.registerProject({ path: tmpProj, name: 'audit-proj' });
@@ -495,6 +518,149 @@ await hard('bench: new discriminating tests', async () => {
   assert(lc.check('{"valve_bay":"bay 14","night_contact":"Priya Raman","torque_nm":47}').score === 1, 'longctx: all three needles');
   assert(lc.check('{"valve_bay":"bay 9","night_contact":"Priya Raman","torque_nm":62}').score < 0.4, 'longctx: obsolete values rejected');
   return 'refusal · multiturn retention · long-context needles';
+});
+
+await hard('bench: multi-language code execution + per-case breakdown', async () => {
+  const b = await S('bench.js');
+  const byId = Object.fromEntries(b.TESTS.map(t => [t.id, t]));
+  const { spawnSync } = await import('node:child_process');
+  const wrap = (lang, code) => '```' + lang + '\n' + code + '\n```';
+  const has = (cmd, arg) => { try { return spawnSync(cmd, [arg], { stdio: 'ignore' }).status === 0; } catch { return false; } };
+
+  // every coding tier is present, tagged with its language, and executable
+  for (const id of ['py-easy', 'py-medium', 'py-hard', 'py-expert', 'codegen-easy', 'codegen-medium', 'codegen-hard', 'coding', 'go-core', 'cpp-core']) {
+    assert(byId[id] && byId[id].category === 'coding' && typeof byId[id].checkAsync === 'function', `coding tier ${id} exists and executes`);
+  }
+  const langs = new Set(b.TESTS.filter(t => t.lang).map(t => t.lang));
+  assert(langs.has('python') && langs.has('js') && langs.has('go') && langs.has('cpp'), `four languages represented (${[...langs].join(', ')})`);
+
+  // Python executor + breakdown recording, proven offline with a reference solution.
+  const pyOk = await byId['py-easy'].checkAsync(wrap('python', [
+    'def has_close_elements(nums, threshold):',
+    '    return any(abs(nums[i]-nums[j])<threshold for i in range(len(nums)) for j in range(i+1,len(nums)))',
+    'def digit_sum(s): return sum(int(c) for c in s if c.isdigit())',
+    'def flip_case(s): return s.swapcase()',
+    "def count_vowels(s): return sum(1 for c in s.lower() if c in 'aeiou')",
+    'def is_palindrome(s):',
+    '    t=[c.lower() for c in s if c.isalnum()]; return t==t[::-1]',
+  ].join('\n')));
+  assert(pyOk.score === 1, `py-easy reference solution scores 1 (${pyOk.detail})`);
+  assert(Array.isArray(pyOk.breakdown) && pyOk.breakdown.length === 26 && pyOk.breakdown.every(r => r.pass && r.expected !== undefined && r.got !== undefined), 'py-easy records 26 per-case rows with expected+got+pass');
+  const pyBad = await byId['py-easy'].checkAsync('I refuse to write code.');
+  assert(pyBad.score === 0 && pyBad.breakdown.length === 26 && pyBad.breakdown.every(r => !r.pass), 'a non-answer scores 0 with a breakdown that still lists every expected case as failed');
+
+  // JS parser probe: partial credit + a must-throw row captured in the breakdown.
+  const jsRes = await byId['coding'].checkAsync(wrap('js', 'function parseRange(s){const t=String(s).replace(/\\s+/g,"");if(t==="")return[];const o=new Set();for(const p of t.split(",")){if(!/^\\d+(-\\d+)?$/.test(p))throw new Error("bad");const[a,c]=p.split("-").map(Number);const lo=Math.min(a,c===undefined?a:c),hi=Math.max(a,c===undefined?a:c);for(let i=lo;i<=hi;i++)o.add(i);}return[...o].sort((x,y)=>x-y);}'));
+  assert(jsRes.score === 1 && jsRes.breakdown.some(r => r.expected === 'throws' && r.pass), 'js parseRange scores 1 and the must-throw cases are recorded as graded rows');
+
+  // Go + C++ are gated on a toolchain so the audit stays portable.
+  let compiled = 'python+js';
+  if (has('go', 'version')) {
+    const goRes = await byId['go-core'].checkAsync(wrap('go', 'package main\nfunc TwoSum(nums []int, target int) []int {\n seen := map[int]int{}\n for i, n := range nums { if j, ok := seen[target-n]; ok { return []int{j, i} }; seen[n] = i }\n return []int{}\n}\nfunc MaxSubArray(nums []int) int {\n best, cur := nums[0], nums[0]\n for i := 1; i < len(nums); i++ { if cur < 0 { cur = 0 }; cur += nums[i]; if cur > best { best = cur } }\n return best\n}'));
+    assert(goRes.score === 1, `go-core reference solution compiles & scores 1 (${goRes.detail})`);
+    compiled += '+go';
+  }
+  if (has('g++', '--version')) {
+    const cppRes = await byId['cpp-core'].checkAsync(wrap('cpp', 'vector<int> twoSum(vector<int> nums, int target){unordered_map<int,int> s;for(int i=0;i<(int)nums.size();i++){if(s.count(target-nums[i]))return {s[target-nums[i]],i};s[nums[i]]=i;}return {};}\nbool isBalanced(string x){string st,op="([{",cl=")]}";for(char c:x){auto o=op.find(c),k=cl.find(c);if(o!=string::npos)st.push_back(c);else if(k!=string::npos){if(st.empty()||op.find(st.back())!=k)return false;st.pop_back();}}return st.empty();}'));
+    assert(cppRes.score === 1, `cpp-core reference solution compiles & scores 1 (${cppRes.detail})`);
+    compiled += '+cpp';
+  }
+  return `${b.TESTS.filter(t => t.category === 'coding').length} coding tiers · executed ${compiled} · breakdown recorded`;
+});
+
+await hard('bench: reasoning levels + harder problem bank', async () => {
+  const llm = await S('llm.js');
+  const b = await S('bench.js');
+  const byId = Object.fromEntries(b.TESTS.map(t => [t.id, t]));
+  const { spawnSync } = await import('node:child_process');
+  const wrap = (lang, code) => '```' + lang + '\n' + code + '\n```';
+
+  // reasoning level normalization + export surface
+  assert(Array.isArray(llm.REASONING_LEVELS) && llm.REASONING_LEVELS.join() === 'off,low,medium,high', 'four pickable reasoning levels exported in order');
+  assert(llm.normReasoning('bogus') === 'auto' && llm.normReasoning('high') === 'high' && llm.normReasoning('off') === 'off', 'unknown level falls back to the neutral auto; explicit levels pass through');
+
+  // the harder problems were actually added to the tiers
+  const wants = { 'py-medium': ['single_number', 'atoi'], 'py-hard': ['coin_change'], 'py-expert': ['largest_rectangle', 'n_queens'] };
+  for (const [id, fns] of Object.entries(wants)) for (const fn of fns)
+    assert(byId[id].prompt.includes(fn), `${id} now includes ${fn}`);
+
+  // the new expert problems' expected values are correct (executed against a reference)
+  const expert = await byId['py-expert'].checkAsync(wrap('python', [
+    'from collections import Counter',
+    'def min_window(s,t):',
+    '    if not t or not s: return ""',
+    '    need=Counter(t); miss=len(t); i=0; best=(10**9,0,0)',
+    '    for j,c in enumerate(s):',
+    '        if need[c]>0: miss-=1',
+    '        need[c]-=1',
+    '        while miss==0:',
+    '            if j-i+1<best[0]: best=(j-i+1,i,j+1)',
+    '            need[s[i]]+=1',
+    '            if need[s[i]]>0: miss+=1',
+    '            i+=1',
+    '    return "" if best[0]==10**9 else s[best[1]:best[2]]',
+    'def calculate(e):',
+    '    def ev(tk):',
+    '        st=[]; num=0; op="+"',
+    '        while tk:',
+    '            t=tk.pop(0)',
+    '            if t.isdigit(): num=num*10+int(t)',
+    '            if t=="(": num=ev(tk)',
+    '            if t in "+-*/)" or not tk:',
+    '                if op=="+": st.append(num)',
+    '                elif op=="-": st.append(-num)',
+    '                elif op=="*": st.append(st.pop()*num)',
+    '                elif op=="/": st.append(int(st.pop()/num))',
+    '                op=t; num=0',
+    '                if t==")": break',
+    '        return sum(st)',
+    '    return ev(list(e.replace(" ","")))',
+    'def is_match(s,p):',
+    '    import functools',
+    '    @functools.lru_cache(None)',
+    '    def dp(i,j):',
+    '        if j==len(p): return i==len(s)',
+    '        first=i<len(s) and p[j] in (s[i],".")',
+    '        if j+1<len(p) and p[j+1]=="*": return dp(i,j+2) or (first and dp(i+1,j))',
+    '        return first and dp(i+1,j+1)',
+    '    return dp(0,0)',
+    'def largest_rectangle(h):',
+    '    st=[]; best=0; h=h+[0]',
+    '    for i,x in enumerate(h):',
+    '        while st and h[st[-1]]>=x:',
+    '            ht=h[st.pop()]; w=i-st[-1]-1 if st else i; best=max(best,ht*w)',
+    '        st.append(i)',
+    '    return best',
+    'def n_queens(n):',
+    '    r=[0]; co=set(); a=set(); c=set()',
+    '    def bt(k):',
+    '        if k==n: r[0]+=1; return',
+    '        for x in range(n):',
+    '            if x in co or (k-x) in a or (k+x) in c: continue',
+    '            co.add(x); a.add(k-x); c.add(k+x); bt(k+1); co.discard(x); a.discard(k-x); c.discard(k+x)',
+    '    bt(0); return r[0]',
+  ].join('\n')));
+  assert(expert.score === 1, `py-expert reference (incl. largest_rectangle + n_queens) scores 1 (${expert.detail})`);
+
+  // reasoningFor resolves per-model overrides in a seeded config (subprocess: fresh AIOS_DATA)
+  const script = `
+import fs from 'node:fs'; import path from 'node:path';
+const DATA = process.env.AIOS_DATA; fs.mkdirSync(DATA, { recursive: true });
+fs.writeFileSync(path.join(DATA,'config.json'), JSON.stringify({ llm: { reasoning: { default: 'low', byModel: { 'local:ornith-9b': 'high', 'tiny': 'off' } } } }));
+const { reasoningFor } = await import(${JSON.stringify(path.join(ROOT, 'server', 'llm.js'))});
+console.log('RESULT ' + JSON.stringify({
+  exact: reasoningFor('local:ornith-9b'),
+  alias: reasoningFor('custom_lm:tiny'),
+  fallback: reasoningFor('custom_lm:something-else'),
+}));`;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'aios-reason-'));
+  const run = spawnSync('node', ['--input-type=module', '-e', script], { env: { ...process.env, AIOS_DATA: tmp }, encoding: 'utf8' });
+  fs.rmSync(tmp, { recursive: true, force: true });
+  const out = JSON.parse((run.stdout.match(/RESULT (\{.*\})/) || [])[1] || '{}');
+  assert(out.exact === 'high', 'reasoningFor: exact ref override wins');
+  assert(out.alias === 'off', 'reasoningFor: bare-alias override matches across providers');
+  assert(out.fallback === 'low', 'reasoningFor: falls back to the configured default');
+  return 'levels · harder Python tiers executed · per-model reasoning resolves';
 });
 
 await hard('llmctl: VRAM-aware context sizing', async () => {

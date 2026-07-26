@@ -9,17 +9,22 @@ import { spawnSync } from 'node:child_process';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 let failed = false;
 
-// frontend: full bundle resolution (output discarded)
-try {
-  await build({
-    entryPoints: [join(root, 'web/js/main.js')],
-    bundle: true, write: false, format: 'esm', logLevel: 'silent',
-  });
-  console.log('✓ web/js bundles cleanly');
-} catch (e) {
-  failed = true;
-  console.error('✗ frontend errors:');
-  for (const err of e.errors || []) console.error(`  ${err.location?.file}:${err.location?.line} ${err.text}`);
+// frontend: full bundle resolution (output discarded). Every HTML entry point
+// needs listing — the phone shell at /m has its own and shares no code with the
+// desktop bundle beyond api.js.
+const ENTRIES = ['web/js/main.js', 'web/js/mobile/receipts.js'];
+for (const entry of ENTRIES) {
+  try {
+    await build({
+      entryPoints: [join(root, entry)],
+      bundle: true, write: false, format: 'esm', logLevel: 'silent',
+    });
+    console.log(`✓ ${entry} bundles cleanly`);
+  } catch (e) {
+    failed = true;
+    console.error(`✗ ${entry} errors:`);
+    for (const err of e.errors || []) console.error(`  ${err.location?.file}:${err.location?.line} ${err.text}`);
+  }
 }
 
 // server: node --check each module (parse only)

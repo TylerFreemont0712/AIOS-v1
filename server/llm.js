@@ -82,11 +82,20 @@ export async function listModels() {
   for (const c of cfg.providers.custom) {
     if (managedId === `custom_${c.id}`) continue;   // replaced by the local: entries below
     jobs.push((async () => {
+      const seen = new Set();
+      const add = (mid) => {
+        mid = String(mid || '').trim();
+        if (!mid || seen.has(mid)) return;
+        seen.add(mid);
+        out.push({ ref: `custom_${c.id}:${mid}`, provider: c.name, model: mid, label: `${mid} (${c.name})` });
+      };
+      // manually-listed models always show — for gateways with no /models endpoint (e.g. Agnes AI)
+      for (const mid of Array.isArray(c.models) ? c.models : []) add(mid);
       try {
         const headers = c.apiKey ? { Authorization: `Bearer ${c.apiKey}` } : {};
         const r = await fetchJSON(`${c.baseUrl.replace(/\/$/, '')}/models`, { headers }, 4000);
-        for (const m of r.data || []) out.push({ ref: `custom_${c.id}:${m.id}`, provider: c.name, model: m.id, label: `${m.id} (${c.name})` });
-      } catch { /* unreachable */ }
+        for (const m of r.data || []) add(m.id);
+      } catch { /* unreachable, or no /models — the manual list still applies */ }
     })());
   }
 
@@ -245,9 +254,46 @@ export function samplingParams(kind, overrides) {
   return o;
 }
 
+// ---------- reasoning / thinking level ----------
+//
+// A single knob — off | low | medium | high — that scales how much a reasoning model
+// thinks before answering. Resolved from config (per-model override, then the default)
+// unless a caller passes one explicitly (the Bench app does, to sweep a model across
+// reasoning levels). Translation is provider-specific and guarded: the local-only knobs
+// (chat_template_kwargs) are never sent to a real cloud endpoint.
+
+// Explicit, user-pickable levels. 'auto' (the neutral default) is deliberately NOT here:
+// it means "send nothing, let the model's own chat template decide" — so normal chat with
+// a reasoning model behaves exactly as it did before any level was configured.
+export const REASONING_LEVELS = ['off', 'low', 'medium', 'high'];
+const REASONING_ALL = ['auto', 'off', 'low', 'medium', 'high'];
+export const normReasoning = (l) => REASONING_ALL.includes(l) ? l : 'auto';
+
+/** The configured reasoning level for a model ref (exact ref wins, then bare alias, then default). */
+export function reasoningFor(modelRef) {
+  const r = loadConfig().llm?.reasoning || {};
+  const by = r.byModel || {};
+  if (modelRef && Object.prototype.hasOwnProperty.call(by, modelRef)) return normReasoning(by[modelRef]);
+  const alias = String(modelRef || '').split(':').pop();
+  if (alias && Object.prototype.hasOwnProperty.call(by, alias)) return normReasoning(by[alias]);
+  return normReasoning(r.default);
+}
+
+// loopback + private LAN → a self-hosted server we can safely feed local-only params.
+const looksLocal = (p) => /(?:\/\/|@|^)(127\.0\.0\.1|localhost|0\.0\.0\.0|\[?::1\]?|192\.168\.|10\.\d|172\.(1[6-9]|2\d|3[01])\.)/.test(String(p?.baseUrl || ''));
+
+/** OpenAI-compatible reasoning knobs. enable_thinking toggles Qwen3/ornith-style
+ *  templates; reasoning_effort is understood by newer llama.cpp/vLLM (ignored elsewhere). */
+function openaiReasoningBody(level, p) {
+  level = normReasoning(level);
+  if (level === 'auto' || !looksLocal(p)) return {};              // leave it to the template; never send template knobs to a cloud API
+  if (level === 'off') return { chat_template_kwargs: { enable_thinking: false }, reasoning_budget: 0 };
+  return { reasoning_effort: level, chat_template_kwargs: { enable_thinking: true } };
+}
+
 // ---------- streaming chat ----------
 
-export async function streamChat({ modelRef, system, messages, tools, onEvent, signal, maxTokens = 8192, sampling }) {
+export async function streamChat({ modelRef, system, messages, tools, onEvent, signal, maxTokens = 8192, sampling, reasoning }) {
   // auto:<category> → routed to the bench-best local model; local:<alias> → that exact
   // model, auto-served on demand. Either way the managed llama-server may be swapped
   // first (never mid-generation). Dynamic import: router → bench → this module.
@@ -260,6 +306,8 @@ export async function streamChat({ modelRef, system, messages, tools, onEvent, s
   }
   const { providerId, model } = resolveModelRef(modelRef);
   const p = providerFor(providerId);
+  // caller override wins; otherwise the model's configured level (default: off)
+  const rLevel = reasoning !== undefined ? normReasoning(reasoning) : reasoningFor(modelRef);
 
   // Generation speed, measured once here so EVERY caller (chat, agent, research,
   // learn, bench…) reports it without its own stopwatch. Time-to-first-token is
@@ -273,8 +321,8 @@ export async function streamChat({ modelRef, system, messages, tools, onEvent, s
   };
 
   const res = p.kind === 'anthropic' ? await anthropicStream({ p, model, system, messages, tools, onEvent: timed, signal, maxTokens, sampling })
-    : p.kind === 'ollama' ? await ollamaStream({ p, model, system, messages, tools, onEvent: timed, signal, sampling })
-      : await openaiStream({ p, model, system, messages, tools, onEvent: timed, signal, maxTokens, sampling });
+    : p.kind === 'ollama' ? await ollamaStream({ p, model, system, messages, tools, onEvent: timed, signal, sampling, reasoning: rLevel })
+      : await openaiStream({ p, model, system, messages, tools, onEvent: timed, signal, maxTokens, sampling, reasoning: rLevel });
 
   const totalMs = Date.now() - t0;
   // Prefer the provider's own token count; fall back to an estimate when it reports
@@ -287,6 +335,7 @@ export async function streamChat({ modelRef, system, messages, tools, onEvent, s
     tokS: outTokens ? Math.round((outTokens / (decodeMs / 1000)) * 10) / 10 : 0,
     estimated: !reported,
     modelRef,   // the CONCRETE ref actually used — auto:/local: are resolved above
+    reasoning: rLevel,
   };
   return res;
 }
@@ -468,12 +517,13 @@ function toOllamaMessages(system, messages) {
   return out;
 }
 
-async function openaiStream({ p, model, system, messages, tools, onEvent, signal, maxTokens, sampling }) {
+async function openaiStream({ p, model, system, messages, tools, onEvent, signal, maxTokens, sampling, reasoning }) {
   const body = {
     model, stream: true, max_tokens: maxTokens,
     messages: toOpenAIMessages(system, messages),
     stream_options: { include_usage: true },
     ...samplingParams('openai', sampling),
+    ...openaiReasoningBody(reasoning, p),
   };
   if (tools?.length) body.tools = tools.map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }));
 
@@ -525,10 +575,13 @@ async function openaiStream({ p, model, system, messages, tools, onEvent, signal
 
 // --- Ollama native ---
 
-async function ollamaStream({ p, model, system, messages, tools, onEvent, signal, sampling }) {
+async function ollamaStream({ p, model, system, messages, tools, onEvent, signal, sampling, reasoning }) {
   const body = { model, stream: true, messages: toOllamaMessages(system, messages) };
   const opts = samplingParams('ollama', sampling);
   if (Object.keys(opts).length) body.options = opts;
+  // Ollama's thinking toggle for reasoning models (newer server versions). 'auto' leaves it unset.
+  if (['low', 'medium', 'high'].includes(reasoning)) body.think = true;
+  else if (reasoning === 'off') body.think = false;
   if (tools?.length) body.tools = tools.map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }));
 
   const r = await fetch(`${p.baseUrl.replace(/\/$/, '')}/api/chat`, {

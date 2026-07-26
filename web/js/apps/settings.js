@@ -18,6 +18,7 @@ export default {
     const tabs = [
       ['appearance', 'Appearance', 'sun'],
       ['providers', 'AI Providers', 'cpu'],
+      ['chat', 'Chat', 'chat'],
       ['tools', 'Tools', 'wrench'],
       ['vault', 'Vault', 'vault'],
       ['github', 'GitHub', 'github'],
@@ -135,10 +136,11 @@ export default {
           olStatus?.up ? `Running — ${olStatus.models} local models` : 'Not reachable. Install from ollama.com, then `ollama pull qwen3` etc.',
           el('div', { class: 'row' }, olUrl, olBtn)));
 
-        // Custom OpenAI-compatible
-        ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '18px' } }, 'OPENAI-COMPATIBLE ENDPOINTS (LM Studio, vLLM, llama.cpp, OpenRouter…)'));
+        // Custom OpenAI-compatible providers & gateways
+        ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '18px' } }, 'OPENAI-COMPATIBLE PROVIDERS & GATEWAYS (Agnes AI, OpenRouter, Groq, LM Studio, vLLM, llama.cpp…)'));
         for (const p of c.providers.custom) {
-          ui.panel.append(row(p.name, p.baseUrl, el('button', {
+          const meta = p.baseUrl + (p.models?.length ? ` · ${p.models.join(', ')}` : '');
+          ui.panel.append(row(p.name, meta, el('button', {
             class: 'btn sm ghost danger', onclick: async () => {
               await save({ providers: { custom: c.providers.custom.filter(x => x.id !== p.id) } }, 'removed');
               fetchModels(true); renderPanel();
@@ -147,15 +149,53 @@ export default {
         }
         const addBtn = el('button', {
           class: 'btn sm', onclick: async () => {
-            const name = await askText({ title: 'Provider name', placeholder: 'LM Studio', ok: 'Next' });
-            if (!name) return;
-            const baseUrl = await askText({ title: 'Base URL', sub: 'Should end with /v1', placeholder: 'http://localhost:1234/v1', ok: 'Next' });
-            if (!baseUrl) return;
-            const apiKey = await askText({ title: 'API key (optional)', placeholder: 'leave blank if none', ok: 'Add' }) || '';
-            await save({ providers: { custom: [...c.providers.custom, { id: '', name, baseUrl, apiKey }] } }, 'provider added');
+            // known OpenAI-compatible gateways — pick one to auto-fill, or Custom
+            const PRESETS = [
+              { label: 'Custom / other…' },
+              { label: 'Agnes AI', name: 'Agnes AI', baseUrl: 'https://apihub.agnes-ai.com/v1', models: 'agnes-2.0-flash' },
+              { label: 'OpenRouter', name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1' },
+              { label: 'Groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' },
+              { label: 'Together AI', name: 'Together AI', baseUrl: 'https://api.together.xyz/v1' },
+              { label: 'DeepInfra', name: 'DeepInfra', baseUrl: 'https://api.deepinfra.com/v1/openai' },
+              { label: 'Fireworks AI', name: 'Fireworks AI', baseUrl: 'https://api.fireworks.ai/inference/v1' },
+              { label: 'OpenAI', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1' },
+              { label: 'LM Studio (local)', name: 'LM Studio', baseUrl: 'http://localhost:1234/v1' },
+            ];
+            const nameIn = el('input', { class: 'input', placeholder: 'My provider', style: { width: '100%' } });
+            const urlIn = el('input', { class: 'input', placeholder: 'https://…/v1', style: { width: '100%' } });
+            const keyIn = el('input', { class: 'input', type: 'password', placeholder: 'Bearer key — blank if none', style: { width: '100%' } });
+            const modelsIn = el('input', { class: 'input', placeholder: 'agnes-2.0-flash, … (optional)', style: { width: '100%' } });
+            const preset = el('select', {
+              class: 'input select', style: { width: '100%' },
+              onchange: () => { const pr = PRESETS[preset.selectedIndex] || {}; nameIn.value = pr.name || ''; urlIn.value = pr.baseUrl || ''; modelsIn.value = pr.models || ''; },
+            }, ...PRESETS.map(pr => el('option', {}, pr.label)));
+            const fld = (lbl, ctl, hint) => el('div', { style: { marginBottom: '10px' } },
+              el('div', { class: 'lbl', style: { marginBottom: '4px' } }, lbl), ctl,
+              hint && el('div', { class: 'desc', style: { marginTop: '3px' } }, hint));
+            const body = el('div', { style: { marginTop: '6px', minWidth: '400px' } },
+              fld('Preset', preset, 'Pick a known gateway to auto-fill, or choose Custom.'),
+              fld('Name', nameIn),
+              fld('Base URL', urlIn, 'The OpenAI-compatible endpoint, usually ending in /v1.'),
+              fld('API key', keyIn),
+              fld('Models', modelsIn, 'Comma-separated. Needed only when the endpoint has no /models list (e.g. Agnes AI); otherwise leave blank to auto-discover.'));
+            const res = await modal({
+              title: 'Connect an AI provider', wide: true, body,
+              actions: [
+                { label: 'Cancel', value: null },
+                {
+                  label: 'Add', kind: 'primary', onpick: (close) => {
+                    const name = nameIn.value.trim(), baseUrl = urlIn.value.trim();
+                    if (!name || !baseUrl) { toast('Name and Base URL are required', 'err'); return false; }
+                    close({ name, baseUrl, apiKey: keyIn.value.trim(), models: modelsIn.value.split(',').map(s => s.trim()).filter(Boolean) });
+                  },
+                },
+              ],
+            });
+            if (!res) return;
+            await save({ providers: { custom: [...c.providers.custom, { id: '', ...res }] } }, 'provider added');
             fetchModels(true); refreshStatus(); renderPanel();
           },
-        }, icon('plus'), 'Add endpoint');
+        }, icon('plus'), 'Add provider');
         ui.panel.append(el('div', { style: { marginTop: '10px' } }, addBtn));
 
         // ---- managed llama.cpp: profiles + the desktop launcher ----
@@ -256,8 +296,30 @@ export default {
         }, icon('search'), 'Test search');
         ui.panel.append(row('Try it', 'Runs the web_search tool exactly as the agent would', testBtn));
 
+        // maps & directions
+        ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '18px' } }, 'MAPS & DIRECTIONS'));
+        const maps = c.tools?.maps || {};
+        const unitSeg = el('div', { class: 'seg' }, ...[['metric', 'Metric'], ['imperial', 'Imperial']].map(([v, l]) => el('button', {
+          class: 'seg-btn' + ((maps.units || 'metric') === v ? ' on' : ''),
+          onclick: async () => { if (await save({ tools: { maps: { units: v } } })) renderPanel(); },
+        }, l)));
+        ui.panel.append(row('Units', 'For directions & nearby places. Free via OpenStreetMap — driving, walking and cycling need no key.', unitSeg));
+
+        const gk = el('input', { class: 'input', type: 'password', value: '', placeholder: maps.hasGoogleKey ? '•••••• (key set)' : 'optional — enables transit', style: { width: '210px' } });
+        const gkSave = el('button', {
+          class: 'btn sm', onclick: async () => {
+            const v = gk.value.trim(); if (!v) return;
+            if (await save({ tools: { maps: { googleKey: v } } }, 'Google key saved')) renderPanel();
+          },
+        }, 'Save');
+        const gkCtl = el('div', { class: 'row' }, gk, gkSave);
+        if (maps.hasGoogleKey) gkCtl.append(el('button', {
+          class: 'btn sm ghost danger', onclick: async () => { if (await save({ tools: { maps: { googleKey: null } } }, 'key cleared')) renderPanel(); },
+        }, 'Clear'));
+        ui.panel.append(row('Google Directions key', 'Optional. Adds train/bus (transit) directions and exact walking/cycling times; driving works without it.', gkCtl));
+
         // the tool belt
-        const groups = [['files', 'FILES'], ['git', 'GIT'], ['system', 'SYSTEM'], ['web', 'WEB'], ['vault', 'KNOWLEDGE BASE'], ['apps', 'AIOS APPS'], ['mail', 'MAIL'], ['custom', 'AI-FORGED TOOLS']];
+        const groups = [['files', 'FILES'], ['git', 'GIT'], ['system', 'SYSTEM'], ['web', 'WEB'], ['maps', 'MAPS & LOCAL'], ['utility', 'EVERYDAY UTILITIES'], ['vault', 'KNOWLEDGE BASE'], ['apps', 'AIOS APPS'], ['mail', 'MAIL'], ['custom', 'AI-FORGED TOOLS']];
         for (const [gid, glabel] of groups) {
           const list = info.tools.filter(t => t.group === gid);
           if (!list.length) continue;
@@ -407,6 +469,43 @@ export default {
         }
       }
 
+      if (S.tab === 'chat') {
+        ui.panel.append(el('h2', {}, 'Chat'), el('div', { class: 'desc' }, 'Defaults for new chats, the shared base system prompt, and what the AI learns about you.'));
+
+        ui.panel.append(row('Tools by default', 'New chats can call read-only tools (web search, your notes, inbox, planner) so answers stay current. Each chat has its own toggle too.',
+          switchBtn(c.defaults.chatTools !== false, async (v) => { await save({ defaults: { chatTools: v } }); renderPanel(); })));
+
+        const baseTa = el('textarea', { class: 'input', rows: 8, style: { width: '100%', fontFamily: 'var(--mono)', fontSize: '12.5px' } }, '');
+        baseTa.value = c.defaults.chatSystem || '';
+        const baseSave = el('button', { class: 'btn sm primary', onclick: () => save({ defaults: { chatSystem: baseTa.value } }) }, 'Save base prompt');
+        ui.panel.append(el('div', { class: 'set-block' },
+          el('div', { class: 'set-name' }, 'Base system prompt'),
+          el('div', { class: 'set-sub' }, 'Prepended to every chat (each chat\'s own "system" instructions stack on top). {name} and {date} are filled in automatically. Keep the "search before answering time-sensitive questions" guidance to stop the model guessing at current events.'),
+          baseTa, el('div', { class: 'row', style: { marginTop: '6px' } }, baseSave)));
+
+        // --- personality profile the AI maintains about you ---
+        ui.panel.append(el('h2', { style: { marginTop: '22px' } }, 'Your profile'), el('div', { class: 'desc' }, 'The AI learns your communication style and stable preferences from your messages, keeps a note in your Second Brain, and adapts to you. Edit it any time — the AI builds on your changes.'));
+        ui.panel.append(row('Learn my style', 'Periodically updates your profile from recent chats (runs quietly in the background)',
+          switchBtn(c.profile?.enabled !== false, async (v) => { await save({ profile: { enabled: v } }); renderPanel(); })));
+        ui.panel.append(row('Use it in prompts', 'Injects a condensed version of your profile into chat and agent so replies fit you',
+          switchBtn(c.profile?.inject !== false, async (v) => { await save({ profile: { inject: v } }); renderPanel(); })));
+
+        const profTa = el('textarea', { class: 'input', rows: 10, style: { width: '100%', fontSize: '12.5px' } }, '');
+        const profMeta = el('div', { class: 'set-sub' }, 'loading…');
+        (async () => {
+          try {
+            const p = await get('/profile');
+            profTa.value = p.text || '';
+            profMeta.textContent = p.updatedAt ? `Last updated ${new Date(p.updatedAt).toLocaleString()}${p.notePath ? ` · vault: ${p.notePath}` : ''}` : 'No profile yet — chat a bit and it will fill in, or write your own.';
+          } catch { profMeta.textContent = 'could not load profile'; }
+        })();
+        const profSave = el('button', { class: 'btn sm primary', onclick: async () => { try { await put('/profile', { text: profTa.value }); toast('profile saved', 'ok'); } catch (e) { toast(e.message, 'err'); } } }, 'Save profile');
+        const profLearn = el('button', { class: 'btn sm', onclick: async () => { profMeta.textContent = 'learning from your recent chats…'; try { const p = await post('/profile/learn', { modelRef: c.defaults.chatModel }); profTa.value = p.text || profTa.value; profMeta.textContent = p.updatedAt ? `Updated ${new Date(p.updatedAt).toLocaleString()}` : 'no change'; toast('profile updated', 'ok'); } catch (e) { toast(e.message, 'err'); } } }, icon('sparkle'), 'Regenerate now');
+        ui.panel.append(el('div', { class: 'set-block' },
+          el('div', { class: 'set-name' }, 'What the AI knows about you'), profMeta,
+          profTa, el('div', { class: 'row', style: { marginTop: '6px', gap: '8px' } }, profSave, profLearn)));
+      }
+
       if (S.tab === 'agent') {
         ui.panel.append(el('h2', {}, 'Agent defaults'), el('div', { class: 'desc' }, 'How new agent sessions behave. Each session can override these.'));
         const modeSeg = el('div', { class: 'seg' }, ...[['read', 'Read-only'], ['edits', 'Approve edits'], ['auto', 'Full auto']].map(([v, label]) =>
@@ -444,7 +543,7 @@ export default {
         ui.panel.append(row('Run project tests', 'After a clean self-check, runs the project\'s own test command (package.json test script, pytest, Makefile, cargo, go — or a "verify: <cmd>" line in .aios/instructions.md) and sends failures back to the agent',
           switchBtn(c.agent.runTests !== 'off', async (v) => { await save({ agent: { runTests: v ? 'review' : 'off' } }); renderPanel(); })));
 
-        ui.panel.append(row('Life context in chat & agent', 'Injects a live brief of your planner (events, birthdays, tasks), important mail, weather, and job pipeline into every chat/agent message — so "what\'s going on tomorrow?" just works',
+        ui.panel.append(row('Life context in chat & agent', 'Injects a live brief of your planner (events, birthdays, tasks), important mail, and weather into every chat/agent message — so "what\'s going on tomorrow?" just works',
           switchBtn(c.defaults.appContext !== false, async (v) => { await save({ defaults: { appContext: v } }); renderPanel(); })));
 
         ui.panel.append(row('Coding playbooks', 'Injects best-practice guides (skills/*.md) matched to the project\'s stack into the agent prompt; the rest stay available via the skill tool',
@@ -504,6 +603,36 @@ export default {
         const email = el('input', { class: 'input', value: c.user.email || '', placeholder: 'you@example.com', style: { width: '200px' } });
         email.addEventListener('change', () => save({ user: { email: email.value.trim() } }));
         ui.panel.append(row('Email', 'Used as the git commit identity when a repo has none set', email));
+
+        // ---- home location (default origin for directions / nearby places) ----
+        ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '18px' } }, 'HOME'));
+        const home = c.user?.home || {};
+        const hplace = el('input', { class: 'input', placeholder: 'address or place, e.g. Takatsuki', style: { width: '190px' } });
+        const hresults = el('div', { class: 'col', style: { gap: '4px' } });
+        const hfind = el('button', {
+          class: 'btn sm', onclick: async () => {
+            const q = hplace.value.trim();
+            if (!q) return;
+            hfind.disabled = true;
+            hresults.innerHTML = '';
+            try {
+              const hits = await get('/weather/geocode?q=' + encodeURIComponent(q));
+              if (!hits.length) hresults.append(el('div', { class: 'muted small' }, 'no places found — try another spelling'));
+              for (const hit of hits) hresults.append(el('button', {
+                class: 'btn sm ghost', style: { justifyContent: 'flex-start' },
+                onclick: async () => {
+                  const label = hit.name + (hit.detail ? `, ${hit.detail.split(',')[0]}` : '');
+                  if (await save({ user: { home: { lat: hit.lat, lon: hit.lon, place: label } } }, 'home saved')) { hresults.innerHTML = ''; renderPanel(); }
+                },
+              }, `${hit.name} — ${hit.detail}`));
+            } catch (e) { toast(e.message, 'err'); }
+            hfind.disabled = false;
+          },
+        }, icon('search'), 'Find');
+        hplace.addEventListener('keydown', (e) => { if (e.key === 'Enter') hfind.click(); });
+        ui.panel.append(row('Home location',
+          home.place ? `"my house" resolves to ${home.place}` : 'Default origin for directions and reference point for nearby-place searches. Falls back to your weather location below.',
+          el('div', { class: 'col', style: { gap: '6px' } }, el('div', { class: 'row' }, hplace, hfind), hresults)));
 
         // ---- weather location (Home widget) ----
         ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '18px' } }, 'WEATHER'));

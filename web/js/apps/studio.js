@@ -43,14 +43,14 @@ const NEG_TEMPLATES = {
   minimal: 'lowres, worst quality',
 };
 
-// Where the ↗ button lands: the LoRA Manager, not the bare node graph.
-const COMFY_OPEN_PATH = '/loras';
+// Where the ↗ button lands: the workflow (node graph), not the LoRA Manager.
+const COMFY_OPEN_PATH = '/';
 
 // ComfyUI binds LAN-wide now, but its configured URL says 127.0.0.1 — rewrite
 // to wherever the user is browsing from so the ↗ link works off-machine too.
-// `path` picks which UI the link lands on: '/loras' is the LoRA Manager page
-// (custom_nodes/comfyui-lora-manager), '/' the stock node graph. Both are
-// served by the same :8188 process — the manager links back to the graph.
+// `path` picks which UI the link lands on: '/' is the stock node graph (the
+// workflow editor); '/loras' is the LoRA Manager page
+// (custom_nodes/comfyui-lora-manager). Both are served by the same :8188 process.
 const comfyHref = (u, path = COMFY_OPEN_PATH) => {
   try {
     const url = new URL(u);
@@ -80,7 +80,7 @@ export default {
       el('span', { class: 'grow' }),
       ui.startBtn, ui.freeBtn, ui.stopBtn,
       el('button', { class: 'btn sm ghost', title: 'Refresh', onclick: () => refresh() }, icon('refresh')),
-      ui.openComfy = el('a', { class: 'btn sm ghost', href: '#', target: '_blank', rel: 'noreferrer', title: 'Open ComfyUI in LoRA Manager mode (the node graph is one click away, in its menu)' }, 'ComfyUI ', icon('external')));
+      ui.openComfy = el('a', { class: 'btn sm ghost', href: '#', target: '_blank', rel: 'noreferrer', title: 'Open the ComfyUI workflow (node graph) in a new tab' }, 'ComfyUI ', icon('external')));
 
     async function serverAction(kind) {
       const btn = kind === 'start' ? ui.startBtn : kind === 'stop' ? ui.stopBtn : ui.freeBtn;

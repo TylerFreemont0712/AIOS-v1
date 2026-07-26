@@ -16,6 +16,7 @@ import * as projects from './projects.js';
 import * as files from './files.js';
 import * as agent from './agent.js';
 import * as chat from './chat.js';
+import * as profile from './profile.js';
 import * as uploads from './uploads.js';
 import * as vault from './vault.js';
 import * as wiki from './wiki.js';
@@ -33,6 +34,9 @@ import * as comfy from './comfy.js';
 import * as llmctl from './llmctl.js';
 import * as bench from './bench.js';
 import * as router from './router.js';
+import * as finance from './finance.js';
+import * as receipts from './receipts.js';
+import * as financeai from './financeai.js';
 import { gpuStats } from './gpu.js';
 
 const cfg = loadConfig();
@@ -192,6 +196,20 @@ app.post('/api/chats', h(req => chat.createChat(req.body || {})));
 app.get('/api/chats/:id', h(req => chat.getChat(req.params.id)));
 app.patch('/api/chats/:id', h(req => chat.updateChat(req.params.id, req.body || {})));
 app.delete('/api/chats/:id', h(req => { chat.deleteChat(req.params.id); }));
+app.post('/api/chats/bulk-delete', h(req => chat.bulkDelete(req.body?.ids || [])));
+app.post('/api/chats/move', h(req => chat.moveChats(req.body?.ids || [], req.body?.folder || '')));
+
+// ---------- user profile (AI's learned notes about the user) ----------
+app.get('/api/profile', h(() => profile.getProfile()));
+app.put('/api/profile', h(req => profile.setProfile(req.body?.text || '')));
+app.post('/api/profile/learn', h(async req => {
+  // gather a sample of the user's recent messages across their latest chats
+  const msgs = [];
+  for (const c of chat.listChats().slice(0, 6)) {
+    try { for (const m of chat.getChat(c.id).messages) if (m.role === 'user' && m.text) msgs.push(m.text); } catch { }
+  }
+  return profile.learnNow({ userMessages: msgs.slice(-14), modelRef: req.body?.modelRef });
+}));
 
 // ---------- research ----------
 
@@ -234,6 +252,64 @@ app.post('/api/mail/dismiss', h(req => mail.dismiss(String(req.body?.id || '')))
 app.get('/api/mail/senders', h(() => mail.listSenderRules()));
 app.post('/api/mail/sender', h(req => mail.setSenderRule(req.body || {})));
 app.post('/api/notify/test', h(() => notify.sendDiscord('🔔 AIOS test notification — Discord is wired up.')));
+
+// ---------- finance ----------
+// Query shape shared by every read route: ?month=YYYY-MM | ?from=&to= |
+// ?range=this-month|last-month|this-year|all|30d
+app.get('/api/finance/overview', h(req => finance.overview(req.query)));
+app.get('/api/finance/summary', h(req => finance.summary(req.query)));
+app.get('/api/finance/insights', h(req => finance.insights(req.query)));
+app.get('/api/finance/settings', h(() => finance.currencies()));
+app.get('/api/finance/categories', h(() => {
+  const s = finance.settings();
+  return { income: s.incomeCategories, expense: s.expenseCategories };
+}));
+
+app.get('/api/finance/txns', h(req => finance.listTxns(req.query)));
+app.post('/api/finance/txns', h(req => finance.addTxn(req.body || {})));
+app.post('/api/finance/txns/bulk-delete', h(req => finance.deleteTxns(req.body?.ids || [])));
+app.get('/api/finance/txns/:id', h(req => finance.getTxn(req.params.id)));
+app.patch('/api/finance/txns/:id', h(req => finance.updateTxn(req.params.id, req.body || {})));
+app.delete('/api/finance/txns/:id', h(req => { finance.deleteTxn(req.params.id); }));
+
+app.get('/api/finance/chart/categories', h(req => finance.byCategory(req.query)));
+app.get('/api/finance/chart/monthly', h(req => finance.monthlySeries(req.query)));
+app.get('/api/finance/chart/daily', h(req => finance.dailySeries(req.query)));
+app.get('/api/finance/chart/merchants', h(req => finance.topMerchants(req.query)));
+app.get('/api/finance/suggest', h(req => finance.suggest(req.query)));
+
+app.get('/api/finance/presets', h(() => finance.listPresets()));
+app.post('/api/finance/presets', h(req => finance.addPreset(req.body || {})));
+app.patch('/api/finance/presets/:id', h(req => finance.updatePreset(req.params.id, req.body || {})));
+app.delete('/api/finance/presets/:id', h(req => { finance.deletePreset(req.params.id); }));
+app.post('/api/finance/presets/:id/log', h(req => finance.logPreset(req.params.id, req.body || {})));
+
+app.get('/api/finance/goal', h(req => finance.getGoal(req.query.month)));
+app.put('/api/finance/goal', h(req => finance.setGoal(req.body?.month, req.body || {})));
+
+app.get('/api/finance/budgets', h(req => finance.listBudgets(req.query.month)));
+app.put('/api/finance/budgets', h(req => finance.setBudget(req.body || {})));
+app.delete('/api/finance/budgets/:id', h(req => { finance.deleteBudget(req.params.id); }));
+
+app.get('/api/finance/recurring', h(() => finance.listRecurring()));
+app.post('/api/finance/recurring', h(req => finance.addRecurring(req.body || {})));
+app.patch('/api/finance/recurring/:id', h(req => finance.updateRecurring(req.params.id, req.body || {})));
+app.delete('/api/finance/recurring/:id', h(req => { finance.deleteRecurring(req.params.id); }));
+app.post('/api/finance/recurring/run', h(req => finance.runRecurring(req.body || {})));
+
+// looking back: a year at a glance, and the frozen monthly write-ups
+app.get('/api/finance/year', h(req => finance.yearOverview(req.query.year)));
+app.get('/api/finance/calendar', h(req => finance.calendar(req.query)));
+app.get('/api/finance/recap', h(req => finance.getRecap(req.query.month)));
+app.post('/api/finance/recap', h(req => financeai.generateRecap(req.body?.month, req.body || {})));
+app.put('/api/finance/recap/note', h(req => finance.setRecapNote(req.body?.month, req.body?.note)));
+
+// receipt OCR — upload the image via /api/uploads first, then scan by its id
+app.get('/api/finance/receipts', h(req => receipts.listReceipts(req.query)));
+app.get('/api/finance/receipts/:id', h(req => receipts.getReceipt(req.params.id)));
+app.post('/api/finance/receipts/scan', h(req => receipts.scan(req.body || {})));
+app.post('/api/finance/receipts/:id/apply', h(req => receipts.apply(req.params.id, req.body || {})));
+app.delete('/api/finance/receipts/:id', h(req => { receipts.deleteReceipt(req.params.id); }));
 
 // ---------- planner ----------
 app.get('/api/planner/events', h(req => planner.eventsInRange(req.query.from, req.query.to)));
@@ -314,6 +390,7 @@ app.get('/api/llm/log', h(req => ({ log: llmctl.llamaLog(Number(req.query?.lines
 
 app.get('/api/bench', h(() => ({ ...bench.leaderboard(), ...bench.benchStatus() })));
 app.get('/api/bench/runs', h(req => ({ runs: bench.recentRuns(Number(req.query?.limit) || 40) })));
+app.get('/api/bench/history', h(req => ({ runs: bench.testHistory(req.query?.model, req.query?.test, Number(req.query?.limit) || 20) })));
 app.post('/api/bench/run', h(req => bench.startBench(req.body || {})));
 app.post('/api/bench/sweep', h(req => bench.startSweep(req.body || {})));
 app.post('/api/bench/stop', h(() => bench.stopBench()));
@@ -371,6 +448,29 @@ app.post('/api/learn/:id/feedback', h(req => learn.generateFeedback({ id: req.pa
 app.post('/api/learn/:id/advise', h(req => learn.generateAdvice({ id: req.params.id, modelRef: req.body?.modelRef })));
 app.get('/api/learn/:id/weak', h(req => learn.getWeakTopics(req.params.id, Number(req.query?.limit) || 8)));
 
+
+// ---------- phone shell ----------
+// /m is a separate document with its own CSS and JS — it shares nothing with the
+// desktop shell but /css/theme.css (variables and primitives) and /js/api.js, so
+// nothing here can move a pixel of the desktop layout.
+//
+// A phone landing on / is redirected to it, carrying the pairing token through so
+// the LAN link printed at boot still works from a photo message. ?desktop=1 opts
+// out for anyone who wants the full shell on a phone anyway.
+const PHONE_UA = /iPhone|iPod|Android[^;]*Mobile|Windows Phone|BlackBerry|Opera Mini/i;
+
+app.get('/m', (req, res) => {
+  res.sendFile(path.join(ROOT, 'web', 'mobile.html'), (err) => {
+    if (err && !res.headersSent) res.status(err.status || 500).end();
+  });
+});
+
+app.get('/', (req, res, next) => {
+  if (req.query.desktop !== undefined) return next();
+  if (!PHONE_UA.test(req.headers['user-agent'] || '')) return next();
+  const qs = req.originalUrl.slice(req.originalUrl.indexOf('?') + 1);
+  res.redirect(302, '/m' + (req.originalUrl.includes('?') && qs ? '?' + qs : ''));
+});
 
 // ---------- static shell ----------
 

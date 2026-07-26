@@ -9,6 +9,11 @@ import { get, post, put } from '../api.js';
 
 const pctCls = (v) => v >= 0.8 ? 'good' : v >= 0.5 ? 'mid' : 'bad';
 const fmt = (v) => v === undefined || v === null ? '—' : Math.round(v * 100) + '%';
+// resolved reasoning level for a model: per-ref override, then alias, then filename, then default
+const reasoningLevel = (inf, m) => {
+  const r = inf?.reasoning || {}, by = r.byModel || {};
+  return by[`local:${m.alias}`] ?? by[m.alias] ?? by[m.file] ?? r.default ?? 'off';
+};
 
 export default {
   id: 'models', title: 'Models', icon: 'cpu', width: 1220, height: 800,
@@ -113,6 +118,7 @@ export default {
               m.bench
                 ? el('span', { class: 'learn-tag sm ' + pctCls(m.bench.overall), title: `benched ${timeAgo(m.bench.at)} · ${m.bench.covered} tests` }, `bench ${fmt(m.bench.overall)} · ${m.bench.tokS || '—'} t/s`)
                 : el('span', { class: 'muted small' }, 'unbenched'),
+              (() => { const lv = reasoningLevel(inf, m); return lv && lv !== 'off' && lv !== 'auto' ? el('span', { class: 'learn-tag sm', title: 'reasoning / thinking level' }, '🧠 ' + lv) : null; })(),
               el('span', { class: 'muted small mono' }, `local:${m.alias}`),
               ...(m.preset.tags || []).map(t => el('span', { class: 'learn-tag sm' }, t)),
               !m.preset.configured ? el('button', { class: 'btn sm ghost', style: { padding: '1px 7px' }, title: 'LLM-configure just this model', onclick: () => autoSetup(m.file) }, icon('sparkle'), 'setup') : null),
@@ -143,6 +149,7 @@ export default {
         batch: sel([512, 1024, 2048, 4096], p.batch),
         ubatch: sel([128, 256, 512, 1024], p.ubatch),
         flashAttn: el('input', { type: 'checkbox', checked: p.flashAttn }),
+        reasoning: sel(['auto', 'off', 'low', 'medium', 'high'], reasoningLevel(inf, m)),
         mmproj: el('select', { class: 'input select' },
           el('option', { value: '' }, '(none — text only)'),
           ...(inf.mmproj || []).map(mm => el('option', { value: mm, selected: mm === p.mmproj ? '' : undefined }, mm))),
@@ -160,6 +167,7 @@ export default {
           row('gpu layers', f.ngl, 'auto fits to free VRAM; 999 = all; 0 = CPU'),
           row('kv cache K/V', el('div', { class: 'row', style: { gap: '6px' } }, f.kvK, f.kvV), 'q8_0 halves KV memory'),
           row('flash-attn', f.flashAttn, 'required for quantized KV'),
+          row('reasoning', f.reasoning, 'thinking effort for reasoning models (ornith, Qwen3, R1) — applies per request'),
           row('threads', f.threads),
           row('batch / ubatch', el('div', { class: 'row', style: { gap: '6px' } }, f.batch, f.ubatch)),
           row('vision', f.mmproj, 'pair an mmproj projector — enables image input'),
@@ -178,8 +186,9 @@ export default {
           threads: Number(f.threads.value), batch: Number(f.batch.value), ubatch: Number(f.ubatch.value),
           flashAttn: f.flashAttn.checked, mmproj: f.mmproj.value, extra: f.extra.value.trim(),
         };
-        await put('/config', { llm: { presets: { [m.file]: preset } } });
-        toast(ok === 'reset' ? 'preset reset to size defaults' : 'preset saved — applies on next serve' + (m.serving ? ' (hit Serve to reload now)' : ''), 'ok');
+        // reasoning applies per-request (not a launch flag), so it takes effect immediately — keyed by alias
+        await put('/config', { llm: { presets: { [m.file]: preset }, reasoning: { byModel: { [m.alias]: f.reasoning.value } } } });
+        toast(ok === 'reset' ? 'preset reset to size defaults (reasoning kept)' : 'preset saved — applies on next serve' + (m.serving ? ' (hit Serve to reload now)' : ''), 'ok');
         refresh();
       } catch (e) { toast(e.message, 'err'); }
     }

@@ -5,6 +5,7 @@ import { el, icons, icon, modal, toast, menu, fuzzy, askText } from './ui.js';
 import { registerApp, renderDock, openApp, apps } from './wm.js';
 import { state, refreshConfig, refreshProjects, refreshStatus, setProject, on } from './state.js';
 import { startMatrix, stopMatrix } from './matrix.js';
+import { applyPalette } from './themes.js';
 
 import dashboard from './apps/dashboard.js';
 import chat from './apps/chat.js';
@@ -20,27 +21,16 @@ import learn from './apps/learn.js';
 import benchApp from './apps/bench.js';
 import modelsApp from './apps/models.js';
 import planner from './apps/planner.js';
+import finance from './apps/finance.js';
 import settings from './apps/settings.js';
 
 window.aios = { open: openApp };
 
 // ---------- appearance ----------
 
-// Theme registry: name, label, whether it's a dark palette, its signature accent,
-// preview swatch colours [bg, surface, accent], and an optional coordinated wallpaper.
-// Add a palette block in theme.css + an entry here to ship a new theme.
-export const THEMES = [
-  { name: 'system', label: 'System', dark: null, accent: '#d97757', preview: ['#efede4', '#30302e', '#d97757'] },
-  { name: 'light', label: 'Light', dark: false, accent: '#d97757', preview: ['#efede4', '#fdfcf9', '#d97757'] },
-  { name: 'dark', label: 'Dark', dark: true, accent: '#d97757', preview: ['#262624', '#383836', '#d97757'] },
-  { name: 'matrix', label: 'Matrix', dark: true, accent: '#33ff77', wallpaper: 'matrix', preview: ['#000600', '#0a1e11', '#33ff77'] },
-  { name: 'nord', label: 'Nord', dark: true, accent: '#88c0d0', preview: ['#2e3440', '#3b4252', '#88c0d0'] },
-  { name: 'dracula', label: 'Dracula', dark: true, accent: '#bd93f9', preview: ['#282a36', '#44475a', '#bd93f9'] },
-  { name: 'rose', label: 'Rosé Pine', dark: true, accent: '#ebbcba', preview: ['#191724', '#26233a', '#ebbcba'] },
-  { name: 'synthwave', label: 'Synthwave', dark: true, accent: '#ff3ca8', wallpaper: 'synthwave', preview: ['#190b2e', '#2c1550', '#ff3ca8'] },
-  { name: 'solarized', label: 'Solarized', dark: false, accent: '#268bd2', preview: ['#fdf6e3', '#eee8d5', '#268bd2'] },
-];
-export const themeByName = (n) => THEMES.find(t => t.name === n) || THEMES[0];
+// The theme registry moved to themes.js so the phone shell at /m can share it.
+// Re-exported here because settings.js and others import it from main.js.
+export { THEMES, themeByName } from './themes.js';
 
 let curWallpaper = null;
 function applyWallpaper(kind) {
@@ -53,12 +43,7 @@ function applyWallpaper(kind) {
 }
 
 export function applyAppearance(a = state.config?.appearance || {}) {
-  const t = themeByName(a.theme || 'system');
-  const sysDark = matchMedia('(prefers-color-scheme: dark)').matches;
-  const dark = t.name === 'system' ? sysDark : !!t.dark;
-  document.documentElement.dataset.theme = t.name === 'system' ? (sysDark ? 'dark' : 'light') : t.name;
-  document.documentElement.dataset.mode = dark ? 'dark' : 'light';
-  document.documentElement.style.setProperty('--accent', a.accent || t.accent || '#d97757');
+  const dark = applyPalette(a);
   applyWallpaper(a.wallpaper);
   const tb = document.getElementById('tb-theme');
   if (tb) tb.innerHTML = dark ? icons.sun : icons.moon;
@@ -232,8 +217,9 @@ async function boot() {
   registerApp(benchApp);
   registerApp(modelsApp);
   registerApp(planner);
+  registerApp(finance);
   registerApp(settings);
-  renderDock(['home', '|', 'chat', 'agent', 'research', '|', 'planner', 'github', 'studio', 'vault', 'learn', 'bench', 'models', '|', 'files', 'terminal', 'projects', '|', 'settings']);
+  renderDock(['home', '|', 'chat', 'agent', 'research', '|', 'planner', 'finance', 'github', 'studio', 'vault', 'learn', 'bench', 'models', '|', 'files', 'terminal', 'projects', '|', 'settings']);
 
   // PWA: installable from the pairing link; the SW is a plain passthrough
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => { });

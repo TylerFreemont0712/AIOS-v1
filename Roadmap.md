@@ -53,6 +53,17 @@ endpoint, addressed as `provider:model`) it runs:
   `npm run check | audit | e2e` (11 e2e suites, mock-provider driven).
 
 ### Recently shipped (this update, 2026-07-20)
+- **Everyday assistant toolbelt** (2026-07-23) — a keyless, free-by-default suite for Chat
+  (and the Agent): **directions** (travel time/distance, home as default origin — OSM/OSRM,
+  Google key optional for transit), **find_places** (nearby POIs w/ distance), **weather**
+  (any place, Open-Meteo), **wikipedia**, **translate** (gtx, no key — for life in Japan),
+  **calculate** (safe parser, no eval), **convert** (units + live-FX currency), **datetime**
+  (tz + countdowns), **crawl_site** (native multi-page same-host crawl, query-rankable), and
+  **quick_note** (additive vault capture — never clobbers). New `server/geo.js` + `server/everyday.js`,
+  groups `maps`/`utility`, config `tools.maps` + `user.home`. Chat gains a curated **additive-write**
+  allowance (quick_note/vault_append/daily_log/task_add/event_add) — still no destructive writes
+  without the Agent's gate. Settings → Tools (Maps) + Profile (Home). `everyday.e2e` (50 hard checks
+  + 7 live probes: Takatsuki→Suma 1h3m/57km, USD→JPY, 須磨駅 geocode, ja→en, …).
 - **Bench + auto-routing + Models v2** — deterministic per-category local-model leaderboard,
   `auto:<category>`/`local:<alias>` model refs with on-demand llama-server swapping, and the
   desktop llama-launcher fully re-implemented as the in-browser **Models** app.
@@ -77,6 +88,18 @@ endpoint, addressed as `provider:model`) it runs:
   — a no-tools planning turn proposes a numbered step plan and blocks; you approve (editing the
   plan inline), or reject, before any tool runs. `plan.e2e` (18 checks) covers approve+edit,
   reject, and the no-tools planning turn.
+- **Tool-using Chat** — Chat now has a bounded **read-only** tool loop (web_search, fetch_url,
+  vault/wiki, mail, agenda, learning reads) with a per-chat **Tools** toggle (default on) and an
+  anti-refusal system nudge, so it actually searches for news/current facts instead of declining.
+  Write/filesystem tools stay Agent-only. `chat: read-only tool belt` audit check + `chat-tools.e2e`
+  (16 checks); web_search verified live through the chat path.
+- **Chat personalization + organization** — a configurable **base system prompt** applied to every
+  chat (Settings → Chat) with a stronger "search before answering time-sensitive questions" rule +
+  a temporal-query heuristic that forces web_search; an **auto-learned user profile** (communication
+  style, preferences, facts) stored in the vault (`About Me.md`) and injected into chat/agent —
+  editable, background-maintained, toggleable; and chat **organization**: folders (collapsible,
+  rename), rename chats, **Delete-key**, and right-click **multi-select** delete/move. Wider "You"
+  bubble. `profile: learned user profile` audit check + `chat-personal.e2e` (13 checks).
 
 ---
 

@@ -9,7 +9,7 @@
 
 | Thing | Finding |
 |---|---|
-| ComfyUI | `~/comfyui/ComfyUI`, **v0.25.0**, custom nodes installed (kjnodes, rgthree, frame-interpolation, custom-scripts) + LoRA-Manager config |
+| ComfyUI | `/mnt/projects/comfyui/ComfyUI` (moved off the home partition 2026-07-21), **v0.25.0**, custom nodes installed (kjnodes, rgthree, frame-interpolation, custom-scripts) + LoRA-Manager config |
 | Checkpoints | **None yet** — `models/checkpoints/` and `models/diffusion_models/` are empty placeholders. Nothing can generate until Phase 0. |
 | GPU | RTX 3070 Ti Laptop, **8 GB VRAM** |
 | VRAM today | **~6.5 GB used by `ornith-9b`** (llama-server: Q5_K_M, 32k ctx, q8 KV cache, `-ngl auto`) |

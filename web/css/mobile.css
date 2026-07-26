@@ -1,0 +1,209 @@
+/* Phone shell — loaded ONLY by /m (mobile.html). Nothing here is imported by the
+   desktop shell, and the only thing shared in the other direction is theme.css,
+   whose custom properties this file consumes. It restates html/body sizing in
+   dvh, which is safe because only /m ever loads this file.
+
+   Written for iOS Safari first: dvh units (the 100vh toolbar bug), safe-area
+   insets for the notch and home indicator, 16px minimum font size on inputs so
+   focus never triggers auto-zoom, and 42px+ tap targets. */
+
+/* A fixed app shell, the way a native screen behaves: the document is pinned to
+   the viewport and never scrolls, so there is no baseline page scroll and no
+   rubber-banding. Exactly one region (.m-scroll) scrolls, and only when its
+   content genuinely overflows.
+
+   theme.css already sets html,body{height:100%;overflow:hidden} for the desktop;
+   that is what we want here too, but in dvh so iOS Safari's retracting toolbar
+   does not leave a gap. */
+html, body {
+  height: 100dvh;
+  overflow: hidden;
+}
+
+.m-body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  /* Stop iOS bumping font sizes in landscape. */
+  -webkit-text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.m-app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+/* The only scrolling box on the page. min-height:0 is required or a flex child
+   refuses to shrink below its content and pushes the shell taller. */
+.m-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding-bottom: calc(12px + env(safe-area-inset-bottom));
+}
+
+/* ---------- header ---------- */
+
+.m-head {
+  z-index: 5;
+  flex: none;
+  padding: calc(8px + env(safe-area-inset-top)) 15px 8px;
+  background: color-mix(in srgb, var(--bg) 90%, transparent);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+}
+.m-head-row { display: flex; align-items: center; gap: 10px; }
+.m-title { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
+.m-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex: none;
+  background: var(--faint); transition: background .2s;
+}
+.m-dot.is-up { background: var(--ok); }
+.m-dot.is-down { background: var(--err); }
+.m-grow { flex: 1; }
+.m-sub { font-size: 12px; color: var(--muted); margin-top: 3px; font-variant-numeric: tabular-nums; }
+
+/* ---------- capture ---------- */
+
+.m-capture { flex: none; padding: 12px 15px 8px; display: flex; flex-direction: column; gap: 8px; }
+.m-btn-big {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  width: 100%; min-height: 48px; padding: 0 16px;
+  font-size: 15.5px; font-weight: 600; font-family: inherit;
+  border-radius: 12px; border: 1px solid var(--border);
+  background: var(--surface-2); color: var(--text);
+  cursor: pointer; -webkit-appearance: none;
+  transition: transform .08s, background .15s;
+}
+.m-btn-big:active { transform: scale(.985); background: var(--surface-3); }
+.m-btn-big.is-primary {
+  background: var(--accent); border-color: transparent; color: var(--accent-text);
+  box-shadow: 0 6px 20px -8px color-mix(in srgb, var(--accent) 70%, transparent);
+}
+.m-btn-big:disabled { opacity: .5; pointer-events: none; }
+.m-btn-big svg { width: 18px; height: 18px; flex: none; }
+.m-hint { font-size: 11.5px; color: var(--faint); text-align: center; margin: 2px 0 0; line-height: 1.45; }
+
+/* ---------- queue + receipt cards ---------- */
+
+.m-section { padding: 12px 15px 0; }
+.m-section-title {
+  font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--muted); margin: 0 0 7px;
+}
+.m-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+
+.m-card {
+  display: flex; gap: 10px; padding: 9px;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 11px;
+}
+.m-card.is-failed { border-color: color-mix(in srgb, var(--err) 45%, var(--border)); }
+.m-card.is-applied { opacity: .62; }
+.m-thumb {
+  width: 44px; height: 58px; flex: none; object-fit: cover;
+  border-radius: 8px; background: var(--surface-3); border: 1px solid var(--border);
+}
+.m-thumb-ph {
+  width: 44px; height: 58px; flex: none; border-radius: 8px;
+  background: var(--surface-3); border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center; color: var(--faint); font-size: 20px;
+}
+.m-card-main { flex: 1; min-width: 0; }
+.m-merchant { font-size: 14px; font-weight: 600; line-height: 1.25; }
+.m-meta { font-size: 11.5px; color: var(--muted); margin-top: 2px; font-variant-numeric: tabular-nums; }
+.m-total { font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 4px; }
+.m-err { font-size: 11.5px; color: var(--err); margin-top: 3px; line-height: 1.4; }
+
+/* Progress line for an item that is still being processed. */
+.m-status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin-top: 3px; }
+.m-spin {
+  width: 13px; height: 13px; flex: none; border-radius: 50%;
+  border: 2px solid var(--border-strong); border-top-color: var(--accent);
+  animation: m-spin .7s linear infinite;
+}
+@keyframes m-spin { to { transform: rotate(360deg); } }
+
+.m-items { margin: 5px 0 0; padding: 0; list-style: none; }
+.m-items > li {
+  display: flex; justify-content: space-between; gap: 10px;
+  font-size: 11.5px; color: var(--muted); padding: 1px 0;
+  font-variant-numeric: tabular-nums;
+}
+.m-items-more { font-size: 12px; color: var(--faint); }
+
+.m-actions { display: flex; gap: 7px; margin-top: 8px; }
+.m-btn {
+  flex: 1; min-height: 42px; padding: 0 11px;
+  font-size: 14px; font-weight: 600; font-family: inherit;
+  border-radius: 10px; border: 1px solid var(--border);
+  background: var(--surface-3); color: var(--text);
+  cursor: pointer; -webkit-appearance: none;
+}
+.m-btn:active { transform: scale(.98); }
+.m-btn.is-primary { background: var(--accent); border-color: transparent; color: var(--accent-text); }
+.m-btn:disabled { opacity: .5; pointer-events: none; }
+.m-btn-ghost {
+  min-height: 36px; padding: 0 10px; font-size: 13px; font-weight: 500;
+  border-radius: 9px; border: 1px solid transparent;
+  background: transparent; color: var(--muted); font-family: inherit; cursor: pointer;
+}
+
+/* ---------- category chips ---------- */
+
+.m-chips { display: flex; gap: 5px; overflow-x: auto; margin: 7px -2px 0; padding: 2px; scrollbar-width: none; }
+.m-chips::-webkit-scrollbar { display: none; }
+.m-chip {
+  flex: none; min-height: 29px; padding: 0 11px;
+  border-radius: 15px; border: 1px solid var(--border);
+  background: var(--surface-3); color: var(--muted);
+  font-size: 12px; font-family: inherit; white-space: nowrap; cursor: pointer;
+}
+.m-chip.is-on { background: var(--accent); border-color: transparent; color: var(--accent-text); font-weight: 600; }
+
+/* ---------- misc ---------- */
+
+.m-empty { font-size: 13px; color: var(--muted); text-align: center; padding: 26px 18px; line-height: 1.5; }
+.m-empty-hint { font-size: 12px; color: var(--faint); margin-top: 5px; }
+
+.m-toast {
+  position: fixed; left: 50%; transform: translateX(-50%);
+  bottom: calc(20px + env(safe-area-inset-bottom));
+  z-index: 40; max-width: calc(100vw - 32px);
+  padding: 11px 16px; border-radius: 12px;
+  background: var(--surface-3); border: 1px solid var(--border-strong); color: var(--text);
+  font-size: 14px; box-shadow: var(--shadow); text-align: center;
+  animation: m-rise .18s ease-out;
+}
+.m-toast.is-ok { border-color: color-mix(in srgb, var(--ok) 55%, transparent); }
+.m-toast.is-err { border-color: color-mix(in srgb, var(--err) 55%, transparent); }
+@keyframes m-rise { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
+.m-foot { padding: 18px 15px 4px; text-align: center; }
+.m-foot a { color: var(--faint); font-size: 12.5px; text-decoration: none; }
+.m-foot a:active { color: var(--accent); }
+
+/* ---------- pairing ---------- */
+
+/* The pairing screen is the whole shell (no header), so it owns the scrolling and
+   the top inset itself. */
+.m-pair {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: calc(30px + env(safe-area-inset-top)) 20px calc(20px + env(safe-area-inset-bottom));
+  text-align: center;
+}
+.m-pair h2 { font-size: 17px; margin: 0 0 7px; }
+.m-pair p { font-size: 13.5px; color: var(--muted); line-height: 1.55; margin: 0 0 15px; }
+.m-pair input {
+  width: 100%; min-height: 48px; padding: 0 14px; margin-bottom: 11px;
+  /* 16px minimum: anything smaller makes iOS zoom the page on focus. */
+  font-size: 16px; font-family: var(--mono);
+  border-radius: 11px; border: 1px solid var(--border);
+  background: var(--surface-2); color: var(--text); -webkit-appearance: none;
+}

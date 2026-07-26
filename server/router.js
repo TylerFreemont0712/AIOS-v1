@@ -245,6 +245,7 @@ export function routingInfo() {
     status: llmStatus(),
     serving: servingAlias(),
     routing: { autoSwitch: cfg.llm?.routing?.autoSwitch !== false },
+    reasoning: cfg.llm?.reasoning || { default: 'off', byModel: {} },
     candidates: candidates(),
     mmproj: listMmproj().map(m => m.file),
     table: routeTable(),
