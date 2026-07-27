@@ -1,8 +1,8 @@
 // Models v2: the llama-launcher, fully absorbed. Per-model structured presets
 // (context, offload, KV quant, threads, batching, flash-attn, vision projector,
 // extra flags), live GPU/VRAM, the server log pane, fit hints from the 8GB VRAM
-// math, bench standings, and the auto-routing table. Serving is one click — and
-// mostly unnecessary, because local:<alias> refs auto-serve on demand anywhere.
+// math, and bench standings. Serving is one click — and mostly unnecessary, because
+// local:<alias> refs auto-serve on demand anywhere.
 
 import { el, icon, toast, modal, timeAgo } from '../ui.js';
 import { get, post, put } from '../api.js';
@@ -66,26 +66,12 @@ export default {
         return;
       }
 
-      // seamless-serving explainer + routing table
-      const cats = Object.entries(inf.table || {});
+      // seamless-serving explainer. The bench-driven "auto:<category>" routing table
+      // that used to sit here is gone; per-category winners live in the Bench app.
       ui.main.append(el('div', { class: 'bench-best' },
-        el('div', { class: 'row', style: { gap: '10px', alignItems: 'center' } },
-          el('div', { class: 'learn-lbl grow' }, 'AUTO-ROUTING'),
-          el('label', { class: 'row small muted', style: { gap: '6px' } },
-            el('input', { type: 'checkbox', checked: inf.routing.autoSwitch, onchange: async (e) => {
-              try { await put('/config', { llm: { routing: { autoSwitch: e.target.checked } } }); refresh(); }
-              catch (err2) { toast(err2.message, 'err'); }
-            } }),
-            'auto:​ categories may swap models')),
-        cats.length
-          ? el('div', { class: 'row', style: { gap: '7px', flexWrap: 'wrap' } },
-            ...cats.map(([cat, w]) => el('div', { class: 'bench-best-chip' + (w.serving ? ' serving' : '') },
-              el('span', { class: 'bench-best-cat' }, 'auto:' + cat),
-              el('span', { class: 'mono' }, w.file.replace(/\.gguf$/, '').slice(0, 22)),
-              el('span', { class: 'learn-tag sm ' + (cat === 'fast' ? '' : pctCls(w.score)) }, cat === 'fast' ? w.score + ' t/s' : fmt(w.score)))))
-          : el('div', { class: 'muted small' }, 'No bench data yet — run Bench once to fill this table.'),
+        el('div', { class: 'learn-lbl' }, 'SERVING'),
         el('div', { class: 'muted small' },
-          'Every model below is always available everywhere as “local:​…” in model pickers — pick one and it is served automatically on demand (in-flight generations are never interrupted). Manual Serve exists for pre-loading.')));
+          'Every model below is available everywhere as “local:​…” in model pickers — pick one and it is served automatically on demand (in-flight generations are never interrupted). Manual Serve exists for pre-loading.')));
 
       // the garage
       for (const m of inf.candidates || []) ui.main.append(modelCard(m, inf));

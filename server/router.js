@@ -1,12 +1,16 @@
-// Automatic model routing: `auto:<category>` model refs resolve to the best LOCAL
-// model for that kind of work — as measured by the Bench suite, not by vibes — and
-// the managed llama-server is swapped to it when needed.
+// Seamless local model serving: a `local:<alias>` ref names one exact gguf, and asking
+// for it is enough — llama-server is swapped to that model on demand (never
+// mid-generation) and the ref is rewritten to the concrete provider ref the app calls.
+// So every local model is selectable from every picker with no manual serve/unserve.
 //
-// The contract: pick "Auto — coding" once in any model picker, and from then on the
-// harness (a) looks up which local gguf currently wins the coding category, (b) swaps
-// llama-server to it if something else is loaded (never mid-generation), and (c)
-// resolves to the concrete provider ref the app actually calls. No bench data → the
-// currently-served model wins by default, so auto never strands a request.
+// This module also owns LLM auto-setup: a new gguf lands in the folder and a model
+// reads its filename and size to propose serving args, tags and an mmproj pairing.
+//
+// It used to own `auto:<category>` routing as well — bench-driven pseudo-models that
+// picked a winner per request. Removed 2026-07-27: ten extra entries in every model
+// picker to express a preference the Local list already expresses directly, and the
+// per-category bench winners it displayed are in the Bench app anyway. legacyAutoRef()
+// is all that remains, so refs saved before the removal still resolve.
 
 import os from 'node:os';
 import { loadConfig, updateConfig } from './config.js';
@@ -26,19 +30,6 @@ function selfHosts() {
   }
   return hosts;
 }
-
-export const AUTO_CATEGORIES = [
-  ['best', 'highest overall score'],
-  ['fast', 'highest measured tok/s'],
-  ['coding', 'best at writing working code'],
-  ['reasoning', 'best at multi-step reasoning'],
-  ['agent', 'best at tool calling'],
-  ['structure', 'best at strict JSON'],
-  ['accuracy', 'best at exact extraction'],
-  ['instructions', 'best at format obedience'],
-  ['context', 'best at long-context retrieval'],
-  ['judgment', 'least likely to fabricate — refuses false premises'],
-];
 
 /** The custom provider entry that points at the managed llama-server's port. */
 export function localProviderId() {
@@ -92,52 +83,25 @@ export function candidates() {
   });
 }
 
-/** category → winning local model, by bench data. Only benched models can win. */
-export function routeTable() {
-  const cands = candidates().filter(c => c.bench);
-  const pick = (score) => cands.filter(c => score(c) !== undefined && score(c) !== null)
-    .sort((a, b) => score(b) - score(a) || b.bench.overall - a.bench.overall)[0] || null;
-  const table = {};
-  for (const [cat] of AUTO_CATEGORIES) {
-    const win = cat === 'best' ? pick(c => c.bench.overall)
-      : cat === 'fast' ? pick(c => c.bench.tokS)
-        : pick(c => c.bench.categories[cat]);
-    if (win) {
-      table[cat] = {
-        file: win.file, path: win.path, alias: win.alias, serving: win.serving,
-        score: cat === 'fast' ? win.bench.tokS : (cat === 'best' ? win.bench.overall : win.bench.categories[cat]),
-      };
-    }
-  }
-  return table;
-}
-
-/** Resolve auto:<category> to a concrete `custom_x:alias` ref, swapping the served
- *  model when allowed and safe. Never switches while llama is mid-generation. */
-export async function resolveAuto(category) {
-  const cfg = loadConfig();
+/**
+ * What a pre-removal `auto:<category>` ref should resolve to now.
+ *
+ * Old chats and agent sessions still carry these, and a saved transcript must not stop
+ * working because the routing feature went away. Preference order: whatever
+ * llama-server is already serving (no swap, no load wait), then the configured default
+ * chat model, then the smallest local gguf.
+ */
+export async function legacyAutoRef() {
   const prov = localProviderId();
-  if (!prov) throw err('auto routing needs a custom provider pointing at the managed llama-server (Settings → Providers)');
-  const cat = AUTO_CATEGORIES.some(([c]) => c === category) ? category : 'best';
-  const target = routeTable()[cat];
-  const current = servingAlias();
+  const current = prov ? servingAlias() : '';
+  if (prov && current) return `${prov}:${current}`;
 
-  if (!target) {
-    if (current) return `${prov}:${current}`;   // no bench data — whatever serves, serves
-    throw err('nothing is serving and there is no bench data to pick a model — run Bench once, or start a model in the Models app');
-  }
-  if (target.serving) return `${prov}:${servingAlias() || target.alias}`;
+  const dflt = String(loadConfig().defaults?.chatModel || '').trim();
+  if (dflt && !dflt.startsWith('auto:')) return dflt;
 
-  const autoSwitch = cfg.llm?.routing?.autoSwitch !== false;
-  if (!current) {                                // nothing up: boot the winner regardless
-    await startModel(target.path);
-    return `${prov}:${servingAlias()}`;
-  }
-  if (autoSwitch && !(await llamaBusy())) {
-    await startModel(target.path);               // waits for /health — first call pays the load time
-    return `${prov}:${servingAlias()}`;
-  }
-  return `${prov}:${current}`;                   // busy or switching disabled — degrade gracefully
+  const smallest = listLocalModels().sort((a, b) => a.sizeGB - b.sizeGB)[0];
+  if (smallest) return `local:${modelAlias(smallest.file)}`;
+  throw err('this chat was saved with the old "Auto" model setting, which has been removed — pick a model from the picker');
 }
 
 /** Make sure llama-server is answering as `alias`, swapping if needed. Waits out an
@@ -244,11 +208,8 @@ export function routingInfo() {
     provider: localProviderId(),
     status: llmStatus(),
     serving: servingAlias(),
-    routing: { autoSwitch: cfg.llm?.routing?.autoSwitch !== false },
     reasoning: cfg.llm?.reasoning || { default: 'off', byModel: {} },
     candidates: candidates(),
     mmproj: listMmproj().map(m => m.file),
-    table: routeTable(),
-    autoRefs: AUTO_CATEGORIES.map(([c, why]) => ({ ref: `auto:${c}`, category: c, why })),
   };
 }

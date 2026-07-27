@@ -158,6 +158,7 @@ export function menu(x, y, items) {
 // ---------- model picker ----------
 
 import { get, mediaUrl } from './api.js';
+import { isImageFile } from './imageprep.js';
 
 let modelCache = null;
 export async function fetchModels(force = false) {
@@ -173,7 +174,10 @@ export async function fetchModels(force = false) {
  */
 export function modelPicker(opts = {}) {
   let value = opts.value || (opts.storageKey && localStorage.getItem('aios.model.' + opts.storageKey)) || '';
-  const nameSpan = el('span', { class: 'name' }, prettyModel(value) || 'choose model');
+  // allowEmpty: '' is a meaningful value (inherit whatever the default is) rather
+  // than "nothing picked yet". Used by optional per-feature model overrides.
+  const placeholder = opts.placeholder || (opts.allowEmpty ? 'default' : 'choose model');
+  const nameSpan = el('span', { class: 'name' }, prettyModel(value) || placeholder);
   const pill = el('button', { class: 'model-pick', title: 'Choose model' }, icon('cpu'), nameSpan, icon('chevD'));
 
   pill.addEventListener('click', async (e) => {
@@ -191,6 +195,9 @@ export function modelPicker(opts = {}) {
         onclick: () => setVal(m.ref),
       });
     }
+    if (opts.allowEmpty) {
+      items.unshift({ label: (value ? '' : '✓ ') + placeholder, onclick: () => setVal('') });
+    }
     items.push('-');
     items.push({ label: 'Refresh model list', icon: 'refresh', onclick: async () => { await fetchModels(true); toast('models refreshed'); } });
     const r = pill.getBoundingClientRect();
@@ -199,20 +206,27 @@ export function modelPicker(opts = {}) {
 
   function setVal(ref) {
     value = ref;
-    nameSpan.textContent = prettyModel(ref);
+    nameSpan.textContent = prettyModel(ref) || placeholder;
     if (opts.storageKey) localStorage.setItem('aios.model.' + opts.storageKey, ref);
     opts.onchange?.(ref);
   }
   pill.getValue = () => value;
-  pill.setValue = (ref) => { value = ref; nameSpan.textContent = prettyModel(ref) || 'choose model'; };
+  pill.setValue = (ref) => { value = ref; nameSpan.textContent = prettyModel(ref) || placeholder; };
 
   // Default to the first available model instead of sitting on "choose model".
   // Also recovers if the stored ref points at a model that's no longer available.
-  (async () => {
-    const models = await fetchModels();
-    if (!models.length) return;
-    if (!value || !models.some(m => m.ref === value)) setVal(models[0].ref);
-  })();
+  //
+  // Skipped for allowEmpty pickers: there, empty is a real choice ("inherit the
+  // default"), and auto-selecting would both misreport the setting and fire
+  // onchange on mount — which for a settings panel means silently writing config
+  // the moment the tab is opened.
+  if (!opts.allowEmpty) {
+    (async () => {
+      const models = await fetchModels();
+      if (!models.length) return;
+      if (!value || !models.some(m => m.ref === value)) setVal(models[0].ref);
+    })();
+  }
 
   return pill;
 }
@@ -300,7 +314,7 @@ export function attachTray(opts = {}) {
     node.innerHTML = '';
     node.style.display = items.length ? '' : 'none';
     for (const it of items) {
-      const isImg = it.file.type.startsWith('image/');
+      const isImg = !!it.url;
       const thumb = isImg
         ? el('img', { class: 'att-thumb', src: it.url })
         : el('span', { class: 'att-ico' }, icon('file'));
@@ -319,7 +333,9 @@ export function attachTray(opts = {}) {
       for (const f of files) {
         if (!f) continue;
         if (items.some(x => x.file.name === f.name && x.file.size === f.size)) continue;
-        items.push({ file: f, url: f.type.startsWith('image/') ? URL.createObjectURL(f) : null });
+        // isImageFile, not `type.startsWith('image/')`: an iPhone photo often arrives
+        // with an EMPTY type, which used to show as a generic file chip with no preview.
+        items.push({ file: f, url: isImageFile(f) ? URL.createObjectURL(f) : null });
       }
       render(); opts.onchange?.();
     },

@@ -1,6 +1,6 @@
 // Settings: profile, appearance, providers, tools, vault, agent defaults, network & security.
 
-import { el, icon, toast, askText, confirmBox, modal, fetchModels } from '../ui.js';
+import { el, icon, toast, askText, confirmBox, modal, fetchModels, modelPicker, prettyModel } from '../ui.js';
 import { get, put, post, del } from '../api.js';
 import { state, refreshConfig, refreshStatus, on } from '../state.js';
 import { applyAppearance, THEMES } from '../main.js';
@@ -24,6 +24,7 @@ export default {
       ['github', 'GitHub', 'github'],
       ['mail', 'Mail & Alerts', 'send'],
       ['agent', 'Agent', 'agent'],
+      ['finance', 'Finances', 'graph'],
       ['network', 'Network & Security', 'network'],
       ['profile', 'Profile', 'user'],
       ['about', 'About', 'sparkle'],
@@ -137,7 +138,7 @@ export default {
           el('div', { class: 'row' }, olUrl, olBtn)));
 
         // Custom OpenAI-compatible providers & gateways
-        ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '18px' } }, 'OPENAI-COMPATIBLE PROVIDERS & GATEWAYS (Agnes AI, OpenRouter, Groq, LM Studio, vLLM, llama.cpp…)'));
+        ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '18px' } }, 'OPENAI-COMPATIBLE PROVIDERS & GATEWAYS (OpenRouter, Groq, LM Studio, vLLM, llama.cpp…)'));
         for (const p of c.providers.custom) {
           const meta = p.baseUrl + (p.models?.length ? ` · ${p.models.join(', ')}` : '');
           ui.panel.append(row(p.name, meta, el('button', {
@@ -152,7 +153,6 @@ export default {
             // known OpenAI-compatible gateways — pick one to auto-fill, or Custom
             const PRESETS = [
               { label: 'Custom / other…' },
-              { label: 'Agnes AI', name: 'Agnes AI', baseUrl: 'https://apihub.agnes-ai.com/v1', models: 'agnes-2.0-flash' },
               { label: 'OpenRouter', name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1' },
               { label: 'Groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' },
               { label: 'Together AI', name: 'Together AI', baseUrl: 'https://api.together.xyz/v1' },
@@ -164,7 +164,7 @@ export default {
             const nameIn = el('input', { class: 'input', placeholder: 'My provider', style: { width: '100%' } });
             const urlIn = el('input', { class: 'input', placeholder: 'https://…/v1', style: { width: '100%' } });
             const keyIn = el('input', { class: 'input', type: 'password', placeholder: 'Bearer key — blank if none', style: { width: '100%' } });
-            const modelsIn = el('input', { class: 'input', placeholder: 'agnes-2.0-flash, … (optional)', style: { width: '100%' } });
+            const modelsIn = el('input', { class: 'input', placeholder: 'model-id, … (optional)', style: { width: '100%' } });
             const preset = el('select', {
               class: 'input select', style: { width: '100%' },
               onchange: () => { const pr = PRESETS[preset.selectedIndex] || {}; nameIn.value = pr.name || ''; urlIn.value = pr.baseUrl || ''; modelsIn.value = pr.models || ''; },
@@ -177,7 +177,7 @@ export default {
               fld('Name', nameIn),
               fld('Base URL', urlIn, 'The OpenAI-compatible endpoint, usually ending in /v1.'),
               fld('API key', keyIn),
-              fld('Models', modelsIn, 'Comma-separated. Needed only when the endpoint has no /models list (e.g. Agnes AI); otherwise leave blank to auto-discover.'));
+              fld('Models', modelsIn, 'Comma-separated. Needed only when the endpoint serves no /models list; otherwise leave blank to auto-discover.'));
             const res = await modal({
               title: 'Connect an AI provider', wide: true, body,
               actions: [
@@ -504,6 +504,143 @@ export default {
         ui.panel.append(el('div', { class: 'set-block' },
           el('div', { class: 'set-name' }, 'What the AI knows about you'), profMeta,
           profTa, el('div', { class: 'row', style: { marginTop: '6px', gap: '8px' } }, profSave, profLearn)));
+      }
+
+      if (S.tab === 'finance') {
+        ui.panel.append(
+          el('h2', {}, 'Finances'),
+          el('div', { class: 'desc' }, 'Which model does each job, and the currency everything is compared in.'));
+
+        const fin = c.finance || {};
+
+        // --- models ---
+        // Three jobs, three settings, because the requirements differ: only
+        // receipt reading needs vision. The recommendation still points all three
+        // at one model — see server/finance.js modelOptions().
+        const recBox = el('div', { class: 'set-block' }, el('div', { class: 'set-sub' }, 'checking your models…'));
+        ui.panel.append(recBox);
+
+        const JOBS = [
+          ['ocrModel', 'Reading receipts', 'Turns a photograph into merchant, date and line items. This one must be vision-capable — a text-only model cannot see the image.', true],
+          ['itemModel', 'Naming products', 'Decides that "明治おいしい牛乳" is Milk. Wants strict JSON and comfortable Japanese.'],
+          ['recapModel', 'Monthly write-ups', 'Writes the short account of each month you read back later. Wants readable prose.'],
+        ];
+
+        let visionRefs = new Set();
+        const pickers = {};
+        for (const [key, name, sub, needsVision] of JOBS) {
+          const warn = el('div', { class: 'set-sub', style: { color: 'var(--warn)', marginTop: '4px' } });
+          const sync = (ref) => {
+            warn.textContent = needsVision && ref
+              && visionRefs.size && ref.startsWith('local:') && !visionRefs.has(ref)
+              ? 'This local model has no projector paired with it, so it cannot read images. Pair one in Settings → Models, or pick a vision model.'
+              : '';
+          };
+          const p = modelPicker({
+            value: fin[key] || '', allowEmpty: true, placeholder: 'chat default',
+            onchange: async (ref) => { await save({ finance: { [key]: ref } }); sync(ref); },
+          });
+          pickers[key] = { picker: p, sync };
+          ui.panel.append(el('div', { class: 'set-row' },
+            el('div', { class: 'set-info' },
+              el('div', { class: 'set-name' }, name),
+              el('div', { class: 'set-sub' }, sub),
+              warn),
+            el('div', { class: 'set-ctl' }, p)));
+          sync(fin[key] || '');
+        }
+        ui.panel.append(el('div', { class: 'set-sub', style: { marginTop: '-4px' } },
+          `Left unset, each falls back to the chat default (${prettyModel(c.defaults?.chatModel) || 'none chosen'}).`));
+
+        (async () => {
+          try {
+            const o = await get('/finance/models');
+            visionRefs = new Set(o.vision.map(v => v.ref));
+            for (const [key] of JOBS) pickers[key].sync(fin[key] || '');
+            recBox.innerHTML = '';
+            if (!o.recommended) {
+              recBox.append(el('div', { class: 'set-name' }, 'No vision model available'),
+                el('div', { class: 'set-sub' }, o.note || 'Receipt reading needs a model paired with a projector.'));
+              return;
+            }
+            const r = o.recommended;
+            const already = [...JOBS].every(([k]) => (fin[k] || '') === r[k]);
+            recBox.append(
+              el('div', { class: 'set-name' }, already ? 'Recommended setup — in use' : 'Recommended setup'),
+              el('div', { class: 'set-sub' }, r.why),
+              already ? null : el('div', { class: 'row', style: { marginTop: '8px' } },
+                el('button', {
+                  class: 'btn sm primary',
+                  onclick: async () => {
+                    if (await save({ finance: { ocrModel: r.ocrModel, itemModel: r.itemModel, recapModel: r.recapModel } },
+                      'finance models set')) renderPanel();
+                  },
+                }, icon('sparkle'), `Use ${prettyModel(r.ocrModel)} for all three`)));
+          } catch (e) {
+            recBox.innerHTML = '';
+            recBox.append(el('div', { class: 'set-sub' }, `could not check models: ${e.message}`));
+          }
+        })();
+
+        // --- currency ---
+        ui.panel.append(el('h2', { style: { marginTop: '22px' } }, 'Currency'),
+          el('div', { class: 'desc' },
+            'Every total is converted into the base currency when it is written, so a mixed-currency month adds up correctly. Changing a rate affects future entries only — past ones keep the rate they were recorded at.'));
+
+        const baseIn = el('input', { class: 'input', value: fin.baseCurrency || 'JPY', maxlength: 3, style: { width: '90px', textTransform: 'uppercase' } });
+        ui.panel.append(row('Base currency', 'The currency the app thinks in.',
+          el('div', { class: 'row', style: { gap: '8px' } }, baseIn,
+            el('button', {
+              class: 'btn sm primary',
+              onclick: async () => {
+                const v = baseIn.value.trim().toUpperCase();
+                if (!/^[A-Z]{3}$/.test(v)) return toast('Use a three-letter code like JPY', 'err');
+                if (await save({ finance: { baseCurrency: v } }, 'base currency set')) renderPanel();
+              },
+            }, 'Set'))));
+
+        const ratesBox = el('div', { class: 'set-block' }, el('div', { class: 'set-sub' }, 'loading rates…'));
+        ui.panel.append(ratesBox);
+        (async () => {
+          try {
+            const s = await get('/finance/settings');
+            ratesBox.innerHTML = '';
+            ratesBox.append(
+              el('div', { class: 'set-name' }, `Exchange rates (units of ${s.base} per 1)`),
+              el('div', { class: 'set-sub' }, 'These start from a built-in table and are approximate. Correct any you actually use.'));
+            const inputs = {};
+            const grid = el('div', { class: 'fin-rate-grid' });
+            for (const code of s.codes) {
+              if (code === s.base) continue;
+              const inp = el('input', { class: 'input sm', type: 'number', step: 'any', value: s.rates[code] });
+              inputs[code] = inp;
+              grid.append(el('label', { class: 'fin-rate' }, el('span', {}, code), inp));
+            }
+            ratesBox.append(grid, el('div', { class: 'row', style: { marginTop: '8px', gap: '8px' } },
+              el('button', {
+                class: 'btn sm primary',
+                onclick: async () => {
+                  const rates = {};
+                  for (const [code, inp] of Object.entries(inputs)) {
+                    const v = Number(inp.value);
+                    if (Number.isFinite(v) && v > 0) rates[code] = v;
+                  }
+                  await save({ finance: { rates } }, 'rates saved');
+                },
+              }, 'Save rates'),
+              el('button', {
+                class: 'btn sm', onclick: async () => {
+                  const code = (await askText({ title: 'Add a currency', placeholder: 'e.g. KRW', ok: 'Add' }) || '').trim().toUpperCase();
+                  if (!/^[A-Z]{3}$/.test(code)) return;
+                  await save({ finance: { rates: { [code]: 1 } } }, `${code} added — set its rate`);
+                  renderPanel();
+                },
+              }, icon('plus'), 'Add currency')));
+          } catch (e) {
+            ratesBox.innerHTML = '';
+            ratesBox.append(el('div', { class: 'set-sub' }, `could not load rates: ${e.message}`));
+          }
+        })();
       }
 
       if (S.tab === 'agent') {

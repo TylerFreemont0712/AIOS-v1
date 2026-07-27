@@ -1,29 +1,16 @@
 // Phone view: photograph receipts, let the AIOS box read them, file them under
 // Finances. Served only at /m — the desktop shell never loads this.
 //
-// Two iPhone-specific problems this solves, both of which break a naive
-// <input type="file"> upload:
-//
-//  1. HEIC. iPhone cameras save HEIC/HEIF. Safari *usually* transcodes to JPEG
-//     when you pick from the library, but not always (it depends on the iOS
-//     version and whether the camera is set to "Most Compatible"), and never for
-//     files shared in from other apps. server/uploads.js only classifies
-//     png/jpeg/gif/webp as `image`, so a HEIC upload lands as kind:"other" and
-//     the vision model never sees it.
-//  2. Size. A 12MP photo is 3-5 MB, and the JSON upload path base64-encodes it,
-//     inflating by a third — slow over Wi-Fi and pointless for OCR.
-//
-// Both are fixed the same way: decode the photo locally, draw it to a canvas at
-// a sane resolution, and re-encode as JPEG before upload. Safari can always
-// decode HEIC (it is the OS format), so the canvas round-trip is also the
-// conversion. EXIF rotation is honoured so a portrait receipt is not read
-// sideways.
+// The iPhone-specific photo handling (HEIC, EXIF rotation, downscaling before upload)
+// now lives in ../imageprep.js, shared with the desktop shell's attach points — the
+// phone was the only place that got it right for a while, which is exactly why a
+// receipt photographed from the desktop view used to fail. What stays here is the
+// iOS *picker* handling, which is genuinely specific to this screen: see makePicker().
 
-import { get, post, setToken } from '../api.js';
+import { get, post, patch, setToken, uploadBlob } from '../api.js';
 import { applyPalette } from '../themes.js';
+import { IMAGE_ACCEPT, prepareImage, isImageFile, undecodableHint } from '../imageprep.js';
 
-const LONG_EDGE = 1600;      // plenty for receipt text; keeps uploads ~300-600 KB
-const JPEG_QUALITY = 0.85;
 const MAX_BATCH = 12;        // server caps attachments at 12 per message
 
 const app = document.getElementById('m-app');
@@ -74,84 +61,6 @@ function toast(msg, kind = '') {
 
 const money = (n) => `${state.currency} ${Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
 
-// ---------- image pipeline ----------
-
-/** Decode a File into something canvas-drawable, honouring EXIF orientation.
- *  Three attempts, because no single path covers every iPhone case:
- *    1. createImageBitmap with from-image orientation — fastest, off the main
- *       thread, but Safari has historically refused HEIC here.
- *    2. createImageBitmap without options — older Safari lacks the options arg.
- *    3. <img> + object URL — the reliable HEIC path, since HEIC is the OS format
- *       and WebKit can always render it into an element. iOS applies EXIF
- *       rotation to <img> itself.
- */
-async function decode(file) {
-  const errors = [];
-  if (typeof createImageBitmap === 'function') {
-    for (const opts of [{ imageOrientation: 'from-image' }, undefined]) {
-      try { return await createImageBitmap(file, opts); }
-      catch (e) { errors.push(e.message); }
-    }
-  }
-  const url = URL.createObjectURL(file);
-  try {
-    const img = new Image();
-    await new Promise((res, rej) => {
-      img.onload = res;
-      img.onerror = () => rej(new Error('the browser could not render this file'));
-      img.src = url;
-    });
-    if (img.decode) { try { await img.decode(); } catch { /* already loaded */ } }
-    if (!img.naturalWidth) throw new Error('the browser decoded an empty image');
-    return img;
-  } catch (e) {
-    const ext = (file.name.match(/\.[A-Za-z0-9]+$/) || [''])[0].toLowerCase();
-    const heic = /heic|heif/.test(ext) || /heic|heif/i.test(file.type || '');
-    throw new Error(heic
-      ? 'This iPhone photo is in HEIC and Safari would not decode it here. '
-        + 'Set Settings → Camera → Formats to "Most Compatible" and retake it, '
-        + 'or share it out as JPEG.'
-      : `Could not read ${file.name || 'this file'}${ext ? ` (${ext})` : ''} as an image. ${e.message}`);
-  } finally {
-    setTimeout(() => URL.revokeObjectURL(url), 0);
-  }
-}
-
-/** Downscale to LONG_EDGE and re-encode as JPEG. Returns { blob, width, height }. */
-async function toJpeg(file) {
-  // A PDF or a video shared in from another app decodes to nothing useful; say so
-  // before spending a decode on it.
-  if (file.type && !/^image\//i.test(file.type) && !/heic|heif/i.test(file.type)) {
-    throw new Error(`${file.name || 'That file'} is a ${file.type}, not a photo. Receipts need an image.`);
-  }
-  const src = await decode(file);
-  const w0 = src.width || src.naturalWidth;
-  const h0 = src.height || src.naturalHeight;
-  if (!w0 || !h0) throw new Error('this file does not look like a photo');
-
-  const scale = Math.min(1, LONG_EDGE / Math.max(w0, h0));
-  const w = Math.max(1, Math.round(w0 * scale));
-  const h = Math.max(1, Math.round(h0 * scale));
-
-  const canvas = document.createElement('canvas');
-  canvas.width = w; canvas.height = h;
-  const ctx = canvas.getContext('2d', { alpha: false });
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(src, 0, 0, w, h);
-  src.close?.();
-
-  const blob = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', JPEG_QUALITY));
-  if (!blob) throw new Error('could not re-encode this photo');
-  return { blob, width: w, height: h };
-}
-
-const blobToBase64 = (blob) => new Promise((res, rej) => {
-  const r = new FileReader();
-  r.onerror = () => rej(new Error('could not read the photo'));
-  r.onload = () => { const s = String(r.result || ''); res(s.slice(s.indexOf(',') + 1)); };
-  r.readAsDataURL(blob);
-});
-
 // ---------- flow ----------
 
 async function handleFiles(files) {
@@ -179,16 +88,23 @@ async function handleFiles(files) {
 }
 
 async function processOne(item) {
-  const set = (status, patch = {}) => { Object.assign(item, { status, ...patch }); render(); };
+  const set = (status, extra = {}) => { Object.assign(item, { status, ...extra }); render(); };
   try {
     set('preparing');
-    const { blob } = await toJpeg(item.file);
-    item.thumb = URL.createObjectURL(blob);
-    item.file = null;                                  // release the original
+    // A PDF or a video shared in from another app is not a receipt; say so before
+    // spending a decode on it.
+    if (!isImageFile(item.file)) {
+      throw new Error(`${item.name} is${item.file.type ? ` a ${item.file.type},` : ''} not a photo. Receipts need an image.`);
+    }
+    // force: receipts are always worth downscaling, even a JPEG straight from the
+    // camera — 1600px reads perfectly and uploads in a fraction of the time.
+    const prepped = await prepareImage(item.file, { force: true });
+    if (!prepped) toast(undecodableHint(item.file), '');    // ffmpeg on the box gets a turn
+    const body = prepped ? prepped.blob : item.file;
+    item.thumb = URL.createObjectURL(body);
     set('uploading');
-    const data = await blobToBase64(blob);
-    const name = item.name.replace(/\.(heic|heif)$/i, '.jpg');
-    const up = await post('/uploads', { name, mime: 'image/jpeg', data });
+    const up = await uploadBlob(body, prepped ? prepped.name : item.name);
+    item.file = null;                                  // release the original
     set('reading');
     const rec = await post('/finance/receipts/scan', { uploadId: up.id });
     if (rec.status !== 'parsed') {
@@ -332,14 +248,12 @@ const HIDDEN = {
   opacity: '0', pointerEvents: 'none', zIndex: '-1',
 };
 
-// accept must name the HEIC extensions explicitly: "image/*" alone does not
-// surface them in the Files/Browse branch of the iOS sheet, and photos shared in
-// from other apps often arrive with an empty MIME type.
-const ACCEPT = 'image/*,.heic,.HEIC,.heif,.HEIF,.jpg,.jpeg,.png,.webp';
-
 function makePicker({ capture, multiple }) {
   const input = el('input', {
-    type: 'file', accept: ACCEPT,
+    // IMAGE_ACCEPT names the HEIC extensions explicitly: "image/*" alone does not
+    // surface them in the Files/Browse branch of the iOS sheet, and photos shared in
+    // from other apps often arrive with an empty MIME type.
+    type: 'file', accept: IMAGE_ACCEPT,
     capture: capture ? 'environment' : null,
     multiple: multiple ? 'multiple' : null,
     style: HIDDEN,
@@ -400,11 +314,18 @@ function queueCard(item) {
           el('div', { class: 'm-meta' },
             [p.date, p.paymentMethod, `${(p.items || []).length} item${(p.items || []).length === 1 ? '' : 's'}`]
               .filter(Boolean).join(' · ')),
+          checkNote(p),
           (p.items || []).length ? el('ul', { class: 'm-items' },
-            p.items.slice(0, 4).map(it => el('li', {},
+            p.items.map((it, i) => el('li', { class: it.warn?.length ? 'is-suspect' : '' },
               el('span', {}, it.qty > 1 ? `${it.name} ×${it.qty}` : it.name),
-              el('span', {}, Number(it.amount).toLocaleString('en-US')))),
-            p.items.length > 4 ? el('li', { class: 'm-items-more' }, `+${p.items.length - 4} more`) : null) : null,
+              el('span', {}, Number(it.amount).toLocaleString('en-US')),
+              // A phantom line is the common failure, and it has to be removable here:
+              // the phone is where receipts get photographed, so it is where they get
+              // corrected. The removal is what teaches the shop-specific fix.
+              item.status === 'applied' ? null : el('button', {
+                class: 'm-x', title: 'Not on the receipt',
+                onclick: () => dropLine(item, i),
+              }, '×')))) : null,
           item.status === 'applied'
             ? el('div', { class: 'm-meta' }, `Filed under ${item.chosenCategory || p.category} · ${item.savedCount} entr${item.savedCount === 1 ? 'y' : 'ies'}`)
             : el('div', {}, categoryChips(item, p), actions(item, p)))
@@ -414,6 +335,30 @@ function queueCard(item) {
           el('button', { class: 'm-btn-ghost', onclick: () => { state.queue = state.queue.filter(q => q !== item); render(); } }, 'Dismiss'))
         : null),
   );
+}
+
+/** Do the lines add up? An invented line makes the sum overshoot by its own amount,
+ *  which is the most actionable thing this screen can tell you. */
+function checkNote(p) {
+  const c = p.check;
+  if (!c || c.ok !== false) return null;
+  const amt = Math.abs(c.delta).toLocaleString('en-US');
+  return el('div', { class: 'm-check' },
+    c.delta > 0
+      ? `The lines add up to ${amt} more than the receipt — one is probably not real. Remove it with ×.`
+      : `The lines add up to ${amt} less than the receipt — one was missed.`);
+}
+
+/** Remove a line and save it, so the correction is recorded before applying. */
+async function dropLine(item, index) {
+  const p = item.receipt?.parsed;
+  if (!p) return;
+  const items = (p.items || []).filter((_, i) => i !== index);
+  try {
+    const updated = await patch(`/finance/receipts/${item.receipt.id}`, { ...p, items });
+    item.receipt = updated;
+    render();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 /** The model's category guess is usually right but not always; one tap fixes it

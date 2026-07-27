@@ -93,6 +93,82 @@ export function currencies() {
   return { base: cfg.baseCurrency, rates: cfg.rates, codes: Object.keys(cfg.rates).sort() };
 }
 
+// ---------- which model does the finance work ----------
+
+/** Finance has three model-backed jobs with different needs:
+ *    ocrModel   reads receipt photographs   — MUST be vision-capable
+ *    itemModel  names products from Japanese — wants strict JSON and JA/EN
+ *    recapModel writes the monthly summary   — wants readable prose
+ *
+ *  They are separate settings because the requirements genuinely differ, but the
+ *  recommendation deliberately pushes one model for all three: every distinct
+ *  local model means another llama-server swap, and a receipt that OCRs with one
+ *  model then names its items with another pays that cost twice per scan.
+ *
+ *  Nothing here hardcodes a filename. Vision capability comes from whether a
+ *  model's preset names an mmproj that actually exists on disk, and quality comes
+ *  from the user's own Bench results, so the advice tracks their machine.
+ */
+export async function modelOptions() {
+  const cfg = loadConfig();
+  const f = cfg.finance || {};
+  const out = {
+    current: {
+      ocrModel: f.ocrModel || '', itemModel: f.itemModel || '', recapModel: f.recapModel || '',
+    },
+    chatDefault: cfg.defaults?.chatModel || '',
+    vision: [], local: [], recommended: null, note: '',
+  };
+
+  let llmctl, bench;
+  try {
+    llmctl = await import('./llmctl.js');
+    bench = await import('./bench.js');
+  } catch (e) {
+    out.note = `could not inspect local models: ${e.message}`;
+    return out;
+  }
+
+  const mmprojFiles = new Set(llmctl.listMmproj().map(m => m.file));
+  for (const m of llmctl.listLocalModels()) {
+    const preset = llmctl.presetFor(m.file, m.sizeGB);
+    const canSee = !!preset.mmproj && mmprojFiles.has(preset.mmproj);
+    const entry = {
+      ref: `local:${llmctl.modelAlias(m.file)}`,
+      file: m.file, sizeGB: m.sizeGB, vision: canSee, mmproj: canSee ? preset.mmproj : '',
+    };
+    out.local.push(entry);
+    if (canSee) out.vision.push(entry);
+  }
+
+  // Bench scores are keyed by the same local: refs.
+  let board = { models: [], best: {} };
+  try { board = bench.leaderboard(); } catch { /* no bench data yet */ }
+  const scoreOf = (ref) => board.models.find(b => b.model === ref) || null;
+
+  if (!out.vision.length) {
+    out.note = 'No local model is set up for vision. Pair a model with an mmproj in '
+      + 'Settings → Models to read receipts locally, or point receipt reading at a cloud model.';
+    return out;
+  }
+
+  // Best vision model by measured quality, falling back to the smallest (which
+  // will at least load alongside everything else on an 8GB card).
+  const ranked = out.vision.slice().sort((a, b) => {
+    const sa = scoreOf(a.ref)?.overall ?? -1, sb = scoreOf(b.ref)?.overall ?? -1;
+    return sb - sa || a.sizeGB - b.sizeGB;
+  });
+  const pick = ranked[0];
+  const s = scoreOf(pick.ref);
+  out.recommended = {
+    ocrModel: pick.ref, itemModel: pick.ref, recapModel: pick.ref,
+    why: `${pick.file} is the ${out.vision.length > 1 ? 'best-scoring ' : ''}vision-capable model on this machine`
+      + (s ? ` (bench ${s.overall}, ${s.tokS} tok/s)` : '')
+      + '. Using it for all three keeps llama.cpp on one model, so a receipt scan never has to swap mid-job.',
+  };
+  return out;
+}
+
 // ---------- date helpers ----------
 
 const isDate = (s) => DATE_RX.test(String(s || ''));
@@ -229,9 +305,16 @@ export function updateTxn(id, patch) {
   return writeTxn(sanitizeTxn(patch || {}, prev));
 }
 
+// Deleting a row must also forget the price observations it produced. items.js owns
+// finance_purchase, but a dynamic import here would have to make deleteTxn async and
+// ripple through deleteTxns' transaction, so the one DELETE lives here — see
+// items.deletePurchasesForTxn for the reasoning and keep the two in step.
+const forgetPurchases = (txnId) => run('DELETE FROM finance_purchase WHERE txn_id = ?', String(txnId || '')).changes;
+
 export function deleteTxn(id) {
   const r = run('UPDATE finance_txn SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0', now(), String(id || ''));
   if (!r.changes) throw missing('transaction not found');
+  forgetPurchases(id);
 }
 
 /** Bulk delete — one statement, one transaction. Returns how many rows changed. */
@@ -242,7 +325,9 @@ export function deleteTxns(ids) {
     const stamp = now();
     let n = 0;
     for (const id of list) {
-      n += run('UPDATE finance_txn SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0', stamp, id).changes;
+      const hit = run('UPDATE finance_txn SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0', stamp, id).changes;
+      if (hit) forgetPurchases(id);
+      n += hit;
     }
     return { deleted: n };
   });

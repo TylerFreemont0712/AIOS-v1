@@ -9,7 +9,7 @@ import { DATA, loadConfig, contextBudget, DEFAULT_CHAT_SYSTEM } from './config.j
 import { streamChat } from './llm.js';
 import { chatToolSchemas, runTool, isWriteTool, isChatSafeWrite } from './tools.js';
 import { profileInjection, recordTurn } from './profile.js';
-import { id as genId, now, readJSON, writeJSON, clampMiddle } from './util.js';
+import { id as genId, now, readJSON, writeJSON, clampMiddle, jsonDirIndex } from './util.js';
 
 const DIR = path.join(DATA, 'chats');
 const live = new Map(); // chatId -> AbortController
@@ -21,12 +21,14 @@ const emit = (cid, ev) => publish(`chat:${cid}`, { t: 'chat.event', chatId: cid,
 
 const MAX_TOOL_ROUNDS = 5;   // safety cap on tool-call iterations per user message
 
+const chatIndex = jsonDirIndex(DIR, (c) => ({
+  id: c.id, title: c.title, modelRef: c.modelRef, tools: c.tools !== false,
+  folder: c.folder || '', updatedAt: c.updatedAt, messages: c.messages.length,
+}));
+
 export function listChats() {
   fs.mkdirSync(DIR, { recursive: true });
-  return fs.readdirSync(DIR).filter(f => f.endsWith('.json')).map(f => {
-    const c = readJSON(path.join(DIR, f));
-    return c && { id: c.id, title: c.title, modelRef: c.modelRef, tools: c.tools !== false, folder: c.folder || '', updatedAt: c.updatedAt, messages: c.messages.length };
-  }).filter(Boolean).sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+  return chatIndex().sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
 }
 
 export function createChat({ modelRef, system, tools, folder } = {}) {
@@ -84,7 +86,8 @@ export function stop(id) {
   live.delete(id);
 }
 
-const save = (c) => { c.updatedAt = now(); writeJSON(file(c.id), c); };
+// Compact, not pretty: this runs on every turn and the file is the whole transcript.
+const save = (c) => { c.updatedAt = now(); writeJSON(file(c.id), c, { pretty: false }); };
 
 /** A short directive that makes small models actually reach for tools instead of
  *  declining ("I can't access the internet") — tailored to what's actually available. */

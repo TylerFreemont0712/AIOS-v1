@@ -99,6 +99,74 @@ CREATE TABLE IF NOT EXISTS finance_recurring (
   deleted    INTEGER NOT NULL DEFAULT 0
 );
 
+-- ---------------------------------------------------------------- items
+-- Three tables implement "what does a thing cost, and where is it cheapest":
+--
+--   finance_item          the canonical catalogue — one row per real-world thing,
+--                         deliberately BRAND-FREE ("Milk", not "Yamada Milk")
+--   finance_item_alias    every raw string ever printed on a receipt, pointing at
+--                         a canonical item. This is the point of truth: a row with
+--                         confirmed=1 was settled by the user and the model is
+--                         never allowed to overrule it.
+--   finance_purchase      one line item bought = one price observation
+--
+-- Splitting alias from item is what makes the learning loop work. The model only
+-- ever proposes a mapping for a string nobody has classified yet; once that
+-- mapping is confirmed it becomes a lookup, costs nothing, and never drifts.
+
+CREATE TABLE IF NOT EXISTS finance_item (
+  id           TEXT PRIMARY KEY,
+  name_en      TEXT NOT NULL,                     -- "Milk" — generic, no brand
+  name_ja      TEXT NOT NULL DEFAULT '',          -- "牛乳"
+  category     TEXT NOT NULL DEFAULT 'Groceries',
+  subcategory  TEXT NOT NULL DEFAULT '',          -- "Dairy", "Produce", …
+  unit         TEXT NOT NULL DEFAULT 'each',      -- ml | g | each — comparison base
+  typical_size REAL NOT NULL DEFAULT 0,           -- e.g. 1000 when unit='ml'
+  note         TEXT NOT NULL DEFAULT '',
+  pinned       INTEGER NOT NULL DEFAULT 0,        -- on the watchlist
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL,
+  deleted      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_item_cat ON finance_item(deleted, category);
+
+CREATE TABLE IF NOT EXISTS finance_item_alias (
+  id         TEXT PRIMARY KEY,
+  item_id    TEXT NOT NULL,
+  raw        TEXT NOT NULL,                       -- exactly as printed
+  norm       TEXT NOT NULL,                       -- NFKC-folded matching key
+  source     TEXT NOT NULL DEFAULT 'ai',          -- ai | auto | manual | ocr
+  confirmed  INTEGER NOT NULL DEFAULT 0,          -- 1 = user-settled, authoritative
+  hits       INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(norm)
+);
+CREATE INDEX IF NOT EXISTS idx_alias_item ON finance_item_alias(item_id);
+
+CREATE TABLE IF NOT EXISTS finance_purchase (
+  id              TEXT PRIMARY KEY,
+  item_id         TEXT NOT NULL DEFAULT '',       -- '' while unresolved
+  txn_id          TEXT NOT NULL DEFAULT '',
+  receipt_id      TEXT NOT NULL DEFAULT '',
+  date            TEXT NOT NULL,
+  merchant        TEXT NOT NULL DEFAULT '',
+  raw_name        TEXT NOT NULL,
+  qty             REAL NOT NULL DEFAULT 1,
+  line_total      REAL NOT NULL DEFAULT 0,        -- as printed, in the currency column
+  currency        TEXT NOT NULL DEFAULT 'JPY',
+  line_total_base REAL NOT NULL DEFAULT 0,
+  size            REAL NOT NULL DEFAULT 0,        -- parsed pack size, in the unit column
+  unit            TEXT NOT NULL DEFAULT '',       -- ml | g | each
+  unit_price_base REAL NOT NULL DEFAULT 0,        -- base currency per 1 unit
+  each_price_base REAL NOT NULL DEFAULT 0,        -- base currency per item bought
+  source          TEXT NOT NULL DEFAULT 'ocr',
+  created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_purchase_item ON finance_purchase(item_id, date);
+CREATE INDEX IF NOT EXISTS idx_purchase_merchant ON finance_purchase(merchant);
+CREATE INDEX IF NOT EXISTS idx_purchase_date ON finance_purchase(date);
+
 -- One saved write-up per month. The point of a finance app is what you can tell
 -- about a month a year later, and raw rows do not survive that trip — "why was
 -- June expensive?" is unanswerable from a table of 90 line items. The recap is
@@ -127,6 +195,29 @@ CREATE TABLE IF NOT EXISTS finance_receipt (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+-- What the user corrected after a scan, so the next scan does better.
+--
+-- A vision model reading a crumpled thermal receipt hallucinates: it invents a line
+-- that isn't printed, or prices one absurdly. No prompt fixes that reliably, but the
+-- SAME mistake at the SAME shop is very fixable — the user's correction is the point of
+-- truth, and applying it again is deterministic, no model involved. The hits column is
+-- what separates "a one-off misread" from "this shop always does this": a fix is only
+-- trusted enough to auto-apply once the user has made it more than once.
+CREATE TABLE IF NOT EXISTS finance_receipt_fix (
+  id          TEXT PRIMARY KEY,
+  merchant    TEXT NOT NULL DEFAULT '',           -- normalized merchant key ('' = everywhere)
+  kind        TEXT NOT NULL,                      -- drop | rename | amount
+  raw         TEXT NOT NULL DEFAULT '',           -- normalized printed line the fix keys on
+  raw_display TEXT NOT NULL DEFAULT '',           -- as printed, for showing the user
+  ai_value    TEXT NOT NULL DEFAULT '',           -- what the model said
+  user_value  TEXT NOT NULL DEFAULT '',           -- what the user settled on
+  hits        INTEGER NOT NULL DEFAULT 1,         -- times the user has made this same correction
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  UNIQUE(merchant, kind, raw)
+);
+CREATE INDEX IF NOT EXISTS idx_fix_merchant ON finance_receipt_fix(merchant, hits DESC);
 `;
 
 /** Open (once) and migrate. Safe to call on every access. */
@@ -137,7 +228,20 @@ export function getDb() {
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA foreign_keys = ON');
   db.exec(SCHEMA);
+  // `db` is already assigned, so ensureColumn's getDb() call returns immediately.
+  // parsed_ai keeps the model's ORIGINAL extraction after the user edits a receipt —
+  // the diff between the two is what the correction loop learns from.
+  ensureColumn('finance_receipt', 'parsed_ai', `TEXT NOT NULL DEFAULT ''`);
   backupOnBoot();
+  // One-time data repair for databases written before deleteTxn learned to forget
+  // prices: a purchase whose transaction is gone is an invisible lie in the price
+  // history. Cheap (one indexed DELETE) and a no-op once clean.
+  try {
+    const orphans = db.prepare(`DELETE FROM finance_purchase
+      WHERE txn_id <> '' AND NOT EXISTS (
+        SELECT 1 FROM finance_txn t WHERE t.id = finance_purchase.txn_id AND t.deleted = 0)`).run().changes;
+    if (orphans) console.log(`[finance] cleared ${orphans} price observation(s) left behind by deleted transactions`);
+  } catch (e) { console.error('[finance] orphan sweep failed:', e.message); }
   return db;
 }
 
@@ -147,6 +251,7 @@ export function ensureColumn(table, col, decl) {
   const cols = getDb().prepare(`PRAGMA table_info(${table})`).all();
   if (cols.some(c => c.name === col)) return;
   db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${decl}`);
+  resetStatements();                     // ALTER TABLE can invalidate prepared statements
   console.log(`[finance] schema: added ${table}.${col}`);
 }
 
@@ -170,9 +275,21 @@ function backupOnBoot() {
 
 // ---------- tiny query helpers (mirrors learndb.js) ----------
 
-export const all = (sql, ...args) => getDb().prepare(sql).all(...args);
-export const one = (sql, ...args) => getDb().prepare(sql).get(...args) ?? null;
-export const run = (sql, ...args) => getDb().prepare(sql).run(...args);
+// Statements are prepared once and reused. The queries here are a fixed set of string
+// literals, so the cache is bounded by the code — and applying one receipt runs a
+// handful of them per line item, each of which used to recompile its SQL from scratch.
+const stmts = new Map();
+function stmt(sql) {
+  let s = stmts.get(sql);
+  if (!s) { s = getDb().prepare(sql); stmts.set(sql, s); }
+  return s;
+}
+/** Drop cached statements — required after any DDL, which can invalidate them. */
+export const resetStatements = () => stmts.clear();
+
+export const all = (sql, ...args) => stmt(sql).all(...args);
+export const one = (sql, ...args) => stmt(sql).get(...args) ?? null;
+export const run = (sql, ...args) => stmt(sql).run(...args);
 
 export function tx(fn) {
   const d = getDb();

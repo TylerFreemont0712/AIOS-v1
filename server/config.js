@@ -50,7 +50,8 @@ const defaults = () => ({
   // GitHub app. token is optional — when empty, the server borrows the gh CLI's login.
   github: { token: '' },
   // AIOS owns the local llama.cpp server (approved 2026-07-11). 'big' is the GPU
-  // daily driver; 'tiny' runs CPU-only so ComfyUI gets the whole GPU (Studio mode).
+  // daily driver; 'tiny' is a small fast model for quick work. Freeing the card for
+  // ComfyUI is no longer a profile swap — Studio stops llama-server outright.
   llm: {
     managed: true,
     // Reasoning ("thinking") control for models that support it (e.g. the ornith
@@ -60,7 +61,11 @@ const defaults = () => ({
     // the model's chat template decide — so normal chat is unchanged. off/low/medium/high map,
     // for local OpenAI-compatible servers, to chat_template_kwargs.enable_thinking +
     // reasoning_effort; for Ollama to `think`. Cloud endpoints ignore these entirely.
-    reasoning: { default: 'auto', byModel: {} },
+    // 'tiny' is off by default and that is not arbitrary: Qwen3.5-2B with thinking
+    // enabled spent 900 tokens without emitting a single visible word, while the same
+    // question answered correctly in 36 tokens with thinking off. A fast small model
+    // that never finishes thinking is not a fast small model.
+    reasoning: { default: 'auto', byModel: { tiny: 'off' } },
     binary: '/home/joejin/llama.cpp/build/bin/llama-server',
     // the PyQt launcher (Whisper/MusicGen/manual llama tinkering) — AIOS can open it
     launcher: '/home/joejin/ai/llama-launcher/launch_llama_server.sh',
@@ -71,14 +76,17 @@ const defaults = () => ({
         args: ['--ctx-size', '32758', '-ngl', 'auto', '--batch-size', '2048', '--ubatch-size', '512', '--threads', '8', '--parallel', '1', '--cache-reuse', '256', '--flash-attn', 'on', '--cache-type-k', 'q8_0', '--cache-type-v', 'q8_0'],
       },
       tiny: {
-        // lives in AIOS's data dir — ~/ai/models is root-owned on this machine
-        model: path.join(DATA, 'llm', 'models', 'Qwen3-1.7B-Q8_0.gguf'), alias: 'tiny',
-        args: ['--ctx-size', '8192', '-ngl', '0', '--threads', '8'],
+        model: '/home/joejin/ai/models/Qwen3.5-2B-UD-Q8_K_XL.gguf', alias: 'tiny',
+        // GPU-resident now that Studio stops llama.cpp instead of demoting it: at
+        // 2.6GB it leaves ~5GB free, and CPU-only threw away the speed that makes a
+        // small model worth having. 32k context is what fitContext allows here.
+        args: ['--ctx-size', '32768', '-ngl', '99', '--threads', '8', '--batch-size', '2048',
+          '--ubatch-size', '512', '--flash-attn', 'on', '--cache-type-k', 'q8_0', '--cache-type-v', 'q8_0'],
       },
     },
   },
-  // ComfyUI connector (Studio app). autoSwap: generating while the big LLM holds
-  // VRAM swaps to the tiny profile first. autoFree: release Comfy VRAM after jobs.
+  // ComfyUI connector (Studio app). autoSwap: generating while llama.cpp holds VRAM
+  // stops it first (and restores it afterwards). autoFree: release Comfy VRAM after jobs.
   // dir/python: AIOS can start/stop the ComfyUI server itself (Studio header).
   comfy: {
     url: 'http://127.0.0.1:8188', autoSwap: true, autoFree: true, autoStart: true,
@@ -90,6 +98,15 @@ const defaults = () => ({
     dir: '/mnt/projects/comfyui/ComfyUI', python: '/home/joejin/venv/bin/python', listen: '0.0.0.0',
     args: ['--enable-manager'],
   },
+  // Attachment intake. ffmpeg is what converts the formats no model provider accepts —
+  // above all HEIC, which is what an iPhone shoots by default. Empty = auto-detect on
+  // PATH (set an absolute path if AIOS runs from systemd, whose PATH is minimal).
+  // maxEdge: long edge in pixels after conversion; vision models gain nothing above it.
+  uploads: { ffmpeg: '', maxEdge: 2048 },
+  // Money. ocrModel MUST be vision-capable (a model whose preset names an mmproj that
+  // exists) — receipts.js refuses to OCR with a text-only model rather than silently
+  // returning nothing. Empty = pick the best vision model on this machine at scan time.
+  finance: { baseCurrency: 'JPY', ocrModel: '', itemModel: '', recapModel: '', weekStart: 'monday' },
   // autoApprove: agent writes scoped to the wiki/daily note skip the approval gate.
   // autoExport: finished deep-research reports are saved into the wiki automatically.
   vault: { path: '', wikiFolder: 'AI Wiki', dailyFolder: 'Daily', autoApprove: true, autoExport: true },
@@ -149,7 +166,7 @@ export function publicConfig() {
 /** Apply a partial update from the client. Secrets arrive via explicit fields. */
 export function updateConfig(patch) {
   const c = loadConfig();
-  const allowed = ['user', 'appearance', 'defaults', 'projectsRoot', 'vault', 'agent', 'tools', 'sampling', 'weather', 'llm', 'comfy', 'profile', 'finance'];
+  const allowed = ['user', 'appearance', 'defaults', 'projectsRoot', 'vault', 'agent', 'tools', 'sampling', 'weather', 'llm', 'comfy', 'profile', 'finance', 'uploads'];
   for (const k of allowed) if (patch[k] !== undefined) c[k] = deepMerge(c[k], patch[k]);
   if (patch.mail) {
     const m = patch.mail, M = c.mail;

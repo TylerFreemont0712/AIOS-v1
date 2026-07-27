@@ -1260,7 +1260,11 @@
 
 /* --- ledger --- */
 .fin-toolbar { display: flex; gap: 8px; align-items: center; margin: 0 0 12px; flex-wrap: wrap; }
-.fin-search { min-width: 240px; }
+/* theme.css sets .input{width:100%}, which in a flex toolbar gives every control
+   a full-row flex basis and stacks them. Size them individually instead. */
+.fin-toolbar .input { width: auto; }
+.fin-toolbar select.input { min-width: 132px; }
+.fin-search { flex: 1 1 220px; min-width: 200px; max-width: 340px; }
 .fin-count { font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
 .fin-scroll { overflow-x: auto; }
 .fin-table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -1309,16 +1313,77 @@
 
 /* --- receipts --- */
 .fin-receipt-list { list-style: none; margin: 0; padding: 0; }
-.fin-receipt { display: flex; align-items: center; gap: 12px; padding: 10px 0;
-  border-bottom: 1px solid var(--border); }
+.fin-receipt { border-bottom: 1px solid var(--border); }
+.fin-receipt-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; }
 .fin-receipt-thumb { width: 44px; height: 58px; object-fit: cover; border-radius: var(--r-sm);
-  border: 1px solid var(--border); background: var(--surface-3); }
+  border: 1px solid var(--border); background: var(--surface-3); display: block; }
 .fin-receipt-main { flex: 1; min-width: 0; }
-.fin-receipt-title { font-weight: 500; font-size: 13px; }
+.fin-receipt-title { font-weight: 500; font-size: 13px; display: flex; align-items: center; gap: 6px; }
 .fin-receipt-meta { font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
 .fin-receipt-actions { display: flex; gap: 6px; }
 .fin-receipt.is-failed .fin-receipt-title { color: var(--err); }
 .fin-receipt.is-applied { opacity: .55; }
+/* A scan whose lines don't add up is the one you must look at — say so in the list. */
+.fin-receipt.is-suspect { border-left: 2px solid var(--warn); padding-left: 10px; }
+.fin-receipt.is-open { background: var(--surface-2); border-radius: var(--r-sm); }
+
+.fin-badge { font-size: 10px; font-weight: 600; letter-spacing: .02em; text-transform: uppercase;
+  padding: 1px 5px; border-radius: 3px; background: var(--surface-3); color: var(--faint); }
+.fin-badge.is-bad { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+
+/* --- receipt review editor --- */
+.fin-rc-edit { padding: 4px 0 14px; display: flex; flex-direction: column; gap: 10px; }
+
+.fin-chk { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; line-height: 1.45;
+  padding: 8px 10px; border-radius: var(--r-sm); border: 1px solid var(--border); }
+.fin-chk svg { width: 15px; height: 15px; flex: none; margin-top: 1px; }
+.fin-chk code { font-size: 11px; background: var(--surface-3); padding: 0 4px; border-radius: 3px; margin: 0 2px; }
+.fin-chk.is-ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, var(--border)); }
+.fin-chk.is-warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, var(--border)); }
+.fin-chk.is-bad { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border));
+  background: color-mix(in srgb, var(--err) 7%, transparent); }
+.fin-chk.is-learn { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+
+.fin-rc-head { display: flex; flex-wrap: wrap; gap: 10px; }
+.fin-rc-head label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--faint); }
+.fin-rc-head .input { width: 110px; }
+.fin-rc-head label.wide .input { width: 190px; }
+.fin-rc-head .input.num { width: 88px; }
+
+.fin-rc-lines { width: 100%; border-collapse: collapse; font-size: 12px; }
+.fin-rc-lines th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .03em;
+  color: var(--faint); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--border); }
+.fin-rc-lines th.num, .fin-rc-lines td.num { text-align: right; }
+.fin-rc-lines td { padding: 4px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.fin-rc-lines .input { width: 100%; }
+.fin-rc-lines .input.num { width: 74px; text-align: right; }
+.fin-rc-lines tr.is-suspect { background: color-mix(in srgb, var(--warn) 8%, transparent); }
+.fin-rc-printed { font-size: 11px; color: var(--faint); display: block; max-width: 190px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fin-rc-warn { font-size: 10.5px; color: var(--warn); margin-top: 2px; }
+
+/* Category picker: one tap, and the chosen one has to be obvious at a glance —
+   the model's guess is right often enough that you skim rather than read. */
+.fin-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.fin-chip {
+  font: inherit; font-size: 11.5px; line-height: 1;
+  padding: 5px 9px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--surface-3); color: var(--muted);
+}
+.fin-chip:hover { color: var(--text); border-color: var(--faint); }
+.fin-chip.is-on {
+  background: var(--accent); border-color: var(--accent);
+  color: var(--accent-fg, #fff); font-weight: 600;
+}
+
+.fin-rc-actions { display: flex; align-items: center; gap: 6px; }
+.fin-rc-note { font-size: 11px; color: var(--faint); }
+
+@media (max-width: 760px) {
+  .fin-rc-head .input, .fin-rc-head .input.num { width: 100%; }
+  .fin-rc-head label { flex: 1 1 45%; }
+  .fin-rc-printed { max-width: 90px; }
+}
 
 /* --- shared dialog form --- */
 .fin-form { display: flex; flex-direction: column; gap: 9px; min-width: 330px; }
@@ -1326,3 +1391,127 @@
 .fin-form-row > span { width: 82px; flex: none; }
 .fin-form-row .input { flex: 1; }
 .empty.sm { font-size: 12px; padding: 8px 0; }
+
+/* --- items: price tracking --- */
+.fin-item-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 10px; }
+.fin-item-card { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md);
+  padding: 11px 12px 10px; cursor: pointer; transition: border-color .12s, transform .12s; }
+.fin-item-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+.fin-item-head { display: flex; align-items: flex-start; gap: 8px; }
+.fin-item-names { flex: 1; min-width: 0; }
+.fin-item-en { display: block; font-size: 14px; font-weight: 600; line-height: 1.2; }
+.fin-item-ja { display: block; font-size: 11.5px; color: var(--muted); margin-top: 1px; }
+.fin-item-tags { display: flex; align-items: center; gap: 6px; margin: 7px 0 8px; }
+.fin-item-count { font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.fin-item-prices { display: flex; gap: 14px; flex-wrap: wrap; }
+.fin-item-price { display: flex; flex-direction: column; }
+.fin-item-price-label { font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--faint); }
+.fin-item-price-value { font-size: 13.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.fin-item-price-value.is-best { color: var(--ok); }
+.fin-item-where { font-size: 10.5px; color: var(--muted); }
+.fin-item-foot { margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--border);
+  font-size: 10.5px; color: var(--faint); }
+
+/* item detail */
+.fin-item-detail { min-width: 520px; max-width: 720px; }
+.fin-item-hero { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 12px; }
+.fin-item-hero-name { margin: 0; font-size: 19px; font-weight: 650; }
+.fin-item-hero-ja { font-size: 13px; color: var(--muted); }
+.fin-item-hero-meta { font-size: 11.5px; color: var(--faint); margin-top: 3px; }
+.fin-best { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin-bottom: 14px;
+  padding: 12px 14px; border-radius: var(--r-md);
+  background: linear-gradient(120deg, color-mix(in srgb, var(--ok) 14%, var(--surface-2)), var(--surface-2) 65%);
+  border: 1px solid color-mix(in srgb, var(--ok) 28%, var(--border)); }
+.fin-best-label { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.fin-best-shop { font-size: 17px; font-weight: 650; }
+.fin-best-price { font-size: 13px; color: var(--ok); font-variant-numeric: tabular-nums; }
+.fin-best-saving { margin-left: auto; text-align: right; font-size: 12px; color: var(--muted); }
+.fin-best-pct { display: block; font-size: 22px; font-weight: 650; color: var(--ok); font-variant-numeric: tabular-nums; }
+.fin-item-stats { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 14px; }
+.fin-item-section { margin-bottom: 16px; }
+.fin-item-section > h4 { margin: 0 0 7px; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+.fin-legend-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 6px; }
+.fin-legend-chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--muted); }
+.chart-median { stroke: var(--border-strong); stroke-width: 1; stroke-dasharray: 4 4; }
+.chart-point { stroke: var(--surface-2); stroke-width: 1.5; }
+.fin-table tr.is-cheapest td { background: color-mix(in srgb, var(--ok) 9%, transparent); }
+.fin-table tr.is-cheapest td:first-child { font-weight: 600; }
+
+/* aliases + review queue */
+.fin-alias-list { list-style: none; margin: 0; padding: 0; }
+.fin-alias-list > li { display: flex; align-items: center; gap: 8px; padding: 4px 0;
+  border-bottom: 1px solid var(--border); font-size: 12.5px; }
+.fin-alias-raw { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fin-alias-tag { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; padding: 1px 7px;
+  border-radius: 9px; background: var(--surface-3); color: var(--muted); }
+.fin-alias-tag.is-ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.fin-alias-src { font-size: 10.5px; color: var(--faint); white-space: nowrap; }
+
+/* Built for a whole grocery receipt at once: wide, dense, scrollable, with the
+   confident matches pre-ticked so the common case is read-and-confirm. */
+/* Fill whatever the modal gives us — forcing a width wider than the box pushed the
+   action chips outside it, where they were reachable only by horizontal scroll. */
+.fin-review { width: 100%; min-width: 0; }
+.fin-review-list { list-style: none; margin: 0; padding: 0; max-height: 56vh; overflow-y: auto; }
+.fin-review-row { display: flex; align-items: center; gap: 12px; padding: 7px 2px;
+  border-bottom: 1px solid var(--border); }
+.fin-review-row.is-set { background: color-mix(in srgb, var(--ok) 8%, transparent); }
+.fin-review-row.is-drop { background: color-mix(in srgb, var(--err) 8%, transparent); }
+.fin-review-main { flex: 1; min-width: 0; }
+.fin-review-raw { font-size: 13px; font-weight: 500; }
+.fin-review-meta { font-size: 11px; color: var(--faint); margin-top: 1px; }
+.fin-review-picked { color: var(--ok); font-weight: 600; }
+.fin-review-actions { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
+.fin-suggest { cursor: pointer; }
+.fin-suggest:hover { border-color: var(--accent); color: var(--text); }
+.fin-suggest-weak { opacity: .6; font-size: 10px; }
+
+/* The bulk bar — the count is the point: it tells you how much one click will do. */
+.fin-review-bar { display: flex; align-items: center; gap: 6px; padding: 0 2px 9px;
+  border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+.fin-review-count { font-size: 12px; color: var(--faint); }
+.fin-review-count strong { color: var(--text); }
+.fin-chip.is-drop { color: var(--faint); }
+.fin-chip.is-drop.is-on { background: var(--err); border-color: var(--err); color: #fff; }
+
+@media (max-width: 760px) {
+  .fin-review { min-width: 0; width: 100%; }
+  .fin-review-row { flex-direction: column; align-items: stretch; gap: 6px; }
+  .fin-review-actions { justify-content: flex-start; }
+}
+
+/* finance settings: exchange-rate grid */
+.fin-rate-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; margin-top: 10px; }
+.fin-rate { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.fin-rate > span { width: 34px; flex: none; font-family: var(--mono); font-size: 11.5px; }
+.fin-rate .input { flex: 1; min-width: 0; }
+
+/* --- studio lightbox --- */
+/* Renders stay inside the app instead of opening a browser tab: the strip is the
+   library, so arrow keys need to keep working while one is full-size. */
+.lb-overlay { position: fixed; inset: 0; z-index: 8200; display: flex; flex-direction: column;
+  background: color-mix(in srgb, var(--bg) 92%, #000); backdrop-filter: blur(6px);
+  animation: lb-in .12s ease-out; }
+@keyframes lb-in { from { opacity: 0; } to { opacity: 1; } }
+.lb-stage { flex: 1; min-height: 0; min-width: 0; display: flex; align-items: center;
+  justify-content: center; gap: 10px; padding: 18px 14px 0; }
+.lb-img { min-width: 0; min-height: 0; max-width: 100%; max-height: 100%;
+  object-fit: contain; border-radius: var(--r-md); box-shadow: var(--shadow); }
+.lb-nav { flex: none; width: 46px; height: 84px; border-radius: var(--r-md);
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+  font-size: 30px; line-height: 1; cursor: pointer; font-family: inherit; }
+.lb-nav:hover { background: var(--surface-3); border-color: var(--accent); }
+.lb-bar { flex: none; display: flex; align-items: center; gap: 10px; padding: 10px 16px 14px;
+  font-size: 12.5px; color: var(--muted); }
+.lb-count { font-variant-numeric: tabular-nums; color: var(--text); font-weight: 600; }
+.lb-name { font-family: var(--mono); font-size: 11.5px; color: var(--faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40vw; }
+.lb-kbd { margin-left: 6px; padding: 0 5px; border-radius: 4px; border: 1px solid var(--border-strong);
+  background: var(--surface-3); font-family: var(--mono); font-size: 10px; color: var(--faint); }
+.studio-hero { cursor: zoom-in; border: none; background: none; padding: 0; font: inherit; }
+@media (max-width: 700px) {
+  .lb-nav { width: 34px; height: 64px; font-size: 24px; }
+  .lb-name { display: none; }
+}

@@ -9,7 +9,7 @@ import { DATA, loadConfig, contextBudget } from './config.js';
 import { streamChat } from './llm.js';
 import { webSearch, fetchReadable, fetchPdfText, canReadPdf } from './tools.js';
 import { writeNote } from './vault.js';
-import { id as genId, now, readJSON, writeJSON } from './util.js';
+import { id as genId, now, readJSON, writeJSON, jsonDirIndex } from './util.js';
 
 const DIR = path.join(DATA, 'research');
 const live = new Map(); // id -> AbortController
@@ -27,12 +27,14 @@ const DEPTHS = {
 
 // ---------- store ----------
 
+const researchIndex = jsonDirIndex(DIR, (r) => ({
+  id: r.id, question: r.question, status: r.status, depth: r.depth,
+  modelRef: r.modelRef, updatedAt: r.updatedAt, sources: r.sources.length,
+}));
+
 export function listResearch() {
   fs.mkdirSync(DIR, { recursive: true });
-  return fs.readdirSync(DIR).filter(f => f.endsWith('.json')).map(f => {
-    const r = readJSON(path.join(DIR, f));
-    return r && { id: r.id, question: r.question, status: r.status, depth: r.depth, modelRef: r.modelRef, updatedAt: r.updatedAt, sources: r.sources.length };
-  }).filter(Boolean).sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+  return researchIndex().sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
 }
 
 export function getResearch(id) {
@@ -53,7 +55,8 @@ export function cancel(id) {
   return true;
 }
 
-const save = (r) => { r.updatedAt = now(); writeJSON(file(r.id), r); };
+// Compact: a deep run rewrites this after every source it reads.
+const save = (r) => { r.updatedAt = now(); writeJSON(file(r.id), r, { pretty: false }); };
 
 // ---------- the loop ----------
 

@@ -1,12 +1,15 @@
 // Studio v3: a generation cockpit for the local ComfyUI with selectable
 // workflows — txt2img, img2img (remix a source at a chosen denoise), and pure
 // ESRGAN upscale. Inputs live on the LEFT; the render lands big on the RIGHT
-// with a history strip. AIOS handles the 8GB VRAM dance (LLM ⇄ tiny swap) and
+// with a history strip; click it (or press Enter) for a full-size viewer with
+// ← → to walk the library and Esc to come back. AIOS handles the 8GB VRAM dance
+// (Studio mode stops llama.cpp outright) and
 // even boots ComfyUI itself when it's down. Node-graph surgery (LoRA stacks,
 // ControlNet…) stays in ComfyUI proper via the ↗ link.
 
 import { el, icon, toast, confirmBox } from '../ui.js';
 import { get, post, sub, mediaUrl, uploadFile } from '../api.js';
+import { IMAGE_ACCEPT } from '../imageprep.js';
 import { state } from '../state.js';
 
 const KINDS = [['txt2img', 'Text → Image'], ['img2img', 'Image → Image'], ['upscale', 'Upscale']];
@@ -64,13 +67,13 @@ export default {
   id: 'studio', title: 'Studio', icon: 'image', width: 1240, height: 760,
 
   mount(body, opts, win) {
-    const S = win.studioState = { status: null, checkpoints: [], upscalers: [], jobs: [], unsub: null, busy: false, hero: null, kind: 'txt2img', source: null };
+    const S = win.studioState = { status: null, checkpoints: [], upscalers: [], jobs: [], unsub: null, busy: false, hero: null, kind: 'txt2img', source: null, lightbox: null, onKey: null };
     const ui = {};
     body.classList.add('col');
 
     // ---------- header: status + server lifecycle ----------
     ui.comfyChip = el('span', { class: 'chip' }, '…');
-    ui.llmChip = el('button', { class: 'btn sm ghost git-chip', title: 'Toggle Studio mode (tiny CPU LLM ⇄ big GPU LLM)', onclick: () => toggleStudio() });
+    ui.llmChip = el('button', { class: 'btn sm ghost git-chip', title: 'Toggle Studio mode — stop llama.cpp so ComfyUI gets the whole GPU', onclick: () => toggleStudio() });
     ui.startBtn = el('button', { class: 'btn sm primary', style: { display: 'none' }, title: 'Start the ComfyUI server (AIOS-managed)', onclick: () => serverAction('start') }, icon('play'), 'Start ComfyUI');
     ui.freeBtn = el('button', { class: 'btn sm ghost', style: { display: 'none' }, title: 'Unload models / free VRAM without stopping ComfyUI', onclick: () => serverAction('free') }, 'Free VRAM');
     ui.stopBtn = el('button', { class: 'btn sm ghost danger', style: { display: 'none' }, title: 'Stop the ComfyUI server', onclick: () => serverAction('stop') }, icon('stop'), 'Stop');
@@ -97,17 +100,22 @@ export default {
 
     async function toggleStudio() {
       const llm = S.status?.llm || {};
-      const goingOn = llm.profile !== 'tiny';
+      // Studio mode now STOPS llama.cpp rather than swapping it to a CPU profile,
+      // so "am I in studio mode" is the suspended flag, not the profile name.
+      const goingOn = !llm.suspended;
+      const back = llm.suspended || 'the previous model';
       const what = goingOn
-        ? 'Switch llama.cpp to the tiny CPU model? Chat/agent get slower but the whole GPU frees up for rendering.'
-        : 'Switch back to the big GPU model? ComfyUI unloads first; the big model takes a minute to load.';
-      if (!await confirmBox('Studio mode', what, goingOn ? 'Free the GPU' : 'Back to big', 'primary')) return;
+        ? 'Stop llama.cpp entirely? Chat and agent go offline, but ComfyUI gets the whole card — the most VRAM this machine can give it.'
+        : `Restart llama.cpp (${back})? ComfyUI unloads its models first; the LLM takes a moment to come back.`;
+      if (!await confirmBox('Studio mode', what, goingOn ? 'Free the GPU' : 'Bring the LLM back', 'primary')) return;
       ui.llmChip.disabled = true;
       ui.llmChip.innerHTML = '';
       ui.llmChip.append(el('span', { class: 'spinner' }));
       try {
-        await post('/comfy/studio', { on: goingOn });
-        toast(goingOn ? 'tiny CPU model live — GPU is free' : 'big model back', 'ok');
+        const r = await post('/comfy/studio', { on: goingOn });
+        toast(goingOn
+          ? `llama.cpp stopped — ${r.gpu?.freeMB ?? '?'}MB free for rendering`
+          : `LLM back: ${r.llm?.profile || 'running'}`, 'ok');
       } catch (e) { toast(e.message, 'err'); }
       ui.llmChip.disabled = false;
       refresh();
@@ -162,7 +170,7 @@ export default {
     ui.srcImg = el('img', { class: 'studio-src-img', style: { display: 'none' } });
     ui.srcEmpty = el('span', { class: 'muted small' }, 'no source yet');
     ui.srcUse = el('button', { class: 'btn sm', title: 'Use the render shown on the right as the source', onclick: () => useHeroAsSource() }, 'Use render →');
-    ui.srcFile = el('input', { type: 'file', accept: 'image/*', style: { display: 'none' }, onchange: () => uploadSource() });
+    ui.srcFile = el('input', { type: 'file', accept: IMAGE_ACCEPT, style: { display: 'none' }, onchange: () => uploadSource() });
     ui.srcUpload = el('button', { class: 'btn sm ghost', onclick: () => ui.srcFile.click() }, icon('paperclip'), 'Upload…');
     ui.srcClear = el('button', { class: 'btn sm ghost', title: 'Clear source', onclick: () => setSource(null) }, icon('x'));
 
@@ -269,7 +277,12 @@ export default {
     ui.heroImg = el('img', { class: 'studio-hero-img', style: { display: 'none' } });
     ui.heroEmpty = el('div', { class: 'empty', style: { minHeight: '200px' } }, 'renders land here');
     ui.heroMeta = el('div', { class: 'studio-hero-meta muted small' });
-    ui.hero = el('a', { class: 'studio-hero', href: '#', target: '_blank', rel: 'noreferrer', title: 'Open full size in a new tab' }, ui.heroImg, ui.heroEmpty);
+    // A button, not a link: opening renders in a browser tab loses the library and
+    // the keyboard, which is the whole point of having a strip of them.
+    ui.hero = el('button', {
+      class: 'studio-hero', type: 'button', title: 'View full size  (← → to cycle · Esc to close)',
+      onclick: () => openLightbox(),
+    }, ui.heroImg, ui.heroEmpty);
     ui.strip = el('div', { class: 'studio-strip' });
     ui.right = el('div', { class: 'studio-right' }, ui.hero, ui.heroMeta, ui.strip);
 
@@ -309,8 +322,13 @@ export default {
       ui.comfyChip.title = st.up ? `${st.url}${st.proc?.managed ? ' (AIOS-managed)' : st.proc?.foreign ? ' (started elsewhere)' : ''}` : 'not running — hit Start (or just Generate: it auto-starts)';
       const llm = st.llm || {};
       ui.llmChip.innerHTML = '';
-      ui.llmChip.append(icon('cpu'), llm.running ? ` LLM: ${llm.profile}` : llm.foreign ? ' LLM: unmanaged' : ' LLM: off');
-      ui.llmChip.classList.toggle('dirty', llm.profile === 'tiny');
+      ui.llmChip.append(icon('cpu'), llm.running ? ` LLM: ${llm.profile}`
+        : llm.suspended ? ' LLM: paused for Studio'
+          : llm.foreign ? ' LLM: unmanaged' : ' LLM: off');
+      ui.llmChip.title = llm.suspended
+        ? `Stopped so ComfyUI has the whole GPU. Turning Studio mode off restores ${llm.suspended}.`
+        : 'Which model llama.cpp is serving';
+      ui.llmChip.classList.toggle('dirty', !!llm.suspended);
       ui.openComfy.href = comfyHref(st.url || 'http://127.0.0.1:8188');
       ui.startBtn.style.display = st.up ? 'none' : '';
       ui.freeBtn.style.display = st.up ? '' : 'none';
@@ -418,13 +436,11 @@ export default {
         ui.heroImg.style.display = 'none';
         ui.heroEmpty.style.display = '';
         ui.heroMeta.textContent = '';
-        ui.hero.removeAttribute('href');
         return;
       }
       ui.heroImg.src = mediaUrl('/comfy/image/' + name);
       ui.heroImg.style.display = '';
       ui.heroEmpty.style.display = 'none';
-      ui.hero.href = mediaUrl('/comfy/image/' + name);
       const j = jobOf(name);
       const kindBit = j?.kind === 'img2img' ? ` · img2img d${j.denoise}` : j?.kind === 'upscale' ? ` · upscale ${j.scale || 4}×` : '';
       ui.heroMeta.textContent = j
@@ -435,6 +451,89 @@ export default {
       for (const t of ui.strip.children) t.classList.toggle('on', t.dataset.name === name);
     }
 
+    // ---------- lightbox ----------
+    // Renders used to open in a browser tab, which threw away the library and the
+    // keyboard. This keeps you in the app: ← → walk the strip, Esc comes back.
+
+    /** Every render currently in the strip, newest first — the "library" the
+     *  arrows cycle through. Same order paintOutput() draws. */
+    const imageList = () => S.jobs.filter(j => j.images?.length).flatMap(j => j.images).slice(0, 60);
+
+    function stepHero(delta) {
+      const list = imageList();
+      if (list.length < 2) return;
+      const at = list.indexOf(S.hero);
+      const next = list[((at < 0 ? 0 : at) + delta + list.length) % list.length];
+      setHero(next);
+      if (S.lightbox) paintLightbox();
+      // Keep the selected thumbnail in view when cycling past the fold.
+      ui.strip.querySelector('.studio-thumb-sm.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+
+    function paintLightbox() {
+      if (!S.lightbox || !S.hero) return;
+      const list = imageList();
+      const at = list.indexOf(S.hero);
+      S.lightbox.querySelector('.lb-img').src = mediaUrl('/comfy/image/' + S.hero);
+      S.lightbox.querySelector('.lb-count').textContent = at >= 0 ? `${at + 1} / ${list.length}` : '';
+      S.lightbox.querySelector('.lb-name').textContent = S.hero;
+      S.lightbox.querySelector('.lb-open').href = mediaUrl('/comfy/image/' + S.hero);
+      S.lightbox.querySelector('.lb-save').href = mediaUrl('/comfy/image/' + S.hero);
+      S.lightbox.querySelector('.lb-save').download = S.hero;
+      const single = list.length < 2;
+      for (const b of S.lightbox.querySelectorAll('.lb-nav')) b.style.visibility = single ? 'hidden' : '';
+    }
+
+    function openLightbox(name) {
+      if (name) setHero(name);
+      if (!S.hero || S.lightbox) return;
+      const nav = (dir, glyph, label) => el('button', {
+        class: 'lb-nav lb-' + label, type: 'button', title: `${label} (${dir < 0 ? '←' : '→'})`,
+        onclick: (e) => { e.stopPropagation(); stepHero(dir); },
+      }, glyph);
+
+      S.lightbox = el('div', {
+        class: 'lb-overlay',
+        // Clicking the backdrop closes; clicking the image itself must not.
+        onclick: (e) => { if (e.target === S.lightbox || e.target.classList.contains('lb-stage')) closeLightbox(); },
+      },
+        el('div', { class: 'lb-stage' },
+          nav(-1, '‹', 'prev'),
+          el('img', { class: 'lb-img', alt: '' }),
+          nav(1, '›', 'next')),
+        el('div', { class: 'lb-bar' },
+          el('span', { class: 'lb-count' }),
+          el('span', { class: 'lb-name' }),
+          el('span', { class: 'grow' }),
+          el('a', { class: 'btn sm ghost lb-open', target: '_blank', rel: 'noreferrer', onclick: (e) => e.stopPropagation() }, icon('external'), 'Raw'),
+          el('a', { class: 'btn sm ghost lb-save', onclick: (e) => e.stopPropagation() }, icon('download'), 'Save'),
+          el('button', { class: 'btn sm', type: 'button', onclick: closeLightbox }, 'Close', el('kbd', { class: 'lb-kbd' }, 'Esc'))));
+
+      document.body.append(S.lightbox);
+      paintLightbox();
+    }
+
+    function closeLightbox() {
+      S.lightbox?.remove();
+      S.lightbox = null;
+    }
+
+    // One document-level handler for both the lightbox and the panel. Typing must
+    // never be hijacked, so anything with a focused field bails out early.
+    S.onKey = (e) => {
+      if (!win.node?.isConnected) return;
+      const t = e.target;
+      const typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+      if (e.key === 'Escape' && S.lightbox) { e.preventDefault(); closeLightbox(); return; }
+      if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
+      // Arrows only steer the gallery when this view is the one on screen.
+      if (!S.lightbox && win.node.hidden) return;
+      if (e.key === 'ArrowLeft') { e.preventDefault(); stepHero(-1); }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); stepHero(1); }
+      else if (e.key === 'Enter' && !S.lightbox && S.hero) { e.preventDefault(); openLightbox(); }
+    };
+    document.addEventListener('keydown', S.onKey);
+
     function paintOutput() {
       ui.strip.innerHTML = '';
       const images = S.jobs.filter(j => j.images?.length).flatMap(j => j.images);
@@ -443,6 +542,7 @@ export default {
           class: 'studio-thumb-sm', dataset: { name },
           title: jobOf(name)?.prompt.slice(0, 160) || name,
           onclick: () => setHero(name),
+          ondblclick: () => openLightbox(name),
         }, el('img', { src: mediaUrl('/comfy/image/' + name), loading: 'lazy' })));
       }
       if (!images.length) ui.strip.append(el('div', { class: 'muted small', style: { padding: '6px' } },
@@ -454,5 +554,10 @@ export default {
     refresh();
   },
 
-  unmount(win) { win.studioState?.unsub?.(); },
+  unmount(win) {
+    const S = win.studioState;
+    S?.unsub?.();
+    if (S?.onKey) document.removeEventListener('keydown', S.onKey);
+    S?.lightbox?.remove();
+  },
 };

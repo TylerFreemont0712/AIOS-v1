@@ -119,11 +119,26 @@ await hard('mail: parser units + notification rules', async () => {
 await hard('uploads: roundtrip + classify', async () => {
   const up = await S('uploads.js');
   assert(up.classify('image/png', 'x.png') === 'image' && up.classify('', 'a.py') === 'text' && up.classify('application/pdf', '') === 'pdf', 'classify');
-  const meta = up.saveUpload({ name: 'note.txt', mime: 'text/plain', data: Buffer.from('hello audit').toString('base64') });
+  // An iPhone hands us HEIC, or a photo with no MIME type at all, or a HEIC labelled
+  // image/jpeg. All three used to classify as 'other' and never reach a vision model.
+  assert(up.classify('image/heic', 'IMG_1.HEIC') === 'image', 'heic is an image');
+  assert(up.classify('', 'IMG_2.HEIC') === 'image', 'heic with no mime is an image');
+  assert(up.classify('application/octet-stream', 'IMG_3.jpg') === 'image', 'jpeg with a generic mime is an image');
+  assert(up.normalizeMime('', 'IMG_4.HEIC') === 'image/heic', 'mime inferred from extension');
+  assert(up.sniffMime(Buffer.from('0000ftypheic', 'latin1')) === 'image/heic', 'heic sniffed from its header');
+  assert(up.sniffMime(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0])) === 'image/jpeg', 'jpeg sniffed');
+  assert(up.isProviderSafeImage('image/jpeg') && !up.isProviderSafeImage('image/heic'), 'provider-safe set');
+
+  const meta = await up.saveUpload({ name: 'note.txt', mime: 'text/plain', data: Buffer.from('hello audit').toString('base64') });
   const { buffer } = up.readUpload(meta.id);
   assert(buffer.toString() === 'hello audit', 'bytes roundtrip');
   assert(up.resolveAttachments([{ id: meta.id }, { id: '../evil' }]).length === 1, 'junk id not stripped');
-  return 'save/read · classify · resolveAttachments';
+
+  // Raw binary path (what every current client uses) and byte-sniffing over a lying client.
+  const png = Buffer.concat([Buffer.from([0x89]), Buffer.from('PNG\r\n\x1a\n', 'latin1'), Buffer.alloc(8)]);
+  const raw = await up.saveUploadBuffer({ name: 'shot.bin', mime: 'application/octet-stream', buffer: png });
+  assert(raw.kind === 'image' && raw.mime === 'image/png', 'raw upload sniffed as png, got ' + raw.mime);
+  return 'save/read · classify · sniff · heic · raw · resolveAttachments';
 });
 
 await hard('weather: WMO map + unconfigured state', async () => {
@@ -277,7 +292,12 @@ await hard('chat: read-only tool belt', async () => {
   const t = await S('tools.js');
   const names = t.chatTools().map(x => x.name);
   assert(names.includes('web_search') && names.includes('fetch_url'), 'chat has web tools (news)');
-  assert(!names.some(n => t.isWriteTool(n)), 'chat tools are all read-only');
+  // Chat is read-only EXCEPT for a curated set of note/planner/finance writes
+  // (quick_note, task_add, finance_log…). What matters is that every write tool it can
+  // reach is on that list — chat.js refuses any other write at call time.
+  const writes = names.filter(n => t.isWriteTool(n));
+  const unsafe = writes.filter(n => !t.isChatSafeWrite(n));
+  assert(!unsafe.length, 'chat offers write tools that are not chat-safe: ' + unsafe.join(', '));
   for (const forbidden of ['bash', 'write_file', 'edit_file', 'git_commit', 'delete_path']) {
     assert(!names.includes(forbidden), `chat must NOT expose ${forbidden}`);
   }
@@ -396,9 +416,11 @@ srv.listen(0, async () => {
   return 'wedged provider throws instead of hanging';
 });
 
-await hard('router: bench-driven model routing', async () => {
-  // Pure routing logic (no llama boots): seed bench.db with two local models that have
-  // OPPOSITE strengths, then assert the route table sends each category to its winner.
+await hard('router: local provider match + bench join', async () => {
+  // No llama boots: seed bench.db with two local models recorded under DIFFERENT ref
+  // styles, then assert both join back to their ggufs and the managed provider is
+  // matched by port. (The auto:<category> route table this used to assert was removed
+  // 2026-07-27 — per-category winners live in the Bench app.)
   // Subprocess so the seeded AIOS_DATA is read fresh by config/bench/router.
   const { spawnSync } = await import('node:child_process');
   const script = `
@@ -425,14 +447,17 @@ ins.run('r2','x',A,'reasoning','reasoning',0.3,40,'2026-07-18T01:00:00Z');
 ins.run('r3','x',B,'coding','coding',0.4,12,'2026-07-18T01:00:00Z');
 ins.run('r4','x',B,'reasoning','reasoning',0.95,12,'2026-07-18T01:00:00Z');
 db.close();
-const { candidates, routeTable, localProviderId } = await import(${JSON.stringify(path.join(ROOT, 'server', 'router.js'))});
+const { candidates, localProviderId, legacyAutoRef } = await import(${JSON.stringify(path.join(ROOT, 'server', 'router.js'))});
 const prov = localProviderId();
 const cands = candidates();
-const t = routeTable();
+const byFile = Object.fromEntries(cands.map(c => [c.file, c.bench]));
 const out = {
   prov,
   joined: cands.filter(c => c.bench).length,
-  coding: t.coding?.file, reasoning: t.reasoning?.file, fast: t.fast?.file, best: t.best?.file,
+  aCoding: byFile[a.file]?.categories?.coding,
+  bReasoning: byFile[b.file]?.categories?.reasoning,
+  aTokS: byFile[a.file]?.tokS,
+  legacy: await legacyAutoRef().catch(e => 'ERR ' + e.message),
   aFile: a.file, bFile: b.file,
 };
 console.log('RESULT ' + JSON.stringify(out));`;
@@ -446,11 +471,12 @@ console.log('RESULT ' + JSON.stringify(out));`;
   const o = JSON.parse(m[1]);
   assert(o.prov === 'custom_lm', 'local provider matched by port');
   assert(o.joined === 2, 'bench rows joined to local ggufs by alias');
-  assert(o.coding === o.aFile, 'coding routes to the coding winner');
-  assert(o.reasoning === o.bFile, 'reasoning routes to the reasoning winner');
-  assert(o.fast === o.aFile, 'fast routes by measured tok/s');
-  assert(o.best, 'best category resolves');
-  return 'provider match · alias join · per-category winners · speed routing';
+  assert(o.aCoding === 0.9, 'per-category bench scores survive the join, got ' + o.aCoding);
+  assert(o.bReasoning === 0.95, 'the provider-ref model joins too, got ' + o.bReasoning);
+  assert(o.aTokS === 40, 'measured tok/s carried through, got ' + o.aTokS);
+  // A ref saved before auto: was removed must still resolve to something real.
+  assert(/^(custom_lm|local):/.test(o.legacy), 'legacy auto: ref resolves, got ' + o.legacy);
+  return 'provider match · alias join · bench scores · legacy auto: ref';
 });
 
 await hard('llm: generation-speed measurement', async () => {
@@ -870,6 +896,198 @@ await hard('learn: assessments, scoring + mastery', async () => {
   assert(L.getWeakTopics(s.id).find(w => w.topic === 'alpha').seen === 3, 'conversational grading moves mastery too');
   L.deleteSubject(s.id, { confirm: 'Audit Quiz Subject' });   // has attempts → guarded
   return 'authoring · answer hiding · mcq/multi/shortanswer/order grading · pass bar · mastery · replay guard';
+});
+
+await hard('receipts: hallucination guards', async () => {
+  const r = await S('receipts.js');
+  const mk = (items, t = { subtotal: 300, tax: 30, total: 330 }) =>
+    r.normalizeParsed({ merchant: 'Audit Shop', date: '2026-05-28', currency: 'JPY', items, ...t });
+
+  // A receipt is a closed system: the lines must reconcile with the subtotal. This is the
+  // only hallucination check that needs neither a model nor any history.
+  const clean = mk([{ printed: '虫ゴム交換(前後セット)', name: 'Valve rubber', qty: 1, amount: 300 }]);
+  assert(clean.check.verdict === 'balanced' && clean.check.delta === 0, 'a correct receipt balances');
+
+  const invented = mk([
+    { printed: '虫ゴム交換(前後セット)', name: 'Valve rubber', qty: 1, amount: 300 },
+    { printed: 'ドリンク', name: 'Drink', qty: 1, amount: 180 },
+  ]);
+  assert(invented.check.verdict === 'overshoot' && invented.check.delta === 180,
+    'an invented line overshoots by its own amount, got ' + JSON.stringify(invented.check));
+
+  assert(mk([]).check.verdict === 'no-items', 'no lines is distinguishable from balanced');
+
+  // A line worth more than the whole receipt cannot be real.
+  const huge = mk([
+    { printed: 'ok', name: 'ok', qty: 1, amount: 300 },
+    { printed: 'タイヤ', name: 'Tyre', qty: 1, amount: 8000 },
+  ]);
+  assert(huge.items.length === 1 && huge.dropped?.[0]?.why === 'more than the receipt total',
+    'over-total line dropped and reported');
+
+  // Summary lines masquerading as products — observed live: `小計 1点 ￥300` renamed
+  // "Product". Anchored so a real product that merely STARTS with the vocabulary survives.
+  const dropsIt = (printed) => {
+    const n = mk([{ printed, name: printed, qty: 1, amount: 100 }, { printed: 'x', name: 'x', qty: 1, amount: 200 }]);
+    return (n.dropped || []).some(d => d.printed === printed);
+  };
+  for (const s of ['小計 1点 ￥300', '合計', 'お預り 1000', 'お釣り', 'ポイント', 'レジ袋 5',
+    '消費税 30', '伝票番号 No.28822', 'Total 640', 'Subtotal', 'TAX 8%', 'Change 360', 'Points 6']) {
+    assert(dropsIt(s), `summary line not dropped: ${s}`);
+  }
+  for (const s of ['カード型ケース', 'Card case', '牛乳 1000ml', 'おにぎり 鮭', 'Total Wine Merlot',
+    'ポイントカード発行手数料', '現金書留封筒', '虫ゴム交換(前後セット)']) {
+    assert(!dropsIt(s), `real product wrongly dropped: ${s}`);
+  }
+
+  // A placeholder name is worse than the printed text — it would pollute the catalogue.
+  const ph = mk([{ printed: '虫ゴム交換', name: 'Product', qty: 1, amount: 300 }]);
+  assert(ph.items[0].name === '虫ゴム交換', 'placeholder name falls back to the printed text');
+
+  return 'reconciliation · over-total · 21 summary/product cases · placeholder names';
+});
+
+await hard('receipts: the correction loop learns', async () => {
+  const r = await S('receipts.js');
+  const { run } = await S('financedb.js');
+  const { now } = await S('util.js');
+
+  const scanned = r.normalizeParsed({
+    merchant: 'Learn Shop', date: '2026-06-01', currency: 'JPY',
+    items: [
+      { printed: '本物の品', name: 'Real thing', qty: 1, amount: 300 },
+      { printed: '幽霊の品', name: 'Phantom', qty: 1, amount: 180 },   // invented
+    ], subtotal: 300, tax: 30, total: 330,
+  });
+  assert(!scanned.check.ok, 'the seeded scan should not reconcile');
+
+  const seed = (id) => run(`INSERT INTO finance_receipt (id,upload_id,status,model,raw,parsed,parsed_ai,error,txn_ids,created_at,updated_at)
+    VALUES (?,'','parsed','audit','',?,'','','[]',?,?)`, id, JSON.stringify(scanned), now(), now());
+
+  // Correct it twice — a fix is only trusted after being made more than once, so one
+  // odd misread never becomes a standing rule.
+  for (const id of ['aud1', 'aud2']) {
+    seed(id);
+    r.editReceipt(id, { ...scanned, items: scanned.items.filter(i => i.name !== 'Phantom') });
+    const rec = await r.apply(id, { mode: 'total' });
+    assert(rec.learned.learned >= 1, 'apply() learned nothing from the edit');
+  }
+  const fix = r.listFixes().find(f => f.kind === 'drop' && f.raw === '幽霊の品');
+  assert(fix && fix.hits === 2 && fix.active, 'the drop should be recorded twice and active: ' + JSON.stringify(fix));
+
+  // A fresh scan of the SAME shop now self-corrects, with no model involved.
+  const again = r.replayFixes(r.normalizeParsed({
+    merchant: 'Learn Shop', date: '2026-06-08', currency: 'JPY',
+    items: [
+      { printed: '本物の品', name: 'Real thing', qty: 1, amount: 300 },
+      { printed: '幽霊の品', name: 'Phantom', qty: 1, amount: 180 },
+    ], subtotal: 300, tax: 30, total: 330,
+  }));
+  assert(again.items.length === 1 && again.check.verdict === 'balanced',
+    'a learned drop should be replayed and restore the balance');
+  assert(again.learned?.[0]?.kind === 'drop', 'the replay should be reported to the UI');
+
+  // …and must not leak to a different shop.
+  const other = r.replayFixes(r.normalizeParsed({
+    merchant: 'Different Shop', date: '2026-06-08', currency: 'JPY',
+    items: [{ printed: '幽霊の品', name: 'Phantom', qty: 1, amount: 180 }], subtotal: 180, tax: 0, total: 180,
+  }));
+  assert(other.items.length === 1, 'a fix learned at one shop must not apply at another');
+
+  // An applied receipt is frozen — editing it would desync the ledger.
+  let refused = false;
+  try { r.editReceipt('aud1', { total: 999 }); } catch { refused = true; }
+  assert(refused, 'editing an already-applied receipt must be refused');
+
+  return 'learn on apply · hits gate · deterministic replay · merchant-scoped · applied is frozen';
+});
+
+await hard('finance: deleting a row forgets its price', async () => {
+  const fin = await S('finance.js');
+  const items = await S('items.js');
+  const r = await S('receipts.js');
+  const { run } = await S('financedb.js');
+  const { now } = await S('util.js');
+
+  // The reported failure: a receipt logged with a phantom "お茶" line that doubled it.
+  // Deleting the ledger row used to leave the price observation behind, so the invented
+  // ¥200 kept counting toward what tea "usually" costs — and priceProbe() would then
+  // judge future scans against a hallucination.
+  const tea = items.createItem({ nameEn: 'Audit Tea', unit: 'each', typicalSize: 1 });
+  const t = fin.addTxn({ date: '2026-07-20', kind: 'expense', amount: 200, currency: 'JPY', category: 'Groceries', merchant: 'Audit Super' });
+  items.recordPurchase({ itemId: tea.id, txnId: t.id, date: '2026-07-20', merchant: 'Audit Super', rawName: 'お茶', qty: 1, lineTotal: 200, currency: 'JPY' });
+  assert(items.itemDetail(tea.id).purchases.length === 1, 'the observation should be recorded');
+  fin.deleteTxn(t.id);
+  assert(items.itemDetail(tea.id).purchases.length === 0, 'deleting the row must forget its price observation');
+
+  // Bulk delete has to do the same, or the cleanup depends on which button you pressed.
+  const t2 = fin.addTxn({ date: '2026-07-21', kind: 'expense', amount: 300, currency: 'JPY', category: 'Groceries' });
+  items.recordPurchase({ itemId: tea.id, txnId: t2.id, date: '2026-07-21', merchant: 'S', rawName: 'お茶', qty: 1, lineTotal: 300, currency: 'JPY' });
+  fin.deleteTxns([t2.id]);
+  assert(items.itemDetail(tea.id).purchases.length === 0, 'bulk delete must forget prices too');
+
+  // Reverting a whole applied receipt: rows gone, prices gone, scan editable again.
+  const parsed = r.normalizeParsed({
+    merchant: 'Audit Super', date: '2026-07-22', currency: 'JPY',
+    items: [{ printed: 'パン', name: 'Bread', qty: 1, amount: 200 },
+      { printed: 'お茶', name: 'Ocha', qty: 1, amount: 200 }],
+    subtotal: 200, tax: 0, total: 200,
+  });
+  assert(parsed.check.verdict === 'overshoot', 'the phantom should show as an overshoot');
+  run(`INSERT INTO finance_receipt (id,upload_id,status,model,raw,parsed,parsed_ai,error,txn_ids,created_at,updated_at)
+       VALUES ('audrv','','parsed','audit','',?,'','','[]',?,?)`, JSON.stringify(parsed), now(), now());
+  const applied = await r.apply('audrv', { mode: 'items' });
+  assert(applied.created.length === 2, 'both lines should post');
+
+  let frozen = false;
+  try { r.editReceipt('audrv', parsed); } catch { frozen = true; }
+  assert(frozen, 'an applied receipt must be frozen until reverted');
+
+  const rev = r.revertReceipt('audrv');
+  assert(rev.receipt.status === 'parsed', 'revert should reopen the scan, got ' + rev.receipt.status);
+  assert(rev.undone.transactions === 2, 'revert should remove both rows, got ' + rev.undone.transactions);
+  for (const id of applied.created.map(x => x.id)) {
+    let gone = false;
+    try { fin.getTxn(id); } catch { gone = true; }
+    assert(gone, 'a reverted transaction should be gone from the ledger');
+  }
+  r.editReceipt('audrv', { ...parsed, items: [parsed.items[0]] });   // editable again
+  assert(r.getReceipt('audrv').parsed.items.length === 1, 'the reverted scan should accept edits');
+
+  // Reverting something that was never applied is a mistake worth naming.
+  let refused = false;
+  try { r.revertReceipt('audrv'); } catch { refused = true; }
+  assert(refused, 'reverting an unapplied receipt should be refused');
+
+  return 'delete forgets prices · bulk delete too · revert unwinds rows+prices · frozen until reverted';
+});
+
+await hard('items: bulk review actions', async () => {
+  const items = await S('items.js');
+  const milk = items.createItem({ nameEn: 'Audit Milk', unit: 'ml', typicalSize: 1000 });
+
+  // Two observations of the same printed name, plus one that was never a product.
+  for (const d of ['2026-07-01', '2026-07-08']) {
+    items.recordPurchase({ date: d, merchant: 'Bulk Shop', rawName: '明治おいしい牛乳 1000ml', qty: 1, lineTotal: 250, currency: 'JPY' });
+  }
+  items.recordPurchase({ date: '2026-07-08', merchant: 'Bulk Shop', rawName: 'ポイント値引', qty: 1, lineTotal: 6, currency: 'JPY' });
+
+  const queue = items.unresolved({ limit: 50 });
+  const milkRow = queue.find(g => /牛乳/.test(g.rawName));
+  const junkRow = queue.find(g => /ポイント/.test(g.rawName));
+  assert(milkRow && milkRow.count === 2, 'the queue groups by printed name');
+
+  // One call files the whole group — assignPurchase already fans out to siblings.
+  const res = items.assignPurchases([{ purchaseId: milkRow.purchaseIds[0], itemId: milk.id }]);
+  assert(res.assigned === 2, 'bulk assign should file every sibling, got ' + res.assigned);
+  assert(items.itemDetail(milk.id).purchases.length === 2, 'both observations should now belong to the item');
+
+  // …and the non-product can be binned outright rather than needing a fake catalogue entry.
+  const dropped = items.dropPurchases(junkRow.purchaseIds);
+  assert(dropped.dropped === junkRow.purchaseIds.length, 'drop should remove the observations');
+  assert(!items.unresolved({ limit: 50 }).some(g => /ポイント/.test(g.rawName)), 'the binned line should leave the queue');
+
+  return 'grouped queue · one call files a whole group · non-products discardable';
 });
 
 await hard('llmctl: profiles + launcher config', async () => {

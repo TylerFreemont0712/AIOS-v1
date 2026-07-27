@@ -1,6 +1,8 @@
 // AIOS-managed llama.cpp lifecycle (ownership approved 2026-07-11). Two profiles:
-// 'big'  — the GPU daily driver (ornith-9b)
-// 'tiny' — CPU-only (-ngl 0) tool-call model that frees ALL VRAM for ComfyUI.
+// 'big'  — the GPU daily driver
+// 'tiny' — a small fast model for quick work and low-VRAM situations
+// Freeing the GPU for ComfyUI is no longer a profile swap: suspendForGpu() stops
+// llama-server outright and resumeAfterGpu() puts back whatever was serving.
 // Pidfile discipline mirrors scripts/aios-launch.sh; a llama-server started by the
 // old PyQt launcher is treated as "foreign" and replaced on the first swap.
 
@@ -9,10 +11,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DATA, loadConfig } from './config.js';
+import { gpuStats } from './gpu.js';
 
 const DIR = path.join(DATA, 'llm');
 const PIDFILE = path.join(DIR, 'llama.pid');
 const PROFILE_FILE = path.join(DIR, 'profile');
+// What was serving before something else needed the whole GPU. Kept in a file
+// rather than a module variable so an AIOS restart mid-Studio-session can still
+// put the right model back.
+const SUSPEND_FILE = path.join(DIR, 'suspended');
 const LOG = path.join(DIR, 'llama.log');
 
 const err = (msg, status = 400) => Object.assign(new Error(msg), { status });
@@ -20,11 +27,45 @@ const readPid = () => { try { return Number(fs.readFileSync(PIDFILE, 'utf8').tri
 const alive = (pid) => { try { return pid > 0 && (process.kill(pid, 0), true); } catch { return false; } };
 const isLlama = (pid) => { try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('llama-server'); } catch { return false; } };
 
+/**
+ * PIDs whose command line contains `needle`, read straight out of /proc.
+ *
+ * This replaced a `spawnSync('pgrep')`, which is a fork — measured at 23.8ms of
+ * BLOCKED event loop per call on this box, against 2.4ms for the scan below. It is
+ * not a cold path: resolveModel() in router.js asks "what is serving?" up to four
+ * times per chat send, and the Models app polls /api/llm/status every 12s, so the
+ * old version stalled the whole server for ~95ms on every message. pgrep stays as
+ * the fallback for anything without /proc.
+ */
+export function pidsMatching(needle) {
+  let entries;
+  try { entries = fs.readdirSync('/proc'); }
+  catch {
+    const r = spawnSync('pgrep', ['-f', needle], { encoding: 'utf8', timeout: 4000 });
+    return (r.stdout || '').split('\n').filter(Boolean).map(Number).filter(Boolean);
+  }
+  const out = [];
+  for (const e of entries) {
+    const c = e.charCodeAt(0);
+    if (c < 48 || c > 57) continue;                       // only numeric entries are pids
+    try { if (fs.readFileSync(`/proc/${e}/cmdline`, 'latin1').includes(needle)) out.push(Number(e)); }
+    catch { /* the process exited mid-scan, or is not ours to read */ }
+  }
+  return out;
+}
+
+// The scan is cheap but not free, and one request can ask several times. A beat of
+// cache collapses those into one; anything that starts or stops a server clears it.
+let pidCache = { at: 0, pids: null };
+export const invalidateProcCache = () => { pidCache = { at: 0, pids: null }; };
+
 /** llama-server processes AIOS did not start (e.g. the PyQt launcher's child). */
 function foreignPids() {
-  const r = spawnSync('pgrep', ['-f', 'llama-server --model'], { encoding: 'utf8', timeout: 4000 });
+  if (!pidCache.pids || Date.now() - pidCache.at > 1000) {
+    pidCache = { at: Date.now(), pids: pidsMatching('llama-server') };
+  }
   const own = readPid();
-  return (r.stdout || '').split('\n').filter(Boolean).map(Number).filter(p => p && p !== own);
+  return pidCache.pids.filter(p => p && p !== own);
 }
 
 export function llmStatus() {
@@ -41,6 +82,9 @@ export function llmStatus() {
     pid: mine ? pid : (foreign[0] || 0),
     port: cfg.port || 8080,
     profiles: Object.keys(cfg.profiles || {}),
+    // Set while Studio/ComfyUI holds the GPU. The UI needs this to distinguish
+    // "deliberately stopped so Comfy can render" from "the LLM fell over".
+    suspended: gpuSuspendedFor(),
   };
 }
 
@@ -82,11 +126,61 @@ export async function stopLlama() {
   const own = readPid();
   if (alive(own) && isLlama(own)) await killPid(own);
   for (const p of foreignPids()) if (isLlama(p)) await killPid(p);
+  invalidateProcCache();
   try { fs.unlinkSync(PIDFILE); } catch { }
   try { fs.unlinkSync(PROFILE_FILE); } catch { }
   for (let i = 0; i < 20 && await healthy(cfg.port || 8080); i++) await sleep(250);
   return { stopped: true };
 }
+
+/** Free the GPU completely for another tenant (ComfyUI), remembering what was
+ *  loaded so it can be restored afterwards.
+ *
+ *  Stopping beats swapping to the tiny CPU profile: a llama-server process holds
+ *  its CUDA context and cuBLAS workspace even at -ngl 0, which is a few hundred MB
+ *  that an SDXL checkpoint would rather have. On an 8GB card that margin decides
+ *  whether a generation fits. */
+export async function suspendForGpu() {
+  const cur = llmStatus();
+  if (!cur.running && !cur.foreign) return { suspended: false, was: '', reason: 'nothing was serving' };
+  const was = cur.running ? (cur.profile || '') : '';
+  fs.mkdirSync(DIR, { recursive: true });
+  try { fs.writeFileSync(SUSPEND_FILE, was); } catch { }
+  await stopLlama();
+  return { suspended: true, was, gpu: gpuStats() };
+}
+
+/** Put back whatever suspendForGpu() stopped. Falls back to `fallback` when
+ *  nothing was remembered, and does nothing if something is already serving. */
+export async function resumeAfterGpu({ fallback = 'big' } = {}) {
+  let was = '';
+  try { was = fs.readFileSync(SUSPEND_FILE, 'utf8').trim(); } catch { }
+  try { fs.unlinkSync(SUSPEND_FILE); } catch { }
+
+  const cur = llmStatus();
+  if (cur.running) return { resumed: false, profile: cur.profile, reason: 'already serving' };
+
+  const target = was || fallback;
+  try {
+    if (target.startsWith('model:')) return { resumed: true, ...(await startModel(target.slice(6))) };
+    return { resumed: true, ...(await startProfile(target)) };
+  } catch (e) {
+    // A remembered model that has since been deleted must not leave the box with
+    // no LLM at all.
+    if (target !== fallback) {
+      try { return { resumed: true, ...(await startProfile(fallback)), note: `${target} failed: ${e.message}` }; }
+      catch { /* fall through */ }
+    }
+    return { resumed: false, error: e.message };
+  }
+}
+
+/** Is a restore pending? Lets the UI say "Studio has the GPU" honestly.
+ *  A function declaration, not a const, so llmStatus() above can call it. */
+export function gpuSuspendedFor() {
+  try { return fs.readFileSync(SUSPEND_FILE, 'utf8').trim() || ''; } catch { return ''; }
+}
+export const gpuSuspended = () => !!gpuSuspendedFor();
 
 /**
  * Start (or switch to) a profile. Kills whatever llama-server currently runs,
@@ -162,6 +256,47 @@ export function listMmproj() {
     } catch { }
   }
   return out;
+}
+
+/**
+ * Local models that can actually see: their preset names an mmproj projector that is
+ * really on disk. This is the single definition of "vision-capable" in AIOS — nothing
+ * hardcodes a filename, so pairing a new model with an mmproj in Settings → Models is
+ * all it takes for receipt OCR to start offering it.
+ *
+ * Sorted smallest-first, which on an 8GB card is also load-order preference: a
+ * projector plus weights has to fit beside whatever else holds VRAM.
+ */
+export function visionModels() {
+  const have = new Set(listMmproj().map(m => m.file));
+  const out = [];
+  for (const m of listLocalModels()) {
+    const preset = presetFor(m.file, m.sizeGB);
+    if (preset.mmproj && have.has(preset.mmproj)) {
+      out.push({ ref: `local:${modelAlias(m.file)}`, alias: modelAlias(m.file), file: m.file, sizeGB: m.sizeGB, mmproj: preset.mmproj });
+    }
+  }
+  return out.sort((a, b) => a.sizeGB - b.sizeGB);
+}
+
+/**
+ * Can this model ref read an image? Returns true / false / null when unknowable.
+ *
+ * `null` matters: a ref pointing at an OpenAI-compatible endpoint we do not manage
+ * might well be vision-capable, and refusing it would be wrong. Only a ref that
+ * resolves to a local gguf with no projector is a definite no.
+ */
+export function refSeesImages(ref) {
+  const s = String(ref || '').trim();
+  if (!s) return null;
+  const provider = s.includes(':') ? s.slice(0, s.indexOf(':')) : '';
+  const alias = s.includes(':') ? s.slice(s.indexOf(':') + 1) : s;
+  if (provider === 'anthropic') return true;              // every Claude model sees
+  if (provider === 'auto') return null;                   // resolved per request
+  const m = findByAlias(alias);
+  if (!m) return null;                                    // not one of ours — cannot say
+  const preset = presetFor(m.file, m.sizeGB);
+  return !!(preset.mmproj && listMmproj().some(x => x.file === preset.mmproj));
 }
 
 /** Parameter count in billions, from the filename convention (27B, 12b, 1.7B, E4B).
@@ -288,8 +423,12 @@ async function boot({ model, alias, args, label, budget }) {
   fs.writeSync(out, `\n===== ${new Date().toISOString()} starting "${label}" =====\n`);
   const child = spawn(cfg.binary, argv, { detached: true, stdio: ['ignore', out, out] });
   child.unref();
+  // The child dup'd the descriptor into its own table, so OUR copy is now pure leak —
+  // and with Studio swapping models on every generation, one per swap adds up.
+  try { fs.closeSync(out); } catch { }
   fs.writeFileSync(PIDFILE, String(child.pid));
   fs.writeFileSync(PROFILE_FILE, label);
+  invalidateProcCache();
 
   const t0 = Date.now();
   while (Date.now() - t0 < budget) {

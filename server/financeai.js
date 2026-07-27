@@ -86,7 +86,7 @@ export async function generateRecap(month, { model, force = false, signal } = {}
 
   const text = res.text || res.reasoning || '';
   const { extractJSON } = await import('./util.js');
-  const obj = extractJSON(text) || {};
+  const obj = extractJSON(text, { require: ['summary', 'headline'] }) || {};
   let headline = String(obj.headline || '').trim().slice(0, 200);
   let summary = String(obj.summary || '').trim();
 

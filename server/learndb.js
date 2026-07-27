@@ -213,14 +213,25 @@ function ensureColumn(table, col, decl) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all();
   if (cols.some(c => c.name === col)) return;
   db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${decl}`);
+  stmts.clear();                         // ALTER TABLE can invalidate prepared statements
   console.log(`[learn] schema: added ${table}.${col}`);
 }
 
 // ---------- tiny query helpers ----------
 
-export const all = (sql, ...args) => getDb().prepare(sql).all(...args);
-export const one = (sql, ...args) => getDb().prepare(sql).get(...args) ?? null;
-export const run = (sql, ...args) => getDb().prepare(sql).run(...args);
+// Prepared once, reused after. The SQL strings are literals in this codebase, so the
+// cache is bounded by the code rather than by traffic; a review session that grades
+// twenty lessons no longer recompiles the same UPDATE twenty times.
+const stmts = new Map();
+function stmt(sql) {
+  let s = stmts.get(sql);
+  if (!s) { s = getDb().prepare(sql); stmts.set(sql, s); }
+  return s;
+}
+
+export const all = (sql, ...args) => stmt(sql).all(...args);
+export const one = (sql, ...args) => stmt(sql).get(...args) ?? null;
+export const run = (sql, ...args) => stmt(sql).run(...args);
 
 /** node:sqlite has no transaction sugar; this keeps multi-write ops atomic. */
 export function tx(fn) {

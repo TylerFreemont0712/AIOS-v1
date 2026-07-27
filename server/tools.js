@@ -477,6 +477,16 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: 'price_check', write: false, group: 'apps',
+    description: 'What the user pays for a specific thing, and which shop is cheapest for it. Prices are normalised per litre / per kilo / per item, so pack sizes are already accounted for. Use for "where should I buy milk", "am I paying more for coffee than I used to", "what does X usually cost me". Search matches English, Japanese, and the exact text printed on receipts. Omit `item` to list the tracked items with the biggest available saving.',
+    parameters: {
+      type: 'object',
+      properties: {
+        item: { type: 'string', description: 'e.g. "milk", "牛乳", or part of a printed receipt line' },
+      },
+    },
+  },
+  {
     name: 'finance_log', write: true, group: 'apps',
     description: 'Record one transaction in the user\'s Finances ledger. Use when they say they spent or earned something ("log 1200 yen for lunch", "I got paid 50000"). Amounts are positive; `kind` carries the direction. Check finance_search first if a duplicate looks likely.',
     parameters: {
@@ -946,7 +956,7 @@ const CHAT_TOOL_ALLOW = new Set([
   'vault_search', 'vault_list', 'vault_read', 'wiki_recall', 'note_template',
   'mail_recent', 'mail_search', 'mail_read',
   'agenda_view',
-  'finance_summary', 'finance_search', 'finance_insights',
+  'finance_summary', 'finance_search', 'finance_insights', 'price_check',
   'learn_subjects', 'learn_subject', 'learn_lesson_read', 'learn_weak_topics',
   // additive writes Chat is allowed to make (see CHAT_SAFE_WRITES) — jotting notes,
   // logging the day, adding planner items on request
@@ -1494,6 +1504,42 @@ const impls = {
         (i.goal.majorPct !== null ? ` · stretch ${i.goal.majorPct}%` : ''));
     }
     if (out.length === 3) out.push('Nothing unusual stands out this period.');
+    return out.join('\n');
+  },
+
+  async price_check({ item }) {
+    const itemsMod = await import('./items.js');
+    // Shopper units: per litre / per kilo reads naturally, per millilitre does not.
+    const per = (u) => (u === 'ml' ? '/L' : u === 'g' ? '/kg' : ' each');
+    const val = (v, u) => Math.round((u === 'each' ? v : v * 1000) * 100) / 100;
+
+    if (!item) {
+      const { items: list, currency } = itemsMod.listItems({ sort: 'saving', limit: 10 });
+      const worth = list.filter(i => i.timesBought >= 2 && i.medianUnitPrice > i.bestUnitPrice * 1.05);
+      if (!worth.length) return 'No item has enough price history yet to say where it is cheapest. Scan a few more receipts.';
+      return 'Where the biggest savings are (normalised per litre / kilo / item):\n'
+        + worth.map(i => `  ${i.nameEn}${i.nameJa ? ` (${i.nameJa})` : ''}: usually ${currency} ${val(i.medianUnitPrice, i.unit)}${per(i.unit)}, `
+          + `but ${currency} ${val(i.bestUnitPrice, i.unit)}${per(i.unit)} at ${i.bestMerchant || 'somewhere'} — bought ${i.timesBought}×`).join('\n');
+    }
+
+    const { items: found, currency } = itemsMod.listItems({ search: String(item), limit: 5 });
+    if (!found.length) return `Nothing tracked matching "${item}". Prices only exist for items that have appeared on a scanned receipt.`;
+    const out = [];
+    for (const hit of found.slice(0, 3)) {
+      const d = itemsMod.itemDetail(hit.id);
+      const u = d.item.unit;
+      out.push(`${d.item.nameEn}${d.item.nameJa ? ` (${d.item.nameJa})` : ''} — bought ${d.stats.timesBought}×, `
+        + `${currency} ${d.stats.totalSpent.toLocaleString('en-US')} spent in total`);
+      if (!d.merchants.length) { out.push('  no priced purchases yet'); continue; }
+      for (const m of d.merchants) {
+        out.push(`  ${m.merchant}: usually ${currency} ${val(m.median, u)}${per(u)} `
+          + `(best ${currency} ${val(m.best, u)}, ${m.count}×, last ${m.lastDate})`);
+      }
+      if (d.saving) out.push(`  → ${d.cheapest.merchant} is ${d.saving.pct}% cheaper than ${d.saving.vs}`);
+      if (d.stats.trendPct !== null) {
+        out.push(`  → price is ${d.stats.trendPct > 0 ? 'up' : 'down'} ${Math.abs(d.stats.trendPct)}% since you started tracking it`);
+      }
+    }
     return out.join('\n');
   },
 

@@ -10,11 +10,56 @@ export function readJSON(file, fallback = null) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
 }
 
-export function writeJSON(file, data) {
+/**
+ * Atomic JSON write.
+ *
+ * `pretty` is on by default because most of what AIOS stores is meant to be readable
+ * by hand (config, presets, project registries). Transcripts pass `false`: they are
+ * written on EVERY streamed turn, they grow all session, and indenting them costs both
+ * the extra bytes and the event-loop time to produce them — writeFileSync blocks, so a
+ * long chat was charging every message for the length of its own history.
+ */
+export function writeJSON(file, data, { pretty = true } = {}) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.writeFileSync(tmp, pretty ? JSON.stringify(data, null, 2) : JSON.stringify(data));
   fs.renameSync(tmp, file);
+}
+
+/**
+ * A list view over a directory of JSON records, cached by mtime.
+ *
+ * Sidebars (chats, agent sessions, research) need a handful of fields per record —
+ * usually including a message COUNT, which is why this was reading and parsing every
+ * transcript in full on every refresh. That is O(all bytes ever written) for a list
+ * that changes one row at a time, it blocks the event loop, and it gets slower every
+ * day the box stays up. Now an unchanged file costs one stat().
+ *
+ * The cache is bounded by the directory: entries for deleted files are evicted on the
+ * next pass, so nothing accumulates.
+ */
+export function jsonDirIndex(dir, summarize) {
+  const cache = new Map();                   // filename -> { mtimeMs, value }
+  return function index() {
+    let names;
+    try { names = fs.readdirSync(dir).filter(f => f.endsWith('.json')); } catch { return []; }
+    const out = [];
+    const seen = new Set(names);
+    for (const f of names) {
+      const abs = path.join(dir, f);
+      let mtimeMs;
+      try { mtimeMs = fs.statSync(abs).mtimeMs; } catch { continue; }
+      const hit = cache.get(f);
+      if (hit && hit.mtimeMs === mtimeMs) { if (hit.value) out.push(hit.value); continue; }
+      const data = readJSON(abs);
+      let value = null;
+      try { value = data ? summarize(data) : null; } catch { value = null; }
+      cache.set(f, { mtimeMs, value });
+      if (value) out.push(value);
+    }
+    for (const k of cache.keys()) if (!seen.has(k)) cache.delete(k);
+    return out;
+  };
 }
 
 /** Resolve `p` inside `root`; throws if it escapes. Returns absolute path. */
@@ -55,26 +100,51 @@ export function estTokens(str) { return Math.ceil((str?.length || 0) / 4); }
 
 /** Pull the first JSON object out of model output, tolerating fences and trailing prose.
  *  String-aware brace walker with a trailing-comma repair fallback. */
-export function extractJSON(text) {
-  if (!text) return null;
-  const cleaned = text.replace(/```(?:json)?/gi, '');
-  const start = cleaned.indexOf('{');
-  if (start < 0) return null;
-  let depth = 0, inStr = false, esc = false;
-  for (let i = start; i < cleaned.length; i++) {
+/** Every balanced {...} block in `text` that parses as JSON, in order. Exported so
+ *  callers that must choose between several candidate objects (a model echoing the
+ *  prompt's template before answering) can score them rather than guess. */
+export function jsonBlocks(text) {
+  const cleaned = String(text).replace(/```(?:json)?/gi, '');
+  const out = [];
+  let start = -1, depth = 0, inStr = false, esc = false;
+  for (let i = 0; i < cleaned.length; i++) {
     const ch = cleaned[i];
     if (esc) { esc = false; continue; }
     if (ch === '\\') { esc = true; continue; }
-    if (ch === '"') inStr = !inStr;
-    else if (!inStr && ch === '{') depth++;
-    else if (!inStr && ch === '}') {
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === '{') { if (depth === 0) start = i; depth++; }
+    else if (ch === '}' && depth > 0) {
       depth--;
-      if (depth === 0) {
+      if (depth === 0 && start >= 0) {
         const cand = cleaned.slice(start, i + 1);
-        try { return JSON.parse(cand); } catch { }
-        try { return JSON.parse(cand.replace(/,\s*([}\]])/g, '$1')); } catch { return null; }  // strip trailing commas
+        let val = null;
+        try { val = JSON.parse(cand); }
+        catch { try { val = JSON.parse(cand.replace(/,\s*([}\]])/g, '$1')); } catch { /* not JSON */ } }
+        if (val && typeof val === 'object') out.push(val);
+        start = -1;
       }
     }
+  }
+  return out;
+}
+
+/** Pull a JSON object out of a model reply.
+ *
+ *  `require` names the key(s) the real answer must contain. Supply it whenever the
+ *  prompt itself shows a JSON template: reasoning models routinely echo the
+ *  template back before answering, and taking the first {...} then returns the
+ *  placeholder — "name_en": "..." — as if it were the result. With `require` set,
+ *  the LAST block carrying one of those keys wins, which is the answer.
+ */
+export function extractJSON(text, { require: req } = {}) {
+  if (!text) return null;
+  const blocks = jsonBlocks(text);
+  if (!blocks.length) return null;
+  if (!req) return blocks[0];
+  const keys = Array.isArray(req) ? req : [req];
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (keys.some(k => blocks[i][k] !== undefined)) return blocks[i];
   }
   return null;
 }

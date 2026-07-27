@@ -37,6 +37,7 @@ import * as router from './router.js';
 import * as finance from './finance.js';
 import * as receipts from './receipts.js';
 import * as financeai from './financeai.js';
+import * as items from './items.js';
 import { gpuStats } from './gpu.js';
 
 const cfg = loadConfig();
@@ -44,7 +45,15 @@ fs.mkdirSync(DATA, { recursive: true });
 
 const app = express();
 app.disable('x-powered-by');
-app.use(express.json({ limit: '60mb' }));   // headroom for base64 image/PDF uploads
+// Body parsing is mounted on /api only. Nothing outside it posts a body, and running a
+// 60MB-capable parser in front of every stylesheet request is pure overhead.
+//
+// The limit is generous for one legacy reason: attachments used to arrive base64-encoded
+// inside JSON, which inflates a 4MB photo into a 5MB string that then has to be parsed
+// AND decoded — measured at ~50MB of heap churn per upload and 3x slower than handling
+// the bytes directly. /api/uploads/raw does it directly; this path stays for any client
+// still running a cached older bundle (the phone PWA caches aggressively).
+app.use('/api', express.json({ limit: '60mb' }));
 
 // ---------- auth ----------
 
@@ -176,6 +185,15 @@ app.delete('/api/agent/sessions/:id', h(req => { agent.deleteSession(req.params.
 // ---------- uploads (chat / agent media input) ----------
 
 app.post('/api/uploads', h(req => uploads.saveUpload(req.body || {})));
+
+// Binary upload — the path every current client uses. The bytes arrive as the body
+// instead of base64 inside JSON, which is where a photo's cost used to triple. `type:
+// '*/*'` because the browser reports the real content type (image/heic from an iPhone,
+// or nothing at all for a file shared in from another app) and we want the bytes
+// regardless; uploads.js sniffs the header anyway rather than trusting either.
+app.post('/api/uploads/raw', express.raw({ type: '*/*', limit: '32mb' }), h(req => uploads.saveUploadBuffer({
+  name: req.query.name, mime: req.query.mime || '', buffer: req.body,
+})));
 // Plain handler (not h()): sendFile streams asynchronously, so the h() wrapper would
 // race it and send a JSON fallback first. Use the sendFile callback for errors instead.
 app.get('/api/uploads/:id', (req, res) => {
@@ -260,6 +278,7 @@ app.get('/api/finance/overview', h(req => finance.overview(req.query)));
 app.get('/api/finance/summary', h(req => finance.summary(req.query)));
 app.get('/api/finance/insights', h(req => finance.insights(req.query)));
 app.get('/api/finance/settings', h(() => finance.currencies()));
+app.get('/api/finance/models', h(() => finance.modelOptions()));
 app.get('/api/finance/categories', h(() => {
   const s = finance.settings();
   return { income: s.incomeCategories, expense: s.expenseCategories };
@@ -304,12 +323,46 @@ app.get('/api/finance/recap', h(req => finance.getRecap(req.query.month)));
 app.post('/api/finance/recap', h(req => financeai.generateRecap(req.body?.month, req.body || {})));
 app.put('/api/finance/recap/note', h(req => finance.setRecapNote(req.body?.month, req.body?.note)));
 
+// item price tracking — the canonical catalogue, its learned aliases, and the
+// price observations that answer "where is this cheapest"
+app.get('/api/finance/items', h(req => items.listItems(req.query)));
+app.post('/api/finance/items', h(req => items.createItem(req.body || {})));
+app.get('/api/finance/items/unresolved', h(req => items.unresolved(req.query)));
+app.post('/api/finance/items/resolve', h(async req => {
+  const { resolveNames } = await import('./itemsai.js');
+  const names = Array.isArray(req.body?.names) ? req.body.names.map(String).slice(0, 40) : [];
+  if (!names.length) throw Object.assign(new Error('names must be a non-empty array'), { status: 400 });
+  const map = await resolveNames(names);
+  return { resolved: Object.fromEntries([...map].map(([k, v]) => [k, v || null])) };
+}));
+app.get('/api/finance/items/:id', h(req => items.itemDetail(req.params.id)));
+app.patch('/api/finance/items/:id', h(req => items.updateItem(req.params.id, req.body || {})));
+app.delete('/api/finance/items/:id', h(req => { items.deleteItem(req.params.id); }));
+app.post('/api/finance/items/:id/merge', h(req => items.mergeItems(req.params.id, String(req.body?.into || ''))));
+app.post('/api/finance/items/:id/alias', h(req => items.learnAlias(String(req.body?.raw || ''), req.params.id, { source: 'manual', confirmed: true })));
+app.delete('/api/finance/alias/:id', h(req => { items.deleteAlias(req.params.id); }));
+app.post('/api/finance/purchases/:id/assign', h(req => items.assignPurchase(req.params.id, String(req.body?.itemId || ''))));
+// Bulk paths — a grocery receipt makes twenty observations, and twenty round trips to
+// file them is the reason they never get filed.
+app.post('/api/finance/purchases/assign', h(req => items.assignPurchases(req.body?.pairs || [])));
+app.post('/api/finance/purchases/drop', h(req => items.dropPurchases(req.body?.ids || [])));
+app.get('/api/finance/suggest-items', h(req => items.candidates(String(req.query?.q || ''), { limit: Number(req.query?.limit) || 6 })));
+
 // receipt OCR — upload the image via /api/uploads first, then scan by its id
 app.get('/api/finance/receipts', h(req => receipts.listReceipts(req.query)));
 app.get('/api/finance/receipts/:id', h(req => receipts.getReceipt(req.params.id)));
 app.post('/api/finance/receipts/scan', h(req => receipts.scan(req.body || {})));
+// Correct a scan before it reaches the ledger. The model's original reading is kept, so
+// applying it afterwards can learn from the difference.
+app.patch('/api/finance/receipts/:id', h(req => receipts.editReceipt(req.params.id, req.body || {})));
 app.post('/api/finance/receipts/:id/apply', h(req => receipts.apply(req.params.id, req.body || {})));
+// Take it back out of the ledger so it can be corrected and re-posted — the "I only
+// noticed the phantom line after logging it" path. Removes its rows AND their prices.
+app.post('/api/finance/receipts/:id/revert', h(req => receipts.revertReceipt(req.params.id)));
 app.delete('/api/finance/receipts/:id', h(req => { receipts.deleteReceipt(req.params.id); }));
+// What the corrections have taught it — visible and revocable, not a black box.
+app.get('/api/finance/receipt-fixes', h(req => receipts.listFixes({ limit: Number(req.query?.limit) || 200 })));
+app.delete('/api/finance/receipt-fixes/:id', h(req => { receipts.forgetFix(req.params.id); }));
 
 // ---------- planner ----------
 app.get('/api/planner/events', h(req => planner.eventsInRange(req.query.from, req.query.to)));
@@ -483,11 +536,22 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 const clients = new Set();
 
+// A socket that stopped reading must not be allowed to buffer forever. Streaming a
+// long answer to a phone that walked out of Wi-Fi range used to grow ws's internal
+// queue without bound — the socket is open as far as TCP knows, so nothing pushed
+// back. Past this much backlog the client is hopeless: close it and let the browser
+// reconnect, which it does automatically.
+const MAX_BUFFERED = 8 * 1024 * 1024;
+
 function publish(topic, obj) {
   // stamp the topic so the client fans out generically — no per-message-type
   // mapping to keep in sync (that drift silently broke research/comfy/gh streams)
   const msg = JSON.stringify({ ...obj, _topic: topic });
-  for (const c of clients) if (c.subs.has(topic)) { try { c.ws.send(msg); } catch { } }
+  for (const c of clients) {
+    if (!c.subs.has(topic)) continue;
+    if (c.ws.bufferedAmount > MAX_BUFFERED) { try { c.ws.terminate(); } catch { } continue; }
+    try { c.ws.send(msg); } catch { }
+  }
 }
 agent.setPublisher(publish);
 chat.setPublisher(publish);
@@ -505,10 +569,12 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 wss.on('connection', (ws) => {
-  const client = { ws, subs: new Set(), send: (obj) => { try { ws.send(JSON.stringify(obj)); } catch { } } };
+  const client = { ws, subs: new Set(), alive: true, send: (obj) => { try { ws.send(JSON.stringify(obj)); } catch { } } };
   clients.add(client);
 
+  ws.on('pong', () => { client.alive = true; });
   ws.on('message', async (raw) => {
+    client.alive = true;
     let m; try { m = JSON.parse(raw); } catch { return; }
     try { await route(client, m); }
     catch (e) { client.send({ t: 'error', of: m.t, message: e.message }); }
@@ -516,6 +582,24 @@ wss.on('connection', (ws) => {
   ws.on('close', () => { clients.delete(client); term.closeClientTerminals(client); });
   ws.on('error', () => { });
 });
+
+// Reap dead connections.
+//
+// A phone that sleeps, a laptop whose lid closes, a device that leaves the network —
+// none of them send a close frame, and TCP will not notice for hours. Without this the
+// `clients` set only ever grew: every entry kept its subscription set alive, kept the
+// user's terminal shells running (closeClientTerminals only fires on 'close'), and got
+// a copy of every published message. That is the shape of a server that feels slower
+// the longer it has been up, and it is worst on the LAN devices this is built for.
+const WS_PING_MS = 30_000;
+const wsHeartbeat = setInterval(() => {
+  for (const c of clients) {
+    if (!c.alive) { try { c.ws.terminate(); } catch { } clients.delete(c); term.closeClientTerminals(c); continue; }
+    c.alive = false;                       // set true again by 'pong' or any message
+    try { c.ws.ping(); } catch { try { c.ws.terminate(); } catch { } }
+  }
+}, WS_PING_MS);
+wsHeartbeat.unref();
 
 async function route(client, m) {
   switch (m.t) {

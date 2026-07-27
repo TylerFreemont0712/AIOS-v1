@@ -9,7 +9,7 @@ import { streamChat } from './llm.js';
 import { toolSchemas, toolGroups, toolDirectory, runTool, isWriteTool, isWikiScopedCall, diffPreview } from './tools.js';
 import { checkFile, checkFiles, runProjectTests } from './checks.js';
 import { skillsPrompt } from './skills.js';
-import { id as genId, now, readJSON, writeJSON, estTokens, safePath, clampMiddle } from './util.js';
+import { id as genId, now, readJSON, writeJSON, estTokens, safePath, clampMiddle, jsonDirIndex } from './util.js';
 import { getProject } from './projects.js';
 import { promptContext as gitContext } from './git.js';
 import { appContext } from './context.js';
@@ -26,16 +26,19 @@ const emit = (sid, ev) => publish(`agent:${sid}`, { t: 'agent.event', sessionId:
 
 const file = (id) => path.join(DIR, id + '.json');
 
+// Summarised once per file version — `running` is deliberately NOT part of the cached
+// summary, since it is live state that changes without the file changing.
+const sessionIndex = jsonDirIndex(DIR, (s) => ({
+  id: s.id, projectId: s.projectId, title: s.title, modelRef: s.modelRef, mode: s.mode,
+  planMode: !!s.planMode, updatedAt: s.updatedAt, usage: s.usage, messages: s.transcript.length,
+}));
+
 export function listSessions(projectId) {
   fs.mkdirSync(DIR, { recursive: true });
-  const out = [];
-  for (const f of fs.readdirSync(DIR)) {
-    if (!f.endsWith('.json')) continue;
-    const s = readJSON(path.join(DIR, f));
-    if (!s || (projectId && s.projectId !== projectId)) continue;
-    out.push({ id: s.id, projectId: s.projectId, title: s.title, modelRef: s.modelRef, mode: s.mode, planMode: !!s.planMode, updatedAt: s.updatedAt, usage: s.usage, messages: s.transcript.length, running: live.get(s.id)?.running || false });
-  }
-  return out.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+  return sessionIndex()
+    .filter(s => !projectId || s.projectId === projectId)
+    .map(s => ({ ...s, running: live.get(s.id)?.running || false }))
+    .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
 }
 
 export function createSession({ projectId, modelRef, mode, planMode }) {
@@ -76,7 +79,8 @@ export function deleteSession(id) {
   try { fs.unlinkSync(file(id)); } catch { }
 }
 
-const save = (s) => { s.updatedAt = now(); writeJSON(file(s.id), s); };
+// Compact: the transcript is rewritten on every tool call and every turn.
+const save = (s) => { s.updatedAt = now(); writeJSON(file(s.id), s, { pretty: false }); };
 
 // ---------- control ----------
 
@@ -494,8 +498,12 @@ async function gate(s, st, call) {
     diff: diffPreview(s.root, call.name, call.args),
   });
   const decision = await new Promise((resolve) => {
-    st.approvals.set(call.id, resolve);
-    setTimeout(() => { if (st.approvals.delete(call.id)) resolve('deny'); }, 10 * 60 * 1000);
+    // The timer is cleared on a normal answer and unref'd either way: left pending it
+    // held the whole session state (abort controller, approvals) reachable for ten
+    // minutes after the run finished, and kept the process from exiting cleanly.
+    const timer = setTimeout(() => { if (st.approvals.delete(call.id)) resolve('deny'); }, 10 * 60 * 1000);
+    timer.unref?.();
+    st.approvals.set(call.id, (d) => { clearTimeout(timer); resolve(d); });
   });
   if (decision === 'always') {
     s.allowedTools.push(call.name);

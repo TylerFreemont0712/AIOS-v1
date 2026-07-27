@@ -2,8 +2,9 @@
 
 A web desktop that runs on your machine and serves your whole LAN. One place for
 chatting with local + cloud models, pointing an agentic coder at your projects,
-managing those projects, growing an Obsidian second brain, sketching mindmaps,
-editing files, and dropping into real terminals — full-page attached views switched
+growing an Obsidian second brain, learning something with an AI tutor, tracking
+your money (photograph a receipt, it files itself), generating images, running
+local models, and dropping into real terminals — full-page attached views switched
 from a dock, a command palette, and a warm Claude-style aesthetic. Apps keep
 running in the background when you switch away (terminals stay alive, agent runs
 keep streaming); right-click a dock icon to quit one.
@@ -30,7 +31,13 @@ open it on any other computer/tablet on your network and it just works.
 | **Terminal** | Real PTYs (node-pty) in xterm.js — colors, vim, resize; one shell per window |
 | **Projects** | The hub's registry: register existing folders, create new ones (README + git init), git branch/dirty badges, favorites, notes, jump straight into Agent/Files/Shell |
 | **Second Brain** | Your Obsidian vault: browse/edit/search notes, clickable `[[wikilinks]]`, backlinks, tag chips, an interactive link **graph**, daily-note capture — plus AI that answers *from your notes with citations*, summarizes, and **grows the wiki** by writing interlinked atomic notes into an `AI Wiki/` folder |
-| **Mindmaps** | Tidy-tree SVG maps: Tab/Enter/Del keyboard editing, collapse branches, pan/zoom — or let a model design the whole map, expand any branch with AI, and export maps into the vault as outlines |
+| **Learning Corner** | An AI tutor: a subject **tree**, AI-designed capability roadmaps, web-grounded lessons, and **assessments** with per-question grading (multiple-choice, short-answer, ordering) and per-topic **mastery** tracking |
+| **Finances** | A real ledger: earnings, expenses, budgets, goals, recurring entries and presets across five tabs sharing one period selector; multi-currency, CSV export — plus **receipt capture** (photograph it, a local vision model reads it, you review, it posts) and **item price tracking** that tells you which shop is actually cheaper per unit |
+| **Studio** | ComfyUI cockpit: text→image, image→image and 4× upscale, Animagine + Lightning-LoRA sampling plans, pixel-space hi-res, an LLM prompt generator — and AIOS owns the ComfyUI/llama lifecycle so the 8GB card never double-books |
+| **Models & Bench** | The llama-launcher, absorbed: per-model presets (context, offload, KV quant, flash-attn, vision projector), live GPU/VRAM, log pane, VRAM-fit hints — plus a **deterministic** benchmark scoring every local model per category with TTFT and tok/s (no LLM judge) |
+| **Planner** | Calendar, recurring events, birthdays, reminders and tasks, folded into Home's next-three-days |
+| **Mail** | Read-only IMAP triage with sender ratings and a mini-Gmail viewer; important mail can ping Discord |
+| **GitHub** | Profile, contribution heatmap, repos, PRs, issues; publish a local project or clone one |
 | **Settings** | Providers, **tools** (enable/disable each agent tool, web-search backend), **9 themes** (light/dark/system + Matrix/Nord/Dracula/Rosé Pine/Synthwave/Solarized) with accent & wallpaper, vault paths, agent defaults & self-check, network & security |
 
 Shell niceties: **Ctrl+K** command palette (apps, project switching, vault search,
@@ -205,16 +212,31 @@ server/            zero-build Node (ESM), no framework beyond express + ws
   projects.js      project registry + git info
   files.js         explorer/editor APIs (root-scoped)
   vault.js         Obsidian index, search, graph, daily, AI wiki growth
-  mindmap.js       tree docs + AI generate/expand + vault export
+  wiki.js          typed notes, autolinking, Home MOC, packed-memory recall
+  learn.js         AI tutor: subjects, roadmaps, lessons, assessments (+ learndb.js)
+  finance.js       ledger, budgets, goals, recurring, FX (+ financedb.js, financeai.js)
+  receipts.js      photo → vision-model OCR → reviewed → posted to the ledger
+  items.js         brand-free product catalogue + price history (+ itemsai.js)
+  uploads.js       attachment intake: byte-sniffing + ffmpeg transcode (HEIC → JPEG)
+  llmctl.js        AIOS owns llama-server: profiles, presets, mmproj, hot model swaps
+  bench.js         deterministic per-category model benchmark (bench.db)
+  router.js        local: refs → serve on demand · LLM auto-setup for new ggufs
+  comfy.js         ComfyUI connector + workflow templates + VRAM guard
+  planner.js       calendar/tasks · mail.js  IMAP triage · geo.js/everyday.js  toolbelt
   terminal.js      node-pty (with `script` fallback)
 web/               no build step — vanilla ES modules
   js/wm.js         view manager (pages + dock) · js/main.js shell + palette
-  js/apps/*.js     the apps (chat, agent, research, files, terminal, projects, vault, mindmap, settings)
+  js/apps/*.js     the apps (chat, agent, research, studio, finance, learn, models,
+                   bench, planner, files, terminal, projects, github, vault, settings)
+  js/mobile/       the phone view at /m (receipt capture) · js/imageprep.js shared intake
   vendor/          self-contained bundles (CodeMirror 6, marked+DOMPurify+hljs, xterm)
 skills/            coding playbooks (markdown) injected into the agent by stack
 Roadmap.md         idea bucket for future features
-data/              your stuff (gitignored): config, chats, agent sessions, research, learn, bench
-scripts/           build-vendor.mjs · check.mjs · searxng.mjs
+data/              your stuff (gitignored): config, chats, agent sessions, research,
+                   uploads, comfy renders, and four SQLite stores: learn, bench,
+                   finance, plus per-project .aios/ memory
+scripts/           build-vendor.mjs · check.mjs · audit.mjs · e2e.mjs · searxng.mjs
+                   gguf/split_omni_gguf.py (single-file omni GGUF → text + mmproj)
                    aios-launch.sh + aios.desktop + aios.svg (desktop shortcut)
                    aios.service (systemd unit)
 ```
@@ -252,8 +274,9 @@ loginctl enable-linger $USER   # keep it up after logout
 
 ## Roadmap
 
-Future ideas and the running backlog live in [`Roadmap.md`](Roadmap.md) — an idea
-bucket you can add to freely. Highlights on deck: vault embeddings for semantic
-ask-vault, git-aware agent checkpoints + multi-file patch review, research
-follow-ups and a sources drawer, chat attachments (wire vision through
-`gemma-vision`), and a mobile-friendly layout pass.
+The running backlog lives in [`Roadmap.md`](Roadmap.md) — 54 items with stable IDs,
+each carrying the file to start from, plus a **Top 10 next** decision list at the top
+and a §G recording what was deliberately cut and why. Currently on deck: structured
+output via JSON-schema-constrained sampling, an MCP client (so the ~9,650 servers in
+the registry become AIOS tools), a reranker for the vault, SQLite-aware backups, a
+notification center, and global Ctrl+K search over your own data.

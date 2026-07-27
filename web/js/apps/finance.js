@@ -12,16 +12,27 @@
 
 import { el, icon, toast, modal, confirmBox, menu, debounce } from '../ui.js';
 import { get, post, patch, put, del, uploadFile, mediaUrl } from '../api.js';
+import { IMAGE_ACCEPT } from '../imageprep.js';
 import {
-  groupedBars, donut, legend, areaLine, rankedBars, meter, calendarHeat, sparkbars, fmtNum,
+  groupedBars, donut, legend, areaLine, rankedBars, meter, calendarHeat, sparkbars,
+  pricePoints, palette, fmtNum,
 } from '../charts.js';
 
 const TABS = [
   ['overview', 'Overview'],
   ['history', 'History'],
+  ['items', 'Items'],
   ['ledger', 'Ledger'],
   ['plan', 'Plan'],
   ['receipts', 'Receipts'],
+];
+
+const ITEM_SORTS = [
+  ['recent', 'Recently bought'],
+  ['most', 'Bought most'],
+  ['spend', 'Most spent on'],
+  ['saving', 'Biggest saving available'],
+  ['name', 'Name'],
 ];
 
 const RANGES = [
@@ -38,7 +49,7 @@ const monthStr = (d = new Date()) => d.toISOString().slice(0, 7);
 const prettyMonth = (m) => `${MONTH_NAMES[Number(String(m).slice(5, 7)) - 1] || '?'} ${String(m).slice(0, 4)}`;
 
 export default {
-  id: 'finance', title: 'Finances', icon: 'graph',
+  id: 'finance', title: 'Finances', icon: 'briefcase',
 
   mount(body, opts, win) {
     const S = win.financeState = {
@@ -49,6 +60,7 @@ export default {
       currency: 'JPY',
       categories: { income: [], expense: [] },
       data: null, ledger: null, yearData: null, receipts: null, recap: null, calendar: null,
+      itemsData: null, itemSearch: '', itemCategory: '', itemSort: 'recent',
       search: '', kindFilter: '', busy: false,
     };
 
@@ -102,6 +114,8 @@ export default {
         if (S.tab === 'history') {
           S.yearData = await get(`/finance/year?year=${encodeURIComponent(S.year)}`);
           S.currency = S.yearData.currency || S.currency;
+        } else if (S.tab === 'items') {
+          await loadItems();
         } else {
           S.data = await get(`/finance/overview?${qs()}`);
           S.currency = S.data.settings?.base || S.currency;
@@ -117,6 +131,10 @@ export default {
           if (S.tab === 'receipts') S.receipts = await get('/finance/receipts?limit=30');
         }
         if (S.tab === 'history') sub.textContent = S.year;
+        if (S.tab === 'items') {
+          const n = S.itemsData?.items.length || 0;
+          sub.textContent = `${n} tracked item${n === 1 ? '' : 's'}`;
+        }
         render();
       } catch (e) {
         content.innerHTML = '';
@@ -136,9 +154,13 @@ export default {
 
     function render() {
       content.innerHTML = '';
-      const view = { overview: renderOverview, history: renderHistory, ledger: renderLedger, plan: renderPlan, receipts: renderReceipts }[S.tab];
+      const view = {
+        overview: renderOverview, history: renderHistory, items: renderItems,
+        ledger: renderLedger, plan: renderPlan, receipts: renderReceipts,
+      }[S.tab];
       if (!view) return;
-      if (S.tab === 'history' ? !S.yearData : !S.data) return content.append(el('p', { class: 'empty' }, 'Loading…'));
+      const ready = S.tab === 'history' ? S.yearData : S.tab === 'items' ? S.itemsData : S.data;
+      if (!ready) return content.append(el('p', { class: 'empty' }, 'Loading…'));
       view();
     }
 
@@ -445,6 +467,396 @@ export default {
         el('p', { class: 'fin-teach-hint' }, 'Saved as you type. Rewriting the recap never touches this.'));
     }
 
+    // ---------- items: what things cost, and where ----------
+    async function loadItems() {
+      const q = new URLSearchParams({ sort: S.itemSort });
+      if (S.itemSearch) q.set('search', S.itemSearch);
+      if (S.itemCategory) q.set('category', S.itemCategory);
+      S.itemsData = await get(`/finance/items?${q}`);
+      S.currency = S.itemsData.currency || S.currency;
+    }
+
+    /** Unit prices are small numbers (¥0.26 per ml), so they need more precision
+     *  than money() gives — but a per-each price is just money. */
+    const unitPrice = (v, unit) => unit === 'each'
+      ? money(v)
+      : `${S.currency} ${Number(v || 0).toFixed(v < 1 ? 3 : 2)}`;
+
+    /** The comparable quantity a shopper actually thinks in: per litre, per kilo,
+     *  per item — not per millilitre. */
+    const perLabel = (unit) => (unit === 'ml' ? 'per L' : unit === 'g' ? 'per kg' : 'each');
+    const perValue = (v, unit) => (unit === 'each' ? v : v * 1000);
+    const shopPrice = (v, unit) => `${money(perValue(v, unit))} ${perLabel(unit)}`;
+
+    function renderItems() {
+      const d = S.itemsData;
+      const searchBox = el('input', {
+        class: 'input sm fin-search', placeholder: 'Search milk, 牛乳, or a printed name…', value: S.itemSearch,
+        oninput: debounce(async (ev) => { S.itemSearch = ev.target.value.trim(); await loadItems(); render(); }, 250),
+      });
+      const catSel = el('select', { class: 'input sm', onchange: async () => { S.itemCategory = catSel.value; await loadItems(); render(); } },
+        el('option', { value: '' }, 'All categories'),
+        (d.categories || []).map(c => el('option', { value: c }, c)));
+      catSel.value = S.itemCategory;
+      const sortSel = el('select', { class: 'input sm', onchange: async () => { S.itemSort = sortSel.value; await loadItems(); render(); } },
+        ITEM_SORTS.map(([v, l]) => el('option', { value: v }, l)));
+      sortSel.value = S.itemSort;
+
+      content.append(
+        el('div', { class: 'fin-toolbar' }, searchBox, catSel, sortSel,
+          el('span', { class: 'grow' }),
+          d.unresolvedCount
+            ? el('button', { class: 'btn sm', onclick: openReviewQueue },
+              icon('sparkle'), `${d.unresolvedCount} line${d.unresolvedCount === 1 ? '' : 's'} to name`)
+            : null,
+          el('button', { class: 'btn sm ghost', onclick: () => openItemEditor() }, icon('plus'), 'New item')),
+
+        d.items.length
+          ? el('div', { class: 'fin-item-grid' }, d.items.map(itemCard))
+          : teach(
+            S.itemSearch || S.itemCategory ? 'Nothing matches that.' : 'No items tracked yet.',
+            S.itemSearch || S.itemCategory
+              ? 'Search matches the English name, the Japanese name, and every printed name ever seen.'
+              : 'Scan a receipt — every line becomes a price point, and brands are folded together so "ヤマダ牛乳" and "明治牛乳" both count as Milk.'),
+      );
+    }
+
+    function itemCard(it) {
+      const hasPrices = it.bestUnitPrice > 0;
+      const dearer = hasPrices && it.medianUnitPrice > it.bestUnitPrice * 1.05;
+      return el('article', {
+        class: 'fin-item-card', onclick: () => openItem(it.id), title: 'Price history and where to buy it',
+      },
+        el('div', { class: 'fin-item-head' },
+          el('div', { class: 'fin-item-names' },
+            el('span', { class: 'fin-item-en' }, it.nameEn),
+            it.nameJa ? el('span', { class: 'fin-item-ja' }, it.nameJa) : null),
+          it.spark.length > 1 ? sparkbars(it.spark, { width: 52, height: 20 }) : null),
+
+        el('div', { class: 'fin-item-tags' },
+          el('span', { class: 'fin-cat' }, it.subcategory || it.category),
+          el('span', { class: 'fin-item-count' }, `${it.timesBought}×`)),
+
+        hasPrices
+          ? el('div', { class: 'fin-item-prices' },
+            el('div', { class: 'fin-item-price' },
+              el('span', { class: 'fin-item-price-label' }, 'Best'),
+              el('span', { class: 'fin-item-price-value is-best' }, shopPrice(it.bestUnitPrice, it.unit)),
+              it.bestMerchant ? el('span', { class: 'fin-item-where' }, it.bestMerchant) : null),
+            dearer
+              ? el('div', { class: 'fin-item-price' },
+                el('span', { class: 'fin-item-price-label' }, 'Typical'),
+                el('span', { class: 'fin-item-price-value' }, shopPrice(it.medianUnitPrice, it.unit)))
+              : null)
+          : el('p', { class: 'fin-teach-hint' }, 'no priced purchases yet'),
+
+        it.lastDate
+          ? el('div', { class: 'fin-item-foot' }, `last ${it.lastDate}${it.lastMerchant ? ` · ${it.lastMerchant}` : ''}`)
+          : null,
+      );
+    }
+
+    /** Item detail: the answer to "where should I buy this, and is it getting
+     *  more expensive". */
+    async function openItem(itemId) {
+      const holder = el('div', { class: 'fin-item-detail' }, el('p', { class: 'empty sm' }, 'Loading…'));
+      const dlg = modal({ title: 'Item', wide: true, body: holder, actions: [{ label: 'Close', value: true }] });
+      try {
+        const d = await get(`/finance/items/${itemId}`);
+        const it = d.item, st = d.stats;
+        const merchantNames = d.merchants.map(m => m.merchant);
+        const colors = palette(merchantNames.length);
+
+        holder.innerHTML = '';
+        holder.append(
+          el('div', { class: 'fin-item-hero' },
+            el('div', {},
+              el('h3', { class: 'fin-item-hero-name' }, it.nameEn),
+              it.nameJa ? el('div', { class: 'fin-item-hero-ja' }, it.nameJa) : null,
+              el('div', { class: 'fin-item-hero-meta' },
+                `${it.category}${it.subcategory ? ' · ' + it.subcategory : ''} · compared ${perLabel(it.unit)}`)),
+            el('span', { class: 'grow' }),
+            el('button', { class: 'btn ghost xs', title: 'Edit name, unit and category', onclick: () => openItemEditor(it) }, icon('edit'))),
+
+          d.cheapest
+            ? el('div', { class: 'fin-best' },
+              el('div', {},
+                el('div', { class: 'fin-best-label' }, 'Cheapest here'),
+                el('div', { class: 'fin-best-shop' }, d.cheapest.merchant),
+                el('div', { class: 'fin-best-price' }, shopPrice(d.cheapest.median, it.unit))),
+              d.saving
+                ? el('div', { class: 'fin-best-saving' },
+                  el('span', { class: 'fin-best-pct' }, `${d.saving.pct}%`),
+                  el('span', {}, `cheaper than ${d.saving.vs}`))
+                : el('p', { class: 'fin-teach-hint' }, d.merchants.length > 1
+                  ? 'Only one shop has been sampled more than once — a second visit elsewhere makes the comparison trustworthy.'
+                  : 'Only bought here so far. Buy it somewhere else to compare.'))
+            : null,
+
+          el('div', { class: 'fin-item-stats' },
+            yearStat('Bought', `${st.timesBought}×`),
+            yearStat('Spent', money(st.totalSpent)),
+            yearStat('Best', shopPrice(st.best, it.unit), 'is-in'),
+            yearStat('Typical', shopPrice(st.median, it.unit)),
+            yearStat('Worst', shopPrice(st.worst, it.unit), 'is-out'),
+            st.trendPct === null ? null
+              : yearStat('Trend', `${st.trendPct > 0 ? '+' : ''}${st.trendPct}%`, st.trendPct > 0 ? 'is-out' : 'is-in')),
+
+          d.series.length
+            ? el('section', { class: 'fin-item-section' },
+              el('h4', {}, 'Every price paid'),
+              // The axis has to speak the same unit as every other figure here:
+              // showing per-gram next to a per-kg headline reads as a bug.
+              pricePoints(d.series, {
+                merchants: merchantNames,
+                format: (v) => Number(perValue(v, it.unit)).toLocaleString('en-US', { maximumFractionDigits: it.unit === 'each' ? 0 : 0 }),
+              }),
+              el('div', { class: 'fin-legend-row' }, merchantNames.map((m, i) =>
+                el('span', { class: 'fin-legend-chip' },
+                  el('span', { class: 'chart-swatch', style: { background: colors[i] } }), m))))
+            : null,
+
+          d.merchants.length
+            ? el('section', { class: 'fin-item-section' },
+              el('h4', {}, 'By shop'),
+              (() => {
+                const t = el('table', { class: 'fin-table' });
+                t.append(el('thead', {}, el('tr', {},
+                  el('th', {}, 'Shop'), el('th', { class: 'num' }, 'Typical'),
+                  el('th', { class: 'num' }, 'Best'), el('th', { class: 'num' }, 'Latest'),
+                  el('th', { class: 'num' }, 'Times'), el('th', {}, 'Last seen'))));
+                t.append(el('tbody', {}, d.merchants.map((m, i) => el('tr', { class: i === 0 ? 'is-cheapest' : '' },
+                  el('td', {}, el('span', { class: 'chart-swatch', style: { background: colors[i] } }), ' ', m.merchant),
+                  el('td', { class: 'num fin-amount' }, shopPrice(m.median, it.unit)),
+                  el('td', { class: 'num' }, shopPrice(m.best, it.unit)),
+                  el('td', { class: 'num' }, shopPrice(m.latest, it.unit)),
+                  el('td', { class: 'num' }, String(m.count)),
+                  el('td', { class: 'fin-date' }, m.lastDate)))));
+                return el('div', { class: 'fin-scroll' }, t);
+              })())
+            : null,
+
+          el('section', { class: 'fin-item-section' },
+            el('h4', {}, `Printed names that mean "${it.nameEn}"`),
+            el('p', { class: 'fin-teach-hint' },
+              'Confirmed names are the point of truth — the model is never allowed to reassign them.'),
+            el('ul', { class: 'fin-alias-list' }, d.aliases.map(a => el('li', {},
+              el('span', { class: 'fin-alias-raw' }, a.raw),
+              a.confirmed
+                ? el('span', { class: 'fin-alias-tag is-ok' }, 'confirmed')
+                : el('button', {
+                  class: 'btn ghost xs', title: 'Confirm this mapping',
+                  onclick: async (ev) => {
+                    try {
+                      await post(`/finance/items/${it.id}/alias`, { raw: a.raw });
+                      ev.currentTarget.replaceWith(el('span', { class: 'fin-alias-tag is-ok' }, 'confirmed'));
+                    } catch (e) { toast(e.message, 'err'); }
+                  },
+                }, 'confirm'),
+              el('span', { class: 'fin-alias-src' }, `${a.source}${a.hits ? ` · seen ${a.hits}×` : ''}`),
+              el('button', {
+                class: 'btn ghost xs', title: 'This is not the same thing',
+                onclick: async (ev) => {
+                  try { await del(`/finance/alias/${a.id}`); ev.currentTarget.closest('li').remove(); }
+                  catch (e) { toast(e.message, 'err'); }
+                },
+              }, icon('x')))))),
+
+          d.purchases.length
+            ? el('section', { class: 'fin-item-section' },
+              el('h4', {}, 'Purchases'),
+              el('div', { class: 'fin-scroll' }, (() => {
+                const t = el('table', { class: 'fin-table' });
+                t.append(el('thead', {}, el('tr', {},
+                  el('th', {}, 'Date'), el('th', {}, 'Shop'), el('th', {}, 'As printed'),
+                  el('th', { class: 'num' }, 'Paid'), el('th', { class: 'num' }, perLabel(it.unit)))));
+                t.append(el('tbody', {}, d.purchases.slice(0, 40).map(p => el('tr', {},
+                  el('td', { class: 'fin-date' }, p.date),
+                  el('td', {}, p.merchant || '—'),
+                  el('td', { class: 'fin-alias-raw' }, p.rawName),
+                  el('td', { class: 'num fin-amount' }, money(p.lineTotalBase)),
+                  el('td', { class: 'num' }, p.unitPriceBase ? shopPrice(p.unitPriceBase, p.unit || it.unit) : '—')))));
+                return t;
+              })()))
+            : null,
+        );
+      } catch (e) {
+        holder.innerHTML = '';
+        holder.append(el('p', { class: 'empty' }, e.message));
+      }
+      await dlg;
+      if (S.tab === 'items') refresh();
+    }
+
+    /** The review queue: printed names nobody has classified yet. This is where
+     *  the catalogue actually gets taught. */
+    // Naming the lines off a grocery receipt is the part that decides whether price
+    // tracking ever gets used. Twenty lines × one dialog each is why it doesn't, so this
+    // is built for volume: everything on screen at once, the confident matches
+    // pre-selected so the common case is read-and-confirm, and a way to bin the lines
+    // that were never products at all.
+    const CONFIDENT = 0.72;   // below this the model's guess is not worth pre-ticking
+
+    async function openReviewQueue() {
+      const holder = el('div', { class: 'fin-review' }, el('p', { class: 'empty sm' }, 'Loading…'));
+      const dlg = modal({
+        // xl, not wide: a grocery receipt is a dozen-plus lines, each needing its raw
+        // name AND its suggestion chips on one row. At 680px the chips overflow the box.
+        title: 'Name these lines', xl: true,
+        sub: 'Each one you settle becomes permanent — the same printed name is never asked about again.',
+        body: holder, actions: [{ label: 'Done', value: true }],
+      });
+
+      // rawName → chosen itemId ('' = undecided, '·drop' = not a product)
+      const picks = new Map();
+      let rows = [];
+
+      const paint = async (refetch = true) => {
+        if (refetch) {
+          rows = await get('/finance/items/unresolved?limit=120');
+          picks.clear();
+          // Pre-tick only what the matcher is actually confident about — a wrong
+          // pre-selection that gets confirmed in bulk is worse than no help at all.
+          for (const r of rows) {
+            const top = r.suggestions?.[0];
+            if (top && top.score >= CONFIDENT) picks.set(r.rawName, top.id);
+          }
+        }
+        holder.innerHTML = '';
+        if (!rows.length) {
+          holder.append(el('p', { class: 'fin-teach-hint' }, 'Nothing left to name.'));
+          return;
+        }
+        const chosen = [...picks.values()].filter(v => v && v !== '·drop').length;
+        const binned = [...picks.values()].filter(v => v === '·drop').length;
+
+        holder.append(
+          el('div', { class: 'fin-review-bar' },
+            el('span', { class: 'fin-review-count' },
+              `${rows.length} printed name${rows.length === 1 ? '' : 's'} · `,
+              el('strong', {}, `${chosen} matched`),
+              binned ? `, ${binned} to discard` : ''),
+            el('span', { class: 'grow' }),
+            el('button', {
+              class: 'btn sm', title: 'Tick every suggestion the matcher is confident about',
+              onclick: () => {
+                for (const r of rows) {
+                  const top = r.suggestions?.[0];
+                  if (top && top.score >= CONFIDENT && !picks.get(r.rawName)) picks.set(r.rawName, top.id);
+                }
+                paint(false);
+              },
+            }, 'Tick confident'),
+            el('button', { class: 'btn sm ghost', onclick: () => { picks.clear(); paint(false); } }, 'Clear'),
+            el('button', {
+              class: 'btn sm primary', disabled: !chosen && !binned,
+              onclick: () => commit(),
+            }, `Apply ${chosen + binned}`)),
+          el('ul', { class: 'fin-review-list' }, rows.map(r => reviewRow(r, picks, () => paint(false)))));
+      };
+
+      const commit = async () => {
+        const pairs = [];
+        const drop = [];
+        for (const r of rows) {
+          const v = picks.get(r.rawName);
+          if (!v) continue;
+          if (v === '·drop') drop.push(...r.purchaseIds);
+          // assignPurchase files every sibling sharing the printed name, so one id per group
+          else pairs.push({ purchaseId: r.purchaseIds[0], itemId: v });
+        }
+        try {
+          let filed = 0, dropped = 0;
+          if (pairs.length) filed = (await post('/finance/purchases/assign', { pairs })).assigned;
+          if (drop.length) dropped = (await post('/finance/purchases/drop', { ids: drop })).dropped;
+          toast(`Filed ${filed} line${filed === 1 ? '' : 's'}`
+            + (dropped ? ` · discarded ${dropped}` : ''), 'ok');
+          await paint();
+        } catch (e) { toast(e.message, 'err'); }
+      };
+
+      await paint();
+      await dlg;
+      if (S.tab === 'items') refresh();
+    }
+
+    function reviewRow(r, picks, redraw) {
+      const chosen = picks.get(r.rawName) || '';
+      const pick = (v) => { if (picks.get(r.rawName) === v) picks.delete(r.rawName); else picks.set(r.rawName, v); redraw(); };
+      const named = chosen && chosen !== '·drop'
+        ? (r.suggestions.find(s => s.id === chosen)?.nameEn || 'chosen')
+        : '';
+
+      return el('li', { class: 'fin-review-row' + (chosen ? ' is-set' : '') + (chosen === '·drop' ? ' is-drop' : '') },
+        el('div', { class: 'fin-review-main' },
+          el('div', { class: 'fin-review-raw' }, r.rawName),
+          el('div', { class: 'fin-review-meta' },
+            `${r.count}× · ${r.merchants.join(', ') || 'unknown shop'} · last ${r.lastDate}`,
+            named ? el('span', { class: 'fin-review-picked' }, ' → ' + named) : null)),
+        el('div', { class: 'fin-review-actions' },
+          r.suggestions.map(s => el('button', {
+            class: 'fin-chip' + (chosen === s.id ? ' is-on' : ''),
+            title: `${Math.round(s.score * 100)}% match${s.score >= CONFIDENT ? ' — confident' : ''}`,
+            onclick: () => pick(s.id),
+          }, s.nameEn, s.score >= CONFIDENT ? null : el('span', { class: 'fin-suggest-weak' }, ` ${Math.round(s.score * 100)}%`))),
+          el('button', {
+            class: 'fin-chip', title: 'Create a catalogue entry for this line',
+            onclick: async () => {
+              const created = await openItemEditor(null, { seedName: r.rawName });
+              if (created) { picks.set(r.rawName, created.id); redraw(); }
+            },
+          }, '+ New'),
+          el('button', {
+            class: 'fin-chip is-drop' + (chosen === '·drop' ? ' is-on' : ''),
+            title: 'This was never a product — discard the price observations',
+            onclick: () => pick('·drop'),
+          }, 'Not a product')));
+    }
+
+    /** Create or edit a catalogue entry. Resolves to the saved item. */
+    async function openItemEditor(item = null, { seedName = '' } = {}) {
+      const isEdit = !!item?.id;
+      const f = {
+        nameEn: el('input', { class: 'input', value: item?.nameEn || '', placeholder: 'Milk' }),
+        nameJa: el('input', { class: 'input', value: item?.nameJa || '', placeholder: '牛乳' }),
+        category: el('input', { class: 'input', list: 'fin-item-cats', value: item?.category || 'Groceries' }),
+        subcategory: el('input', { class: 'input', value: item?.subcategory || '', placeholder: 'Dairy' }),
+        unit: el('select', { class: 'input' },
+          el('option', { value: 'each' }, 'each — countable'),
+          el('option', { value: 'ml' }, 'ml — liquids'),
+          el('option', { value: 'g' }, 'g — by weight')),
+        typicalSize: el('input', { class: 'input', type: 'number', value: item?.typicalSize || '', placeholder: '1000' }),
+      };
+      f.unit.value = item?.unit || 'each';
+      const cats = S.itemsData?.categories || [];
+
+      const ok = await modal({
+        title: isEdit ? `Edit "${item.nameEn}"` : 'New item',
+        sub: seedName
+          ? `Printed as "${seedName}" — give it the generic name, without the brand.`
+          : 'Keep the name generic and brand-free: "Milk", not "Yamada Milk".',
+        body: el('div', { class: 'fin-form' },
+          el('datalist', { id: 'fin-item-cats' }, cats.map(c => el('option', { value: c }))),
+          row('English', f.nameEn), row('Japanese', f.nameJa),
+          row('Category', f.category), row('Sub', f.subcategory),
+          row('Sold by', f.unit), row('Usual size', f.typicalSize)),
+        actions: [{ label: 'Cancel', value: false }, { label: isEdit ? 'Save' : 'Create', value: true, kind: 'primary' }],
+      });
+      if (!ok) return null;
+      const payload = {
+        nameEn: f.nameEn.value, nameJa: f.nameJa.value, category: f.category.value,
+        subcategory: f.subcategory.value, unit: f.unit.value, typicalSize: Number(f.typicalSize.value) || 0,
+      };
+      try {
+        const saved = isEdit
+          ? await patch(`/finance/items/${item.id}`, payload)
+          : await post('/finance/items', payload);
+        toast(isEdit ? 'Saved' : 'Item created', 'ok');
+        if (S.tab === 'items') { await loadItems(); render(); }
+        return saved;
+      } catch (e) { toast(e.message, 'err'); return null; }
+    }
+
     // ---------- ledger ----------
     function txnTable(items, { compact: isCompact = false } = {}) {
       const table = el('table', { class: 'fin-table' });
@@ -634,33 +1046,260 @@ export default {
     }
 
     // ---------- receipts ----------
+    //
+    // A vision model reading a crumpled thermal receipt gets most lines right and then
+    // invents one. So the scan is a DRAFT, never a result: every field is editable before
+    // anything reaches the ledger, and the arithmetic check tells you where to look —
+    // if the lines add up to more than the subtotal, the surplus is very likely a line
+    // that isn't on the paper. What you fix is remembered per shop (server/receipts.js
+    // learnFix), so the same phantom line is dropped for you next time.
+
+    // Which receipts are expanded, and the in-progress edit for each. Kept on the app
+    // state (not the DOM) so a background refresh can't discard half-typed corrections.
+    S.openReceipts = S.openReceipts || {};
+
+    /** The reconciliation banner — the single most useful thing on this screen. */
+    function checkBanner(chk, currency) {
+      if (!chk) return null;
+      const m = (n) => `${currency || S.currency} ${Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+      if (chk.verdict === 'balanced') {
+        return el('div', { class: 'fin-chk is-ok' }, icon('check'),
+          el('span', {}, `The lines add up to ${m(chk.itemsSum)} — that matches the receipt.`));
+      }
+      if (chk.verdict === 'no-items') {
+        return el('div', { class: 'fin-chk is-warn' }, icon('eye'),
+          el('span', {}, 'No line items were read. Only the total will be logged — add lines below if you want per-item prices tracked.'));
+      }
+      if (chk.verdict === 'unchecked') {
+        return el('div', { class: 'fin-chk is-warn' }, icon('eye'),
+          el('span', {}, `No subtotal was printed, so the lines can't be cross-checked. They come to ${m(chk.itemsSum)}.`));
+      }
+      const over = chk.delta > 0;
+      return el('div', { class: 'fin-chk is-bad' }, icon('shield'),
+        el('span', {},
+          el('strong', {}, over ? `${m(Math.abs(chk.delta))} too much. ` : `${m(Math.abs(chk.delta))} missing. `),
+          over
+            ? `The lines come to ${m(chk.itemsSum)} but the receipt says ${m(chk.expected)}. Look for a line that isn't on the paper — a surplus this exact is usually one invented item.`
+            : `The lines come to ${m(chk.itemsSum)} but the receipt says ${m(chk.expected)}. A line was probably missed — add it below.`));
+    }
+
+    /** The editable draft for one receipt. */
+    function receiptEditor(r) {
+      const draft = S.openReceipts[r.id];
+      const cats = S.categories?.expense || [];
+      const wrap = el('div', { class: 'fin-rc-edit' });
+
+      const redraw = () => {
+        // Recompute the check locally so the banner reacts as you type, without a
+        // round trip. The server recomputes it authoritatively on save.
+        const sum = draft.items.reduce((s, i) => s + (Number(i.amount) || 0), 0);
+        const expected = draft.subtotal ?? (draft.total != null && draft.tax != null ? draft.total - draft.tax : draft.total);
+        const delta = Math.round((sum - (expected ?? sum)) * 100) / 100;
+        const tol = Math.max(1, Math.abs(expected ?? 0) * 0.01);
+        draft.check = !draft.items.length ? { verdict: 'no-items', itemsSum: 0, expected, delta: 0 }
+          : expected == null ? { verdict: 'unchecked', itemsSum: sum, expected: null, delta: 0 }
+            : Math.abs(delta) <= tol ? { verdict: 'balanced', itemsSum: sum, expected, delta }
+              : { verdict: delta > 0 ? 'overshoot' : 'short', itemsSum: sum, expected, delta };
+        wrap.innerHTML = '';
+        wrap.append(body());
+      };
+
+      const num = (obj, key, opts = {}) => el('input', {
+        class: 'input xs num', type: 'number', step: opts.step || '1', min: '0',
+        value: obj[key] ?? '',
+        oninput: (e) => {
+          const v = e.target.value.trim();
+          obj[key] = v === '' ? null : Number(v);
+          if (opts.live) redraw();
+        },
+      });
+
+      const body = () => el('div', {},
+        checkBanner(draft.check, draft.currency),
+
+        draft.learned?.length
+          ? el('div', { class: 'fin-chk is-learn' }, icon('sparkle'),
+            el('span', {}, `Applied what you taught it: `,
+              ...draft.learned.map(l => el('code', {}, l.kind === 'drop' ? `dropped “${l.line}”` : `renamed “${l.line}” → ${l.to}`))))
+          : null,
+        draft.dropped?.length
+          ? el('div', { class: 'fin-chk is-warn' }, icon('eye'),
+            el('span', {}, `Removed automatically: `,
+              ...draft.dropped.map(d => el('code', {}, `${d.name} ${d.amount} (${d.why})`)),
+              ' — add it back below if it was real.'))
+          : null,
+
+        // header fields
+        el('div', { class: 'fin-rc-head' },
+          el('label', { class: 'wide' }, el('span', {}, 'Shop'),
+            el('input', { class: 'input xs', value: draft.merchant || '', oninput: e => { draft.merchant = e.target.value; } })),
+          el('label', {}, el('span', {}, 'Date'),
+            el('input', { class: 'input xs', type: 'date', value: draft.date || '', oninput: e => { draft.date = e.target.value; } })),
+          el('label', {}, el('span', {}, 'Subtotal'), num(draft, 'subtotal', { live: true })),
+          el('label', {}, el('span', {}, 'Tax'), num(draft, 'tax', { live: true })),
+          el('label', {}, el('span', {}, 'Total'), num(draft, 'total', { live: true }))),
+
+        cats.length
+          ? el('div', { class: 'fin-chips' }, cats.map(c => el('button', {
+            class: 'fin-chip' + (c === draft.category ? ' is-on' : ''),
+            onclick: () => { draft.category = c; redraw(); },
+          }, c)))
+          : null,
+
+        // line items
+        el('table', { class: 'fin-rc-lines' },
+          el('thead', {}, el('tr', {},
+            el('th', {}, 'Printed on the receipt'), el('th', {}, 'Item'),
+            el('th', { class: 'num' }, 'Qty'), el('th', { class: 'num' }, 'Amount'), el('th', {}))),
+          el('tbody', {}, draft.items.length
+            ? draft.items.map((it, i) => el('tr', { class: it.warn?.length ? 'is-suspect' : '' },
+              el('td', {}, el('code', { class: 'fin-rc-printed', title: it.printed || '' }, it.printed || '—')),
+              el('td', {},
+                el('input', { class: 'input xs', value: it.name || '', oninput: e => { it.name = e.target.value; } }),
+                it.warn?.length ? el('div', { class: 'fin-rc-warn' }, it.warn.join(' · ')) : null),
+              el('td', { class: 'num' }, num(it, 'qty')),
+              el('td', { class: 'num' }, num(it, 'amount', { live: true })),
+              el('td', {}, el('button', {
+                class: 'btn ghost xs', title: 'Not on the receipt — remove it',
+                onclick: () => { draft.items.splice(i, 1); redraw(); },
+              }, icon('trash')))))
+            : [el('tr', {}, el('td', { colspan: '5', class: 'muted' }, 'No lines. Add one, or just log the total.'))])),
+
+        el('div', { class: 'fin-rc-actions' },
+          el('button', {
+            class: 'btn sm', onclick: () => {
+              draft.items.push({ printed: '', name: '', qty: 1, amount: null });
+              redraw();
+            },
+          }, icon('plus'), 'Add a line'),
+          el('span', { class: 'grow' }),
+          el('button', { class: 'btn sm', onclick: () => saveDraft(r, false) }, 'Save corrections'),
+          el('button', {
+            class: 'btn sm primary', title: 'One ledger row for the whole receipt',
+            onclick: () => saveDraft(r, 'total'),
+          }, `Log ${money(draft.total)}`),
+          draft.items.length > 1
+            ? el('button', {
+              class: 'btn sm', title: 'One ledger row per line item',
+              onclick: () => saveDraft(r, 'items'),
+            }, `Split ${draft.items.length}`)
+            : null),
+
+        r.edited
+          ? el('div', { class: 'fin-rc-note' }, 'You have already corrected this scan; the model’s original reading is kept for comparison.')
+          : null);
+
+      redraw();
+      return wrap;
+    }
+
+    /** Pull an applied receipt back out of the ledger and open it for correction. */
+    async function revertReceipt(r) {
+      const n = (r.txnIds || []).length;
+      const ok = await confirmBox(
+        'Take this receipt back out of the ledger?',
+        `Its ${n} row${n === 1 ? '' : 's'} and the prices recorded from it will be removed, and the scan `
+        + 'reopens for editing. Nothing else in the ledger is touched.',
+        'Undo & edit');
+      if (!ok) return;
+      try {
+        const res = await post(`/finance/receipts/${r.id}/revert`, {});
+        toast(`Removed ${res.undone.transactions} row${res.undone.transactions === 1 ? '' : 's'}`, 'ok');
+        S.receipts = await get('/finance/receipts?limit=30');
+        const fresh = S.receipts.find(x => x.id === r.id);
+        if (fresh?.parsed) S.openReceipts[r.id] = JSON.parse(JSON.stringify({ items: [], ...fresh.parsed }));
+        await refresh();
+      } catch (e) { toast(e.message, 'err'); }
+    }
+
+    /** Persist the draft, then optionally post it to the ledger. */
+    async function saveDraft(r, applyMode) {
+      const draft = S.openReceipts[r.id];
+      try {
+        const payload = {
+          merchant: draft.merchant, date: draft.date, category: draft.category,
+          subtotal: draft.subtotal, tax: draft.tax, total: draft.total,
+          currency: draft.currency, time: draft.time, paymentMethod: draft.paymentMethod,
+          items: draft.items
+            .filter(it => (it.name || '').trim() && Number(it.amount) > 0)
+            .map(it => ({ printed: it.printed || it.name, name: it.name, qty: it.qty || 1, amount: it.amount })),
+        };
+        await patch(`/finance/receipts/${r.id}`, payload);
+        if (!applyMode) {
+          toast('Corrections saved', 'ok');
+          delete S.openReceipts[r.id];
+        } else {
+          const res = await post(`/finance/receipts/${r.id}/apply`, { mode: applyMode });
+          const n = res.learned?.learned || 0;
+          toast(`Added ${res.created.length} row${res.created.length === 1 ? '' : 's'}`
+            + (n ? ` · learned ${n} correction${n === 1 ? '' : 's'}` : ''), 'ok');
+          delete S.openReceipts[r.id];
+        }
+        S.receipts = await get('/finance/receipts?limit=30');
+        await refresh();
+      } catch (e) { toast(e.message, 'err'); }
+    }
+
     function renderReceipts() {
       const list = S.receipts || [];
       content.append(
         el('div', { class: 'fin-toolbar' },
           el('button', { class: 'btn sm primary', onclick: openReceiptFlow }, icon('sparkle'), 'Scan a receipt'),
-          el('span', { class: 'fin-count' }, 'Read on this machine by the local vision model — no image leaves the network.')),
+          el('span', { class: 'fin-count' }, 'Read on this machine by the local vision model — no image leaves the network. Check it before it lands in the ledger.')),
         list.length
           ? el('ul', { class: 'fin-receipt-list' }, list.map(r => {
             const p = r.parsed || {};
-            return el('li', { class: 'fin-receipt is-' + r.status },
-              r.uploadId ? el('img', { class: 'fin-receipt-thumb', src: mediaUrl(`/uploads/${r.uploadId}`), alt: '', loading: 'lazy' }) : null,
-              el('div', { class: 'fin-receipt-main' },
-                el('div', { class: 'fin-receipt-title' }, p.merchant || (r.status === 'failed' ? 'Could not read' : 'Unread')),
-                el('div', { class: 'fin-receipt-meta' },
-                  r.status === 'failed' ? r.error
-                    : `${p.date || ''} · ${money(p.total)} · ${(p.items || []).length} item${(p.items || []).length === 1 ? '' : 's'}${r.status === 'applied' ? ' · added' : ''}`)),
-              r.status === 'parsed'
-                ? el('div', { class: 'fin-receipt-actions' },
-                  el('button', { class: 'btn sm primary', title: 'One row for the receipt total', onclick: () => applyReceipt(r, 'total') }, 'Add total'),
-                  el('button', { class: 'btn sm', title: 'One row per line item', onclick: () => applyReceipt(r, 'items') }, 'Add items'))
-                : null,
-              el('button', {
-                class: 'btn ghost xs', title: 'Delete',
-                onclick: async () => { await del(`/finance/receipts/${r.id}`); S.receipts = await get('/finance/receipts?limit=30'); render(); },
-              }, icon('trash')));
+            const items = p.items || [];
+            const suspect = p.check && p.check.ok === false;
+            const open = !!S.openReceipts[r.id];
+            return el('li', { class: 'fin-receipt is-' + r.status + (suspect ? ' is-suspect' : '') + (open ? ' is-open' : '') },
+              el('div', { class: 'fin-receipt-row' },
+                r.uploadId
+                  ? el('a', { href: mediaUrl(`/uploads/${r.uploadId}`), target: '_blank', rel: 'noopener', title: 'Open the photo full size' },
+                    el('img', { class: 'fin-receipt-thumb', src: mediaUrl(`/uploads/${r.uploadId}`), alt: '', loading: 'lazy' }))
+                  : null,
+                el('div', { class: 'fin-receipt-main' },
+                  el('div', { class: 'fin-receipt-title' },
+                    p.merchant || (r.status === 'failed' ? 'Could not read' : 'Unread'),
+                    suspect ? el('span', { class: 'fin-badge is-bad', title: 'The line items do not match the total' }, 'check me') : null,
+                    r.edited ? el('span', { class: 'fin-badge', title: 'You corrected this scan' }, 'edited') : null),
+                  el('div', { class: 'fin-receipt-meta' },
+                    r.status === 'failed' ? r.error
+                      : `${p.date || ''} · ${money(p.total)} · ${items.length} item${items.length === 1 ? '' : 's'}${r.status === 'applied' ? ' · in the ledger' : ''}`)),
+                r.status === 'parsed'
+                  ? el('div', { class: 'fin-receipt-actions' },
+                    el('button', {
+                      class: 'btn sm' + (suspect || open ? ' primary' : ''),
+                      onclick: () => {
+                        if (open) delete S.openReceipts[r.id];
+                        // Deep-copy so edits are discardable and a refresh can't stomp them.
+                        else S.openReceipts[r.id] = JSON.parse(JSON.stringify({ items: [], ...p }));
+                        render();
+                      },
+                    }, icon(open ? 'chevD' : 'edit'), open ? 'Close' : 'Review & edit'),
+                    !open ? el('button', { class: 'btn sm', title: 'One row for the receipt total', onclick: () => applyReceipt(r, 'total') }, 'Log total') : null)
+                  : null,
+                // Already logged, and you have just spotted a line that shouldn't be there.
+                // Editing the ledger row alone would fix the total but leave the scan wrong
+                // and teach the scanner nothing — so this puts it back in the editor.
+                r.status === 'applied'
+                  ? el('div', { class: 'fin-receipt-actions' },
+                    el('button', {
+                      class: 'btn sm', title: 'Remove its rows from the ledger and reopen it for correction',
+                      onclick: () => revertReceipt(r),
+                    }, icon('refresh'), 'Undo & edit'))
+                  : null,
+                el('button', {
+                  class: 'btn ghost xs', title: 'Delete this scan',
+                  onclick: async () => {
+                    await del(`/finance/receipts/${r.id}`);
+                    delete S.openReceipts[r.id];
+                    S.receipts = await get('/finance/receipts?limit=30'); render();
+                  },
+                }, icon('trash'))),
+              open ? receiptEditor(r) : null);
           }))
-          : teach('No receipts yet.', 'Photograph one and the local model pulls out the merchant, date, items and total.'));
+          : teach('No receipts yet.', 'Photograph one and the local model pulls out the merchant, date, items and total. You get to check it before anything is logged.'));
     }
 
     // ---------- editors ----------
@@ -791,7 +1430,9 @@ export default {
     }
 
     async function openReceiptFlow() {
-      const picker = el('input', { type: 'file', accept: 'image/*', style: { display: 'none' } });
+      // IMAGE_ACCEPT, not 'image/*': iOS does not offer HEIC files in the Files branch
+      // of its picker unless the extensions are named explicitly.
+      const picker = el('input', { type: 'file', accept: IMAGE_ACCEPT, style: { display: 'none' } });
       document.body.append(picker);
       picker.onchange = async () => {
         const file = picker.files?.[0];

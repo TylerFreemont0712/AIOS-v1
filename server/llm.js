@@ -22,7 +22,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { loadConfig } from './config.js';
 import { id as genId, estTokens } from './util.js';
-import { readUpload } from './uploads.js';
+import { readUpload, isProviderSafeImage } from './uploads.js';
 
 const ANTHROPIC_FALLBACK_MODELS = [
   'claude-opus-4-8', 'claude-sonnet-5', 'claude-haiku-4-5-20251001',
@@ -40,7 +40,10 @@ function providerFor(providerId) {
   if (providerId === 'ollama') return { kind: 'ollama', ...cfg.providers.ollama };
   const c = cfg.providers.custom.find(p => `custom_${p.id}` === providerId || p.id === providerId);
   if (c) return { kind: 'openai', ...c };
-  throw new Error(`unknown provider: ${providerId}`);
+  // Reached most often by an old chat whose provider has since been removed in Settings.
+  // Saying so beats "unknown provider: custom_xY7z", which reads like a bug.
+  throw new Error(`this conversation's model provider (${providerId}) is no longer configured `
+    + '— pick another model from the picker, or re-add the provider in Settings → AI Providers');
 }
 
 // ---------- model discovery ----------
@@ -89,7 +92,7 @@ export async function listModels() {
         seen.add(mid);
         out.push({ ref: `custom_${c.id}:${mid}`, provider: c.name, model: mid, label: `${mid} (${c.name})` });
       };
-      // manually-listed models always show — for gateways with no /models endpoint (e.g. Agnes AI)
+      // manually-listed models always show — for gateways that serve no /models endpoint
       for (const mid of Array.isArray(c.models) ? c.models : []) add(mid);
       try {
         const headers = c.apiKey ? { Authorization: `Bearer ${c.apiKey}` } : {};
@@ -102,7 +105,6 @@ export async function listModels() {
   await Promise.allSettled(jobs);
 
   try {
-    const { AUTO_CATEGORIES } = await import('./router.js');
     const { listLocalModels, servingAlias, modelAlias } = await import('./llmctl.js');
     if (managedId) {
       const current = servingAlias();
@@ -114,16 +116,29 @@ export async function listModels() {
           label: `${m.file.replace(/\.gguf$/i, '')} (${m.sizeGB}GB local${alias === current ? ' · serving' : ''})`,
         });
       }
-      // routed pseudo-models: the bench-driven router picks per request
-      for (const [c, why] of [...AUTO_CATEGORIES].reverse()) {
-        out.unshift({ ref: `auto:${c}`, provider: 'auto', model: c, label: `⚡ Auto — ${c} (${why})` });
-      }
     }
-  } catch { /* router unavailable — plain model list */ }
+  } catch { /* llmctl unavailable — plain model list */ }
   return out;
 }
 
+// Probing means a network round trip per provider, each with a seconds-long timeout,
+// and /api/status is polled every 60s by every open tab. Without this, three tabs and a
+// phone meant four times the probes — and when a provider is DOWN each one blocks for
+// its full timeout. One probe serves everyone for a few seconds.
+let probeCache = { at: 0, inflight: null, res: null };
+const PROBE_TTL = 5000;
+
 export async function probeProviders() {
+  if (probeCache.res && Date.now() - probeCache.at < PROBE_TTL) return probeCache.res;
+  if (probeCache.inflight) return probeCache.inflight;
+  probeCache.inflight = doProbeProviders().then(
+    (res) => { probeCache = { at: Date.now(), inflight: null, res }; return res; },
+    (e) => { probeCache.inflight = null; throw e; },
+  );
+  return probeCache.inflight;
+}
+
+async function doProbeProviders() {
   const cfg = loadConfig();
   const res = { anthropic: { enabled: cfg.providers.anthropic.enabled, configured: !!cfg.providers.anthropic.apiKey }, ollama: { enabled: cfg.providers.ollama.enabled, up: false, models: 0 }, custom: [] };
   try {
@@ -294,13 +309,20 @@ function openaiReasoningBody(level, p) {
 // ---------- streaming chat ----------
 
 export async function streamChat({ modelRef, system, messages, tools, onEvent, signal, maxTokens = 8192, sampling, reasoning }) {
-  // auto:<category> → routed to the bench-best local model; local:<alias> → that exact
-  // model, auto-served on demand. Either way the managed llama-server may be swapped
-  // first (never mid-generation). Dynamic import: router → bench → this module.
+  // local:<alias> → that exact model, auto-served on demand, swapping the managed
+  // llama-server if needed (never mid-generation). Dynamic import: router → bench →
+  // this module.
+  //
+  // auto:<category> was a bench-driven router that picked a model per request. It was
+  // removed — ten pseudo-models in every picker to express a preference the Local list
+  // already expresses directly. Refs stored before the removal (old chats, agent
+  // sessions) still resolve here to a real model rather than erroring, since a saved
+  // transcript should not stop working because a feature went away.
   if (String(modelRef || '').startsWith('auto:')) {
-    const { resolveAuto } = await import('./router.js');
-    modelRef = await resolveAuto(modelRef.slice(5));
-  } else if (String(modelRef || '').startsWith('local:')) {
+    const { legacyAutoRef } = await import('./router.js');
+    modelRef = await legacyAutoRef();
+  }
+  if (String(modelRef || '').startsWith('local:')) {
     const { resolveLocal } = await import('./router.js');
     modelRef = await resolveLocal(modelRef.slice(6));
   }
@@ -354,8 +376,18 @@ function textAttachmentBlock(a, buf) {
   return `Attached file "${a.name}":\n\`\`\`\n${body}\n\`\`\``;
 }
 function unreadableNote(a) {
+  if (a.kind === 'image') {
+    return `[Attached image "${a.name}" (${a.mime}) could not be prepared for a model on this machine`
+      + `${a.unreadable ? ` — ${a.unreadable}` : ''}. Tell the user their photo needs to be a JPEG or PNG,`
+      + ' or that AIOS needs ffmpeg installed to convert it (Settings → uploads.ffmpeg).]';
+  }
   return `[Attached ${a.kind === 'pdf' ? 'PDF' : 'file'} "${a.name}" (${a.mime}) — the selected model can't read this format directly. Use an Anthropic model for PDFs, or attach an image or text version.]`;
 }
+
+/** An image is only sent as an image if a provider can actually decode it. uploads.js
+ *  converts the awkward formats on arrival, so this only fires when that failed — and
+ *  a note the model can read beats a media_type it will reject with a 400. */
+const sendableImage = (a) => a.kind === 'image' && !a.unreadable && isProviderSafeImage(a.mime);
 
 // --- Anthropic ---
 
@@ -366,7 +398,7 @@ function anthropicUserContent(m) {
   for (const a of m.attachments || []) {
     const buf = attBytes(a);
     if (!buf) continue;
-    if (a.kind === 'image') content.push({ type: 'image', source: { type: 'base64', media_type: a.mime, data: buf.toString('base64') } });
+    if (sendableImage(a)) content.push({ type: 'image', source: { type: 'base64', media_type: a.mime, data: buf.toString('base64') } });
     else if (a.kind === 'pdf') content.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: buf.toString('base64') } });
     else if (a.kind === 'text') content.push({ type: 'text', text: textAttachmentBlock(a, buf) });
     else content.push({ type: 'text', text: unreadableNote(a) });
@@ -464,7 +496,7 @@ function openaiUserContent(m) {
   for (const a of m.attachments) {
     const buf = attBytes(a);
     if (!buf) continue;
-    if (a.kind === 'image') parts.push({ type: 'image_url', image_url: { url: `data:${a.mime};base64,${buf.toString('base64')}` } });
+    if (sendableImage(a)) parts.push({ type: 'image_url', image_url: { url: `data:${a.mime};base64,${buf.toString('base64')}` } });
     else if (a.kind === 'text') parts.push({ type: 'text', text: textAttachmentBlock(a, buf) });
     else parts.push({ type: 'text', text: unreadableNote(a) });
   }
@@ -499,7 +531,7 @@ function toOllamaMessages(system, messages) {
       for (const a of m.attachments || []) {
         const buf = attBytes(a);
         if (!buf) continue;
-        if (a.kind === 'image') images.push(buf.toString('base64'));
+        if (sendableImage(a)) images.push(buf.toString('base64'));
         else if (a.kind === 'text') content += (content ? '\n\n' : '') + textAttachmentBlock(a, buf);
         else content += (content ? '\n\n' : '') + unreadableNote(a);
       }

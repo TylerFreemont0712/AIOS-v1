@@ -258,6 +258,60 @@ export function sparkbars(values, { height = 22, width = 64, tone = 'accent' } =
     }));
 }
 
+/**
+ * Price history for one item: every purchase as a dot, coloured by merchant, with
+ * a dashed median line. A plain line chart would be wrong here — the points are
+ * not one series over time but independent observations from different shops, and
+ * joining them would imply a price movement that never happened.
+ * `points: [{date, unitPrice, merchant}]` in date order.
+ */
+export function pricePoints(points, { width = 620, height = 200, merchants = [], format = fmtNum } = {}) {
+  if (!points?.length) return empty(width, height, 'no priced purchases yet');
+  const padL = 52, padR = 12, padT = 12, padB = 26;
+  const plotW = width - padL - padR, plotH = height - padT - padB;
+
+  const vals = points.map(p => p.unitPrice);
+  const lo = Math.min(...vals), hi = Math.max(...vals);
+  const pad = (hi - lo) * 0.15 || hi * 0.15 || 1;
+  const min = Math.max(0, lo - pad), max = hi + pad;
+
+  const t0 = Date.parse(points[0].date), t1 = Date.parse(points[points.length - 1].date);
+  const span = t1 - t0 || 1;
+  const x = (d) => padL + (points.length === 1 ? plotW / 2 : ((Date.parse(d) - t0) / span) * plotW);
+  const y = (v) => padT + plotH - ((v - min) / (max - min || 1)) * plotH;
+
+  const names = merchants.length ? merchants : [...new Set(points.map(p => p.merchant || '(unknown)'))];
+  const colors = palette(names.length);
+  const colorOf = (m) => colors[Math.max(0, names.indexOf(m || '(unknown)'))] || 'var(--accent)';
+
+  const kids = [];
+  for (let i = 0; i <= 3; i++) {
+    const v = min + ((max - min) / 3) * i;
+    const yy = y(v);
+    kids.push(svgEl('line', { x1: padL, x2: width - padR, y1: yy, y2: yy, class: 'chart-grid' }));
+    kids.push(svgEl('text', { x: padL - 6, y: yy + 3, 'text-anchor': 'end', class: 'chart-axis', text: format(v) }));
+  }
+  const sorted = vals.slice().sort((a, b) => a - b);
+  const med = sorted[sorted.length >> 1];
+  kids.push(svgEl('line', {
+    x1: padL, x2: width - padR, y1: y(med), y2: y(med), class: 'chart-median',
+  }, svgEl('title', { text: `median ${format(med)}` })));
+
+  for (const p of points) {
+    kids.push(svgEl('circle', {
+      cx: x(p.date), cy: y(p.unitPrice), r: 4.5, fill: colorOf(p.merchant), class: 'chart-point',
+    }, svgEl('title', { text: `${p.date} · ${p.merchant || 'unknown'} · ${format(p.unitPrice)}` })));
+  }
+  kids.push(svgEl('text', { x: padL, y: height - 7, class: 'chart-axis', text: points[0].date }));
+  if (points.length > 1) {
+    kids.push(svgEl('text', {
+      x: width - padR, y: height - 7, 'text-anchor': 'end', class: 'chart-axis',
+      text: points[points.length - 1].date,
+    }));
+  }
+  return svgEl('svg', { class: 'chart', viewBox: `0 0 ${width} ${height}`, width: '100%', height, role: 'img' }, kids);
+}
+
 /** A meter with an optional second "stretch" marker — budgets and goals. */
 export function meter(value, target, { stretch = 0, format = fmtNum, danger = false } = {}) {
   const pct = target > 0 ? Math.min(100, (value / target) * 100) : 0;

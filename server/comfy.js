@@ -5,7 +5,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { DATA, loadConfig } from './config.js';
 import { id as genId, now, readJSON, writeJSON } from './util.js';
 import { gpuStats } from './gpu.js';
@@ -46,11 +46,24 @@ const alive = (pid) => { try { return pid > 0 && (process.kill(pid, 0), true); }
 const isComfy = (pid) => { try { return /main\.py/.test(fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8')); } catch { return false; } };
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/** ComfyUI processes AIOS didn't start (manually launched). */
+/**
+ * ComfyUI processes AIOS didn't start (manually launched, or ours orphaned by a stale
+ * pidfile). Reads /proc rather than forking pgrep: procStatus() sits on the Studio and
+ * services status paths, where a fork costs ~24ms of blocked event loop (llmctl.js).
+ *
+ * Identifying one takes two tests, because the two ways it gets launched look
+ * different: a manual start names the full path (…/ComfyUI/main.py), while AIOS starts
+ * a bare `main.py` with cwd set to the ComfyUI directory — only the cwd gives that one
+ * away. Without both, an unrelated `main.py` on the box reads as a rogue ComfyUI.
+ */
 function foreignComfyPids() {
-  const r = spawnSync('pgrep', ['-f', 'ComfyUI/main.py'], { encoding: 'utf8', timeout: 4000 });
   const own = readPid();
-  return (r.stdout || '').split('\n').filter(Boolean).map(Number).filter(p => p && p !== own);
+  const dir = loadConfig().comfy?.dir || '';
+  return llmctl.pidsMatching('main.py').filter((p) => {
+    if (!p || p === own) return false;
+    try { if (/comfyui/i.test(fs.readFileSync(`/proc/${p}/cmdline`, 'latin1'))) return true; } catch { return false; }
+    try { return !!dir && fs.readlinkSync(`/proc/${p}/cwd`) === path.resolve(dir); } catch { return false; }
+  });
 }
 
 export function procStatus() {
@@ -76,6 +89,7 @@ export async function startComfy() {
     cwd: dir, detached: true, stdio: ['ignore', out, out],
   });
   child.unref();
+  try { fs.closeSync(out); } catch { }   // the child has its own dup — ours would leak
   fs.writeFileSync(PIDFILE, String(child.pid));
 
   const t0 = Date.now();
@@ -161,6 +175,9 @@ function resolveSource(src) {
   if (src.startsWith('upload:')) {
     const { meta, buffer } = uploads.readUpload(src.slice(7));
     if (!/^image\//.test(meta.mime || '')) throw err('the source upload is not an image');
+    // uploads.js converts HEIC and friends on arrival; if that failed, ComfyUI cannot
+    // read the bytes either, so say why instead of handing it a file it will reject.
+    if (meta.unreadable) throw err(`that image is a ${meta.convertedFrom || meta.mime} and could not be converted to JPEG — install ffmpeg (or set uploads.ffmpeg)`);
     const ext = (meta.name || '').match(/\.(png|jpe?g|webp)$/i)?.[0] || '.png';
     return { buffer, name: `aios_src_${src.slice(7)}${ext}` };
   }
@@ -430,16 +447,27 @@ export async function generate(opts = {}) {
 async function run(job) {
   const cfgAll = loadConfig();
   const setStatus = (status, detail = '') => { job.status = status; upsertJob(job); emit(job.id, { type: 'status', status, detail }); };
+  // Only set when THIS job stopped the LLM. Studio mode toggled by hand also
+  // suspends, and that must stay off until the user turns it back on — but a
+  // render should never leave chat and agent dead behind it.
+  let weSuspended = false;
   try {
-    // VRAM guard: the big LLM and SDXL can't share 8GB — swap to tiny first.
-    // A pure ESRGAN upscale needs far less headroom than a checkpoint load.
+    // VRAM guard: an LLM and SDXL cannot share 8GB, so stop llama.cpp outright
+    // rather than swapping it to a CPU profile — a live llama-server keeps its
+    // CUDA context and cuBLAS workspace even at -ngl 0, and that margin decides
+    // whether a checkpoint fits. resumeAfterGpu() puts the same model back.
+    //
+    // The condition is "llama holds the GPU at all", not "the big profile is
+    // loaded": models served ad hoc report profile "model:<alias>", so the old
+    // profile === 'big' test silently skipped the guard for every one of them.
     const llm = llmctl.llmStatus();
     const gpu = gpuStats();
     const needMB = job.kind === 'upscale' ? 2500 : 6500;
-    const bigHoldsGpu = (llm.running && llm.profile === 'big') || llm.foreign;
-    if (cfgAll.comfy?.autoSwap !== false && cfgAll.llm?.managed !== false && bigHoldsGpu && (gpu ? gpu.freeMB < needMB : true)) {
-      setStatus('swapping-llm', 'freeing VRAM: switching llama.cpp to the tiny CPU profile');
-      await llmctl.startProfile('tiny');
+    const llmHoldsGpu = llm.running || llm.foreign;
+    if (cfgAll.comfy?.autoSwap !== false && cfgAll.llm?.managed !== false && llmHoldsGpu && (gpu ? gpu.freeMB < needMB : true)) {
+      setStatus('swapping-llm', 'freeing VRAM: stopping llama.cpp for the duration');
+      const r = await llmctl.suspendForGpu();
+      weSuspended = !!r.suspended;
     }
 
     let comfyImage = null;
@@ -511,19 +539,33 @@ async function run(job) {
     job.error = e.message;
     setStatus('error', e.message);
     emit(job.id, { type: 'error', message: e.message });
+  } finally {
+    // Put the LLM back, including after a failure — the image is already emitted,
+    // so this runs behind the result rather than delaying it. Only one job runs at
+    // a time (see the `running` guard), so there is nothing left to wait for.
+    if (weSuspended) {
+      try {
+        await api('/free', { method: 'POST', body: { unload_models: true, free_memory: true }, timeoutMs: 8000 }).catch(() => { });
+        const back = await llmctl.resumeAfterGpu({ fallback: 'big' });
+        emit(job.id, { type: 'llm', restored: back.profile || back.resumed || false });
+      } catch (e) {
+        console.error('[comfy] could not restart llama.cpp after the job:', e.message);
+      }
+    }
   }
 }
 
 // ---------- studio mode ----------
 
-/** ON = tiny CPU LLM (GPU free for Comfy) · OFF = back to the big model. */
+/** ON = llama.cpp stopped so Comfy gets the whole card · OFF = restore whatever
+ *  was serving before. */
 export async function setStudio(on) {
   if (on) {
-    await llmctl.startProfile('tiny');
+    await llmctl.suspendForGpu();
   } else {
-    // let Comfy drop its models first so the big LLM can map VRAM
+    // Let Comfy drop its models first, or the returning LLM cannot map VRAM.
     await api('/free', { method: 'POST', body: { unload_models: true, free_memory: true }, timeoutMs: 5000 }).catch(() => { });
-    await llmctl.startProfile('big');
+    await llmctl.resumeAfterGpu({ fallback: 'big' });
   }
-  return { studio: !!on, llm: llmctl.llmStatus(), gpu: gpuStats() };
+  return { studio: !!on, llm: llmctl.llmStatus(), gpu: gpuStats(), suspended: llmctl.gpuSuspended() };
 }
