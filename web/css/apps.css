@@ -1186,11 +1186,35 @@
 .cal-cell.l3 { background: color-mix(in srgb, var(--accent) 68%, var(--surface-3)); }
 .cal-cell.l4 { background: var(--accent); }
 .cal-cell.l3 .cal-day, .cal-cell.l4 .cal-day { color: var(--accent-text, #fff); }
+/* Signed mode: direction by hue, magnitude by intensity. A +8,000 day and a −8,000 day
+   are equally intense, opposite colours — which is what a NET calendar has to say. */
+.cal-cell.is-pos.l1 { background: color-mix(in srgb, var(--ok) 20%, var(--surface-3)); }
+.cal-cell.is-pos.l2 { background: color-mix(in srgb, var(--ok) 42%, var(--surface-3)); }
+.cal-cell.is-pos.l3 { background: color-mix(in srgb, var(--ok) 66%, var(--surface-3)); }
+.cal-cell.is-pos.l4 { background: var(--ok); }
+.cal-cell.is-neg.l1 { background: color-mix(in srgb, var(--err) 20%, var(--surface-3)); }
+.cal-cell.is-neg.l2 { background: color-mix(in srgb, var(--err) 42%, var(--surface-3)); }
+.cal-cell.is-neg.l3 { background: color-mix(in srgb, var(--err) 66%, var(--surface-3)); }
+.cal-cell.is-neg.l4 { background: var(--err); }
+.cal-cell.is-pos.l3 .cal-day, .cal-cell.is-pos.l4 .cal-day,
+.cal-cell.is-neg.l3 .cal-day, .cal-cell.is-neg.l4 .cal-day { color: #fff; }
+
+/* Year-to-date card */
+.fin-ytd { display: flex; flex-direction: column; gap: 4px; }
+.fin-ytd-row { display: flex; justify-content: space-between; align-items: baseline; font-size: 12.5px; }
+.fin-ytd-row strong { font-variant-numeric: tabular-nums; }
+.fin-ytd-row strong.is-in { color: var(--ok); }
+.fin-ytd-row strong.is-out { color: var(--err); }
+.fin-ytd-row.is-net { border-top: 1px solid var(--border); margin-top: 3px; padding-top: 5px; font-size: 14px; }
+.fin-ytd-row.is-net strong.is-neg { color: var(--err); }
+.fin-ytd-meta { font-size: 10.5px; color: var(--faint); margin-top: 4px; }
+
 .cal-key { display: flex; align-items: center; gap: 4px; margin-top: 8px; font-size: 10px; }
 .cal-cell.is-key { width: 11px; height: 11px; aspect-ratio: auto; border-radius: 3px; }
 
 /* --- meters --- */
 .fin-meter { margin: 4px 0 8px; }
+.fin-source-list .fin-meter { margin: 4px 0 2px; }
 .fin-meter-track { position: relative; height: 7px; background: var(--surface-3); border-radius: 5px; overflow: hidden; }
 .fin-meter-fill { height: 100%; background: var(--accent); border-radius: 5px; transition: width .25s ease; }
 .fin-meter.is-over .fin-meter-fill { background: var(--err); }
@@ -1311,6 +1335,50 @@
 .fin-preset-meta { display: block; font-size: 11px; color: var(--faint); }
 .fin-recurring-actions { display: flex; gap: 8px; }
 
+/* --- income --- */
+
+/* One-tap logging sits above everything: the whole point is that recording an hour of
+   work costs less effort than not recording it. */
+.fin-quick { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+.fin-quick-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--faint); font-weight: 600; margin-right: 2px; }
+.fin-chip-rate { opacity: .65; margin-left: 5px; font-variant-numeric: tabular-nums; }
+.fin-chip.is-add { border-style: dashed; }
+
+.fin-source-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.fin-source-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.fin-source-name { font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fin-source-total { font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.fin-source-meta { font-size: 10.5px; color: var(--faint); margin-top: 3px; }
+
+/* The daily log — a freelance diary, newest first, each day totalled. */
+.fin-daylog { display: flex; flex-direction: column; gap: 2px; }
+.fin-day { border-bottom: 1px solid var(--border); padding: 7px 0; }
+.fin-day:last-child { border-bottom: none; }
+.fin-day-head { display: flex; align-items: baseline; gap: 8px; }
+.fin-day-date { font-size: 12px; font-weight: 600; }
+.fin-day-hours { font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.fin-day-total { font-size: 12.5px; font-weight: 600; color: var(--ok); font-variant-numeric: tabular-nums; }
+.fin-day-entries { list-style: none; margin: 4px 0 0; padding: 0; }
+.fin-day-entries > li { display: flex; align-items: baseline; gap: 8px; padding: 2px 0 2px 10px;
+  font-size: 11.5px; border-left: 2px solid var(--border); cursor: default; }
+.fin-day-entries > li:hover { border-left-color: var(--accent); background: var(--surface-2); }
+.fin-entry-src { min-width: 110px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fin-entry-note { flex: 1; min-width: 0; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fin-entry-amt { font-variant-numeric: tabular-nums; }
+
+/* The live "here is what you actually keep" line in the log form. */
+.fin-form-preview { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface-2);
+  font-size: 12px; margin: 4px 0; }
+.fin-form-preview-label { font-size: 10.5px; color: var(--faint); }
+.fin-form-check { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); }
+
+@media (max-width: 760px) {
+  .fin-entry-src { min-width: 0; }
+  .fin-day-entries > li { flex-wrap: wrap; }
+}
+
 /* --- receipts --- */
 .fin-receipt-list { list-style: none; margin: 0; padding: 0; }
 .fin-receipt { border-bottom: 1px solid var(--border); }
@@ -1334,6 +1402,34 @@
 /* --- receipt review editor --- */
 .fin-rc-edit { padding: 4px 0 14px; display: flex; flex-direction: column; gap: 10px; }
 
+/* Fields on the left, the paper on the right. The photo column is fixed-width so the
+   fields keep a usable size; below 1100px it stacks instead of squeezing both. */
+.fin-rc-split { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 14px; align-items: start; }
+.fin-rc-fields { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+/* A repaint target that must not become a flex item of its own — the banner inside it
+   takes part in .fin-rc-fields' column directly, and an empty slot occupies nothing. */
+.fin-rc-slot { display: contents; }
+@media (max-width: 1100px) { .fin-rc-split { grid-template-columns: minmax(0, 1fr); } }
+
+.fin-rc-photo { position: sticky; top: 4px; display: flex; flex-direction: column; gap: 6px; }
+.fin-rc-stage {
+  position: relative; overflow: hidden; height: 340px;
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface-3); display: flex; align-items: center; justify-content: center;
+  touch-action: none;                 /* pan is ours, not the browser's */
+}
+.fin-rc-img {
+  max-width: 100%; max-height: 100%; object-fit: contain;
+  transform-origin: center center; transition: transform .08s linear;
+  user-select: none; -webkit-user-drag: none;
+}
+.fin-rc-tools { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.fin-rc-tools .btn { min-width: 26px; justify-content: center; }
+
+/* A line the user has taken ownership of — its name now outranks the model's guess. */
+.fin-rc-lines tr.is-edited td:first-child { border-left: 2px solid var(--accent); }
+.fin-rc-lines .input.mono { font-family: var(--mono, ui-monospace, monospace); font-size: 11px; }
+
 .fin-chk { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; line-height: 1.45;
   padding: 8px 10px; border-radius: var(--r-sm); border: 1px solid var(--border); }
 .fin-chk svg { width: 15px; height: 15px; flex: none; margin-top: 1px; }
@@ -1343,6 +1439,48 @@
 .fin-chk.is-bad { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border));
   background: color-mix(in srgb, var(--err) 7%, transparent); }
 .fin-chk.is-learn { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+
+/* --- how sure the reading is ---
+   One colour ramp, used by the meter, the bar and the list pill, so a score reads the
+   same wherever it appears. --conf is set per level and everything else refers to it. */
+.fin-conf { --conf: var(--ok); border: 1px solid color-mix(in srgb, var(--conf) 30%, var(--border));
+  border-radius: var(--r-sm); padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }
+.fin-conf.is-good { --conf: var(--accent); }
+.fin-conf.is-fair { --conf: var(--warn); }
+.fin-conf.is-low  { --conf: var(--err); background: color-mix(in srgb, var(--err) 7%, transparent); }
+
+.fin-conf-head { display: flex; align-items: center; gap: 9px; }
+.fin-conf-score { font-size: 15px; font-weight: 650; color: var(--conf);
+  font-variant-numeric: tabular-nums; min-width: 28px; }
+.fin-conf-bar { flex: 1; height: 5px; border-radius: 3px; background: var(--surface-3); overflow: hidden; }
+.fin-conf-bar i { display: block; height: 100%; background: var(--conf); border-radius: 3px;
+  transition: width .2s ease; }
+.fin-conf-label { font-size: 11.5px; font-weight: 600; color: var(--conf); }
+.fin-conf-reads { font-size: 11px; color: var(--faint); }
+
+.fin-conf-why { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; }
+.fin-conf-why li { font-size: 11.5px; line-height: 1.4; color: var(--faint); padding-left: 12px; position: relative; }
+.fin-conf-why li::before { position: absolute; left: 0; }
+.fin-conf-why li.is-bad::before { content: '−'; color: var(--warn); }
+.fin-conf-why li.is-ok::before { content: '+'; color: var(--ok); }
+
+/* The same score as a list badge. Not uppercase like the others — it is a number. */
+.fin-conf-pill { text-transform: none; font-variant-numeric: tabular-nums;
+  background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+.fin-conf-pill.is-good { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+.fin-conf-pill.is-fair { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+.fin-conf-pill.is-low  { background: color-mix(in srgb, var(--err) 20%, transparent); color: var(--err); }
+
+/* --- what the corrections have taught it --- */
+.fin-learn { display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 8px 12px; margin-bottom: 10px; border-radius: var(--r-sm);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  background: color-mix(in srgb, var(--accent) 5%, transparent); }
+.fin-learn > .ico { flex: none; color: var(--accent); }
+.fin-learn-stat { display: flex; align-items: baseline; gap: 5px; cursor: default; }
+.fin-learn-stat strong { font-size: 14px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.fin-learn-stat span { font-size: 11.5px; color: var(--faint); }
+.fin-learn-note { font-size: 11px; color: var(--faint); }
 
 .fin-rc-head { display: flex; flex-wrap: wrap; gap: 10px; }
 .fin-rc-head label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--faint); }
@@ -1378,6 +1516,8 @@
 
 .fin-rc-actions { display: flex; align-items: center; gap: 6px; }
 .fin-rc-note { font-size: 11px; color: var(--faint); }
+.fin-linkbtn { font: inherit; font-size: inherit; color: inherit; background: none; border: none;
+  padding: 0; text-decoration: underline; cursor: pointer; }
 
 @media (max-width: 760px) {
   .fin-rc-head .input, .fin-rc-head .input.num { width: 100%; }

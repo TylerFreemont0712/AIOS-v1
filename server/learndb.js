@@ -229,9 +229,17 @@ function stmt(sql) {
   return s;
 }
 
-export const all = (sql, ...args) => stmt(sql).all(...args);
-export const one = (sql, ...args) => stmt(sql).get(...args) ?? null;
-export const run = (sql, ...args) => stmt(sql).run(...args);
+// `undefined` → `null`. node:sqlite refuses to bind undefined and throws "Provided value
+// cannot be bound to SQLite parameter 1", which is what a caller saw when an id was
+// simply missing — an opaque driver message where the lookup should have missed and
+// raised the real one ("lesson not found"). A tool called with an argument left out is
+// an everyday event when a model is doing the calling, and it must produce an answer the
+// model can act on. NULL matches nothing, so every `WHERE id = ?` behaves as intended.
+const bind = (args) => args.map(a => (a === undefined ? null : a));
+
+export const all = (sql, ...args) => stmt(sql).all(...bind(args));
+export const one = (sql, ...args) => stmt(sql).get(...bind(args)) ?? null;
+export const run = (sql, ...args) => stmt(sql).run(...bind(args));
 
 /** node:sqlite has no transaction sugar; this keeps multi-write ops atomic. */
 export function tx(fn) {

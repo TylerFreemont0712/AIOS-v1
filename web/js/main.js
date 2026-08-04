@@ -219,7 +219,11 @@ async function boot() {
   registerApp(planner);
   registerApp(finance);
   registerApp(settings);
-  renderDock(['home', '|', 'chat', 'agent', 'research', '|', 'planner', 'finance', 'github', 'studio', 'vault', 'learn', 'bench', 'models', '|', 'files', 'terminal', 'projects', '|', 'settings']);
+  // Registered ≠ docked. Bench and Files stay registered (and stay in the command
+  // palette) but are not top-level destinations: Bench is something you do TO a model,
+  // so it opens from the Models header, and Files is per-project, so it opens from the
+  // row of the project you want. Both were dock icons pressed about once a month.
+  renderDock(['home', '|', 'chat', 'agent', 'research', '|', 'planner', 'finance', 'github', 'studio', 'vault', 'learn', 'models', '|', 'terminal', 'projects', '|', 'settings']);
 
   // PWA: installable from the pairing link; the SW is a plain passthrough
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => { });

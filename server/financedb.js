@@ -232,6 +232,38 @@ export function getDb() {
   // parsed_ai keeps the model's ORIGINAL extraction after the user edits a receipt —
   // the diff between the two is what the correction loop learns from.
   ensureColumn('finance_receipt', 'parsed_ai', `TEXT NOT NULL DEFAULT ''`);
+  // What the same receipt looks like from the outside: date + total + line items, hashed
+  // to one string. Photographing a receipt twice (once on the phone, once at the desk)
+  // produces two scans of one purchase, and posting both silently doubles a day's spend.
+  // A column rather than a computed check because the lookup happens on every apply.
+  ensureColumn('finance_receipt', 'fingerprint', `TEXT NOT NULL DEFAULT ''`);
+  // The scan's own opinion of how well it read the paper, 0-100 (-1 = never scored).
+  // Denormalised out of `parsed` so "is this getting better over time?" is one query
+  // rather than a JSON parse per row.
+  ensureColumn('finance_receipt', 'confidence', 'REAL NOT NULL DEFAULT -1');
+  // Which correction this scan has already taught the fix table, as a hash of
+  // (model's reading → user's reading). `hits` on finance_receipt_fix is the trust gate that
+  // decides when a fix starts replaying with no model involved, and it is documented as
+  // "times the USER has made this correction" — but apply() ran the diff every time, and
+  // revertReceipt() deliberately keeps parsed_ai so the next apply can still learn. So
+  // Undo & edit → Log re-learned a byte-identical diff and incremented every fix again:
+  // one correction plus one undo promoted a one-off misread to a standing rule. Storing
+  // what was learned is the only thing that cycle cannot change.
+  ensureColumn('finance_receipt', 'learned_sig', `TEXT NOT NULL DEFAULT ''`);
+  // Which kind of document this scan holds — 'receipt' for everything written before the
+  // pipeline learned to read anything else. See docTypes in receipts.js.
+  ensureColumn('finance_receipt', 'doc_type', `TEXT NOT NULL DEFAULT 'receipt'`);
+  // What auto-orientation did, so the review UI can say so and offer the other way round.
+  // Was written onto the in-memory record and read back off the SQL row, which has no such
+  // column — so the banner and its one-click undo could never render after a reload.
+  ensureColumn('finance_receipt', 'oriented', `TEXT NOT NULL DEFAULT ''`);
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_receipt_fp ON finance_receipt(fingerprint, status)`);
+  } catch (e) { console.error('[finance] receipt fingerprint index:', e.message); }
+  // Work behind the money: 3.5 hours, 12 pieces. Lets the Income tab answer "what am I
+  // actually earning per hour", which is the question freelance income exists to answer.
+  ensureColumn('finance_txn', 'units', 'REAL NOT NULL DEFAULT 0');
+  ensureColumn('finance_txn', 'unit', `TEXT NOT NULL DEFAULT ''`);
   backupOnBoot();
   // One-time data repair for databases written before deleteTxn learned to forget
   // prices: a purchase whose transaction is gone is an invisible lie in the price
@@ -287,9 +319,14 @@ function stmt(sql) {
 /** Drop cached statements — required after any DDL, which can invalidate them. */
 export const resetStatements = () => stmts.clear();
 
-export const all = (sql, ...args) => stmt(sql).all(...args);
-export const one = (sql, ...args) => stmt(sql).get(...args) ?? null;
-export const run = (sql, ...args) => stmt(sql).run(...args);
+// `undefined` → `null`, for the same reason as learndb: node:sqlite refuses to bind
+// undefined and raises "Provided value cannot be bound to SQLite parameter 1", so a tool
+// called without an optional id answered with a driver message instead of "not found".
+const bind = (args) => args.map(a => (a === undefined ? null : a));
+
+export const all = (sql, ...args) => stmt(sql).all(...bind(args));
+export const one = (sql, ...args) => stmt(sql).get(...bind(args)) ?? null;
+export const run = (sql, ...args) => stmt(sql).run(...bind(args));
 
 export function tx(fn) {
   const d = getDb();

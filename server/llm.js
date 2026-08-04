@@ -308,7 +308,7 @@ function openaiReasoningBody(level, p) {
 
 // ---------- streaming chat ----------
 
-export async function streamChat({ modelRef, system, messages, tools, onEvent, signal, maxTokens = 8192, sampling, reasoning }) {
+export async function streamChat({ modelRef, system, messages, tools, onEvent, signal, maxTokens = 8192, sampling, reasoning, schema }) {
   // local:<alias> → that exact model, auto-served on demand, swapping the managed
   // llama-server if needed (never mid-generation). Dynamic import: router → bench →
   // this module.
@@ -343,8 +343,8 @@ export async function streamChat({ modelRef, system, messages, tools, onEvent, s
   };
 
   const res = p.kind === 'anthropic' ? await anthropicStream({ p, model, system, messages, tools, onEvent: timed, signal, maxTokens, sampling })
-    : p.kind === 'ollama' ? await ollamaStream({ p, model, system, messages, tools, onEvent: timed, signal, sampling, reasoning: rLevel })
-      : await openaiStream({ p, model, system, messages, tools, onEvent: timed, signal, maxTokens, sampling, reasoning: rLevel });
+    : p.kind === 'ollama' ? await ollamaStream({ p, model, system, messages, tools, onEvent: timed, signal, sampling, reasoning: rLevel, schema })
+      : await openaiStream({ p, model, system, messages, tools, onEvent: timed, signal, maxTokens, sampling, reasoning: rLevel, schema });
 
   const totalMs = Date.now() - t0;
   // Prefer the provider's own token count; fall back to an estimate when it reports
@@ -549,7 +549,7 @@ function toOllamaMessages(system, messages) {
   return out;
 }
 
-async function openaiStream({ p, model, system, messages, tools, onEvent, signal, maxTokens, sampling, reasoning }) {
+async function openaiStream({ p, model, system, messages, tools, onEvent, signal, maxTokens, sampling, reasoning, schema }) {
   const body = {
     model, stream: true, max_tokens: maxTokens,
     messages: toOpenAIMessages(system, messages),
@@ -557,6 +557,23 @@ async function openaiStream({ p, model, system, messages, tools, onEvent, signal
     ...samplingParams('openai', sampling),
     ...openaiReasoningBody(reasoning, p),
   };
+  // Schema-constrained decoding. llama.cpp compiles the JSON Schema to a GBNF grammar and
+  // masks every token that would break it, so malformed JSON stops being possible rather
+  // than being something we parse defensively afterwards. Verified enforced on this box:
+  // a schema with an enum produced that exact enum value, which no model would volunteer.
+  //
+  // Two things it does NOT do, both learned the hard way:
+  //  - It is not injected into the prompt, so the fields still have to be described there.
+  //  - It does not stop a thinking model from thinking first. Gemma 4 emits 180-250
+  //    reasoning tokens whatever you set (enable_thinking, reasoning_effort and
+  //    thinking.type were all measured as no-ops), and those count against max_tokens.
+  //    Callers must budget for reasoning + JSON, and check stopReason for 'length'.
+  if (schema) {
+    body.response_format = {
+      type: 'json_schema',
+      json_schema: { name: schema.name || 'result', strict: true, schema: schema.schema || schema },
+    };
+  }
   if (tools?.length) body.tools = tools.map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }));
 
   const r = await fetch(`${p.baseUrl.replace(/\/$/, '')}/chat/completions`, {
@@ -607,8 +624,10 @@ async function openaiStream({ p, model, system, messages, tools, onEvent, signal
 
 // --- Ollama native ---
 
-async function ollamaStream({ p, model, system, messages, tools, onEvent, signal, sampling, reasoning }) {
+async function ollamaStream({ p, model, system, messages, tools, onEvent, signal, sampling, reasoning, schema }) {
   const body = { model, stream: true, messages: toOllamaMessages(system, messages) };
+  // Ollama's equivalent of response_format: pass the schema object straight to `format`.
+  if (schema) body.format = schema.schema || schema;
   const opts = samplingParams('ollama', sampling);
   if (Object.keys(opts).length) body.options = opts;
   // Ollama's thinking toggle for reasoning models (newer server versions). 'auto' leaves it unset.

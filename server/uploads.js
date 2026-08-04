@@ -22,7 +22,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { DATA, loadConfig } from './config.js';
 import { id as genId, now } from './util.js';
 
@@ -31,6 +31,7 @@ const MAX_BYTES = 25 * 1024 * 1024;          // 25MB per file (raw body limit is
 const ID_RE = /^[A-Za-z0-9_-]{6,64}$/;
 const MAX_ATTACHMENTS = 12;
 const MAX_EDGE = 2048;                       // long edge after transcode; models see no more
+const RESIZE_ABOVE_BYTES = 2 * 1024 * 1024;  // past this a JPEG is over MAX_EDGE in practice
 
 const bad = (msg, status = 400) => Object.assign(new Error(msg), { status });
 
@@ -196,6 +197,243 @@ function toJpeg(buf, { maxEdge = MAX_EDGE, ext = '.bin', timeoutMs = 30_000 } = 
   });
 }
 
+/**
+ * The EXIF Orientation tag of a JPEG, 1-8, or 0 when there is none.
+ *
+ * Worth 40 lines of byte-walking to avoid a subprocess, because it closes a defect that
+ * made the orientation feature actively harmful. Every camera phone stores a portrait photo
+ * as a LANDSCAPE raster plus Orientation=6. ffmpeg's `-i` banner — which imageSize() parses
+ * — reports the coded size and ignores the tag, so detectSideways() saw 4032x3024, called a
+ * correctly-taken portrait receipt "sideways", and rotated it. Meanwhile every ffmpeg
+ * ENCODE in this file autorotates by default, so the rotation was applied to an image that
+ * had just been straightened: the result was genuinely sideways, with the tag now gone so
+ * nothing could recover it. The model was then handed the receipt at 90° — precisely the
+ * failure the feature exists to prevent.
+ *
+ * Only JPEG carries this in practice (PNG has no orientation concept), so that is all this
+ * reads. A truncated or malformed header returns 0 and the caller changes nothing.
+ */
+export function exifOrientation(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 12) return 0;
+  if (buf[0] !== 0xff || buf[1] !== 0xd8) return 0;             // not a JPEG
+  let p = 2;
+  while (p + 4 <= buf.length) {
+    if (buf[p] !== 0xff) return 0;                              // desynchronised
+    const marker = buf[p + 1];
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { p += 2; continue; }
+    if (marker === 0xda || marker === 0xd9) return 0;           // image data — no EXIF
+    const len = buf.readUInt16BE(p + 2);
+    if (len < 2 || p + 2 + len > buf.length) return 0;
+    if (marker === 0xe1 && buf.toString('latin1', p + 4, p + 10) === 'Exif\0\0') {
+      const tiff = p + 10;
+      if (tiff + 8 > buf.length) return 0;
+      const le = buf.toString('latin1', tiff, tiff + 2) === 'II';
+      const u16 = (o) => (le ? buf.readUInt16LE(o) : buf.readUInt16BE(o));
+      const u32 = (o) => (le ? buf.readUInt32LE(o) : buf.readUInt32BE(o));
+      if (u16(tiff + 2) !== 0x2a) return 0;                     // not a TIFF header
+      const ifd = tiff + u32(tiff + 4);
+      if (ifd + 2 > buf.length) return 0;
+      const n = u16(ifd);
+      for (let i = 0; i < n; i++) {
+        const e = ifd + 2 + i * 12;
+        if (e + 12 > buf.length) return 0;
+        if (u16(e) === 0x0112) {                                // Orientation
+          const v = u16(e + 8);
+          return v >= 1 && v <= 8 ? v : 0;
+        }
+      }
+      return 0;
+    }
+    p += 2 + len;
+  }
+  return 0;
+}
+
+/** Pixel size of a stored image, via ffmpeg. Returns null when it cannot be read. */
+export function imageSize(buf) {
+  const bin = ffmpegBin();
+  if (!bin) return null;
+  let dir;
+  try { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aios-dim-')); } catch { return null; }
+  const src = path.join(dir, 'in.bin');
+  try {
+    fs.writeFileSync(src, buf);
+    const r = spawnSync(bin, ['-hide_banner', '-i', src], { encoding: 'utf8', timeout: 15_000 });
+    const m = /,\s(\d{2,6})x(\d{2,6})[\s,]/.exec(r.stderr || '');
+    return m ? { width: Number(m[1]), height: Number(m[2]) } : null;
+  } catch { return null; }
+  finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { } }
+}
+
+/** A downscaled greyscale raster, for cheap image analysis without a CV dependency. */
+export function greyRaster(buf, n = 256) {
+  const bin = ffmpegBin();
+  if (!bin) return null;
+  let dir;
+  try { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aios-grey-')); } catch { return null; }
+  const src = path.join(dir, 'in.bin');
+  try {
+    fs.writeFileSync(src, buf);
+    const r = spawnSync(bin, ['-hide_banner', '-loglevel', 'error', '-i', src,
+      '-vf', `scale=${n}:${n}:force_original_aspect_ratio=disable,format=gray`,
+      '-f', 'rawvideo', '-'], { maxBuffer: 1 << 26, timeout: 20_000 });
+    return r.status === 0 && r.stdout?.length === n * n ? { n, data: r.stdout } : null;
+  } catch { return null; }
+  finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { } }
+}
+
+/**
+ * Trim a photo down to the bright document sitting in it. Returns JPEG bytes, or null
+ * when there is nothing worth cropping.
+ *
+ * This is a resolution problem, not a tidiness one. A receipt photographed on a table
+ * fills only 37-46% of the frame on every real example here, and the model downsamples
+ * whatever it is given to a fixed size — so more than half the pixel budget goes to
+ * woodgrain. Measured: an uncropped receipt transcribed to **86 characters** (the model
+ * found only the big text on the card slip and missed every product); cropped, the same
+ * photo gave **698 characters** and a perfect reading.
+ *
+ * Deliberately conservative. A row or column counts as document only if a quarter of it
+ * is bright, so one specular highlight cannot stretch the box, and the crop is skipped
+ * entirely unless it saves real area and leaves a plausible shape.
+ */
+export function cropToContent(buf, { pad = 0.03, maxArea = 0.8 } = {}) {
+  const n = 192;
+  const g = greyRaster(buf, n);
+  if (!g) return null;
+  const px = g.data;
+
+  // Threshold midway between the darkest and brightest deciles — robust to both a dim
+  // photo and a blown-out one, where a fixed cutoff is robust to neither.
+  const hist = new Array(256).fill(0);
+  for (const v of px) hist[v]++;
+  let acc = 0, lo = 0, hi = 255;
+  const tenth = px.length * 0.1;
+  for (let i = 0; i < 256; i++) { acc += hist[i]; if (acc >= tenth) { lo = i; break; } }
+  acc = 0;
+  for (let i = 255; i >= 0; i--) { acc += hist[i]; if (acc >= tenth) { hi = i; break; } }
+  const th = (lo + hi) / 2;
+  if (hi - lo < 30) return null;                       // flat image: nothing to separate
+
+  let x0 = n, y0 = n, x1 = -1, y1 = -1, rows = 0;
+  for (let y = 0; y < n; y++) {
+    let c = 0;
+    for (let x = 0; x < n; x++) if (px[y * n + x] > th) c++;
+    if (c > n * 0.25) { if (y < y0) y0 = y; if (y > y1) y1 = y; rows++; }
+  }
+  for (let x = 0; x < n; x++) {
+    let c = 0;
+    for (let y = 0; y < n; y++) if (px[y * n + x] > th) c++;
+    if (c > n * 0.25) { if (x < x0) x0 = x; if (x > x1) x1 = x; }
+  }
+  if (rows < n * 0.1 || x1 <= x0 || y1 <= y0) return null;
+
+  const fx0 = Math.max(0, x0 / n - pad), fy0 = Math.max(0, y0 / n - pad);
+  const fx1 = Math.min(1, (x1 + 1) / n + pad), fy1 = Math.min(1, (y1 + 1) / n + pad);
+  const w = fx1 - fx0, h = fy1 - fy0;
+  if (w * h > maxArea) return null;                    // already fills the frame
+  if (w < 0.12 || h < 0.12) return null;               // implausibly small — trust it less
+
+  const bin = ffmpegBin();
+  if (!bin) return null;
+  let dir;
+  try { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aios-crop-')); } catch { return null; }
+  const src = path.join(dir, 'in.bin'), dst = path.join(dir, 'out.jpg');
+  try {
+    fs.writeFileSync(src, buf);
+    const r = spawnSync(bin, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-i', src,
+      '-vf', `crop=iw*${w.toFixed(4)}:ih*${h.toFixed(4)}:iw*${fx0.toFixed(4)}:ih*${fy0.toFixed(4)}`,
+      '-q:v', '2', dst], { timeout: 60_000 });
+    if (r.status !== 0 || !fs.existsSync(dst)) return null;
+    return { buffer: fs.readFileSync(dst), area: Math.round(w * h * 100) };
+  } catch { return null; }
+  finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { } }
+}
+
+/**
+ * Cut a long strip into overlapping horizontal bands. Returns JPEG buffers, or null when
+ * the image is not long enough for this to be worth doing.
+ *
+ * Same problem cropToContent() solves, one step further along. A vision model resizes its
+ * input to a fixed budget before it reads anything, so detail survives in proportion to
+ * how square the picture is. A cropped till receipt is typically 3-6× taller than it is
+ * wide, and squeezing that into a square budget throws away most of the vertical
+ * resolution — which is precisely the resolution the *small* text is written in. Product
+ * names are small text. Totals are not, which is why a bad scan so often gets the total
+ * right and the names wrong: the failure is not that the model cannot read, it is that by
+ * the time it looks, half the strokes are gone.
+ *
+ * Bands are aimed at roughly 1.4:1, the shape that survives that resize best, and they
+ * OVERLAP: a cut through the middle of a line would otherwise lose it from both halves,
+ * and a lost line is invisible where a repeated one is caught by the arithmetic. The
+ * overlap is what the stitcher upstream aligns on, so it has to be several lines deep,
+ * not a few pixels.
+ */
+export function sliceTall(buf, { max = 3, overlap = 0.14, minHeight = 1200, minAspect = 2 } = {}) {
+  const bin = ffmpegBin();
+  if (!bin || max < 2) return null;
+  const size = imageSize(buf);
+  if (!size || !size.width || !size.height) return null;
+  const aspect = size.height / size.width;
+  if (aspect < minAspect || size.height < minHeight) return null;   // already a readable shape
+
+  const n = Math.min(Math.trunc(max), Math.max(2, Math.round(aspect / 1.4)));
+  const bandH = size.height / (1 + (n - 1) * (1 - overlap));
+  const step = bandH * (1 - overlap);
+
+  let dir;
+  try { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aios-slice-')); } catch { return null; }
+  const src = path.join(dir, 'in.bin');
+  try {
+    fs.writeFileSync(src, buf);
+    const bands = [];
+    for (let i = 0; i < n; i++) {
+      const y = Math.min(Math.round(i * step), size.height - Math.round(bandH));
+      const dst = path.join(dir, `b${i}.jpg`);
+      const r = spawnSync(bin, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-i', src,
+        '-vf', `crop=${size.width}:${Math.round(bandH)}:0:${Math.max(0, y)}`,
+        '-q:v', '2', dst], { timeout: 60_000 });
+      if (r.status !== 0 || !fs.existsSync(dst)) return null;       // all or nothing: a
+      bands.push(fs.readFileSync(dst));                             // partial strip is worse
+    }                                                               // than the whole photo
+    return { bands, n, overlap, width: size.width, height: size.height, bandHeight: Math.round(bandH) };
+  } catch { return null; }
+  finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { } }
+}
+
+/**
+ * Rotate a stored image in place, clockwise, and update its metadata.
+ *
+ * In place on purpose: the photo shown in the review editor has to be the same one the
+ * model was given, or "check the reading against the paper" stops meaning anything.
+ */
+export function rotateStored(id, degrees) {
+  const deg = ((Math.round(Number(degrees) / 90) * 90) % 360 + 360) % 360;
+  const meta = getMeta(id);
+  if (!meta) throw bad('upload not found', 404);
+  if (!deg) return meta;
+  const bin = ffmpegBin();
+  if (!bin) throw bad('rotating needs ffmpeg — install it, or set uploads.ffmpeg');
+
+  // transpose=1 is 90° clockwise, transpose=2 is 90° counter-clockwise.
+  const vf = deg === 90 ? 'transpose=1' : deg === 180 ? 'transpose=1,transpose=1' : 'transpose=2';
+  let dir;
+  try { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aios-rot-')); } catch { throw bad('could not rotate'); }
+  const src = path.join(dir, 'in.bin');
+  const dst = path.join(dir, 'out.jpg');
+  try {
+    fs.copyFileSync(dataFile(id), src);
+    const r = spawnSync(bin, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+      '-i', src, '-vf', vf, '-q:v', '3', dst], { timeout: 60_000 });
+    if (r.status !== 0 || !fs.existsSync(dst)) throw bad('ffmpeg could not rotate that image');
+    const out = fs.readFileSync(dst);
+    fs.writeFileSync(dataFile(id), out);
+    const next = { ...meta, mime: 'image/jpeg', size: out.length, rotatedBy: ((meta.rotatedBy || 0) + deg) % 360 };
+    fs.writeFileSync(metaFile(id), JSON.stringify(next));
+    return next;
+  } finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { } }
+}
+
 const dataFile = (id) => path.join(DIR, id + '.bin');
 const metaFile = (id) => path.join(DIR, id + '.json');
 
@@ -215,7 +453,37 @@ async function store({ name, mime, buffer }) {
   meta.kind = classify(meta.mime, cleanName);
 
   let bytes = buffer;
-  if (meta.kind === 'image' && !isProviderSafeImage(meta.mime)) {
+  // A provider-safe JPEG that carries a rotation tag is straightened here and nowhere else.
+  //
+  // Nothing downstream agrees about EXIF: imageSize() reads the coded size and ignores the
+  // tag, while every ffmpeg encode (toJpeg, cropToContent, rotateStored) silently
+  // autorotates first. That disagreement is what let detectSideways() rotate an already-
+  // upright photo — see exifOrientation(). Re-encoding once at the door makes the stored
+  // raster match what every reader will see, and costs one ffmpeg pass on the small
+  // fraction of uploads that actually carry a non-trivial tag.
+  const safe = meta.kind === 'image' && isProviderSafeImage(meta.mime);
+  const needsUpright = safe && exifOrientation(buffer) > 1;
+  // MAX_EDGE was only ever applied on the transcode path, so a provider-safe image was
+  // stored and shipped at native size — a 25MB phone JPEG becomes ~33MB of base64 in the
+  // request body, for pixels the model downsamples away anyway. Size is used as the trigger
+  // rather than probing every upload: an ffmpeg spawn per attachment to measure something
+  // this cheap to over-approximate is the wrong trade, and anything past a couple of MB is
+  // over 2048px in practice. GIF is excluded — `-frames:v 1` would silently drop animation.
+  const needsShrink = safe && buffer.length > RESIZE_ABOVE_BYTES && meta.mime !== 'image/gif';
+  if (needsUpright || needsShrink) {
+    const upright = await toJpeg(buffer, { ext: path.extname(cleanName) || '.jpg' });
+    if (upright) {
+      meta.mime = 'image/jpeg';
+      meta.size = upright.length;
+      if (needsUpright) meta.uprighted = true;
+      if (needsShrink) { meta.originalSize = buffer.length; meta.resized = true; }
+      bytes = upright;
+    } else if (needsUpright) {
+      // No ffmpeg: leave the bytes alone and say so, so detectSideways can decline to
+      // guess rather than guessing from dimensions it cannot trust.
+      meta.exifRotated = true;
+    }
+  } else if (meta.kind === 'image' && !isProviderSafeImage(meta.mime)) {
     const jpeg = await toJpeg(buffer, { ext: path.extname(cleanName) || '.heic' });
     if (jpeg) {
       meta.convertedFrom = meta.mime;
@@ -243,6 +511,24 @@ export async function saveUpload({ name, mime, data } = {}) {
   if (typeof data !== 'string' || !data) throw bad('no file data');
   const b64 = data.includes(',') ? data.slice(data.indexOf(',') + 1) : data;   // tolerate data: URLs
   return store({ name, mime, buffer: Buffer.from(b64, 'base64') });
+}
+
+/** Store bytes we produced ourselves (a crop, a rotation) — already a safe JPEG, so it
+ *  skips the sniff/transcode path and stays synchronous for callers inside a pipeline. */
+export function saveUploadSync({ name = 'image.jpg', mime = 'image/jpeg', buffer } = {}) {
+  if (!Buffer.isBuffer(buffer) || !buffer.length) throw bad('no file data');
+  fs.mkdirSync(DIR, { recursive: true });
+  const meta = { id: genId(12), name, mime, size: buffer.length, kind: 'image', createdAt: now(), derived: true };
+  fs.writeFileSync(dataFile(meta.id), buffer);
+  fs.writeFileSync(metaFile(meta.id), JSON.stringify(meta));
+  return meta;
+}
+
+/** Remove a stored upload. Used for the transient images the OCR pipeline derives. */
+export function deleteUpload(id) {
+  if (!ID_RE.test(String(id || ''))) return false;
+  try { fs.rmSync(dataFile(id), { force: true }); fs.rmSync(metaFile(id), { force: true }); return true; }
+  catch { return false; }
 }
 
 /** Store raw bytes — the binary upload route, which skips base64 entirely. */

@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import { loadConfig } from './config.js';
 import { probeProviders } from './llm.js';
 import { searxngStatus } from './tools.js';
+import * as mcp from './mcp.js';
 
 const extra = []; // future services register here
 
@@ -50,11 +51,22 @@ export async function probeServices() {
       detail: !vpath ? 'not connected' : vaultOk ? 'connected' : 'path missing' }];
   })();
 
+  // One chip per configured MCP server. Read from the cache, so a hung third-party
+  // process shows as down instead of stalling the dashboard.
+  const mcpChips = (async () => mcp.status().map(s => ({
+    id: 'mcp_' + s.id, name: s.name, group: 'MCP', settingsTab: 'tools',
+    status: !s.enabled ? 'off' : s.status === 'up' ? 'up' : s.status === 'starting' ? 'warn' : s.status === 'idle' ? 'off' : 'down',
+    detail: !s.enabled ? 'turned off'
+      : s.status === 'up' ? `${s.tools.length} tool${s.tools.length === 1 ? '' : 's'}`
+        : s.status === 'starting' ? 'connecting…'
+          : s.status === 'idle' ? 'not connected' : (s.error || 'down').slice(0, 80),
+  })))();
+
   const extras = extra.map(s => (async () => {
     try { const r = await s.probe(cfg); return [{ id: s.id, name: s.name, group: s.group || 'Service', settingsTab: s.settingsTab, status: r.status || 'unknown', detail: r.detail || '' }]; }
     catch (e) { return [{ id: s.id, name: s.name, group: s.group || 'Service', settingsTab: s.settingsTab, status: 'down', detail: e.message }]; }
   })());
 
-  const groups = await Promise.all([searxng, providers, vault, ...extras]);
+  const groups = await Promise.all([searxng, providers, vault, mcpChips, ...extras]);
   return groups.flat();
 }

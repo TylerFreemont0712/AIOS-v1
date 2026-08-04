@@ -339,7 +339,11 @@ export async function fetchRecent({ host, port, user, password, mailbox = 'INBOX
   }
 }
 
-const requireMail = () => {
+/** Exported: mail_recent takes its settings as arguments and so never passed through
+ *  here, which meant an unconfigured mailbox answered it with a raw
+ *  `connect ECONNREFUSED 127.0.0.1:993` — a network error the model cannot act on —
+ *  while its two sibling tools said plainly that mail was not set up. */
+export const requireMail = () => {
   const mc = loadConfig().mail || {};
   if (!mc.host || !mc.user || !mc.password) throw Object.assign(new Error('Mail is not configured — add IMAP details in Settings → Mail & Alerts.'), { status: 400 });
   return mc;

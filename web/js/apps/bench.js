@@ -6,6 +6,7 @@
 
 import { el, icon, toast, menu, timeAgo, modal, confirmBox } from '../ui.js';
 import { get, post, del, sub } from '../api.js';
+import { openApp } from '../wm.js';
 
 const pctCls = (v) => v >= 0.8 ? 'good' : v >= 0.5 ? 'mid' : 'bad';
 const fmt = (v) => v === undefined || v === null ? '—' : Math.round(v * 100) + '%';
@@ -31,6 +32,9 @@ export default {
     ui.clear = el('button', { class: 'btn sm ghost danger', title: 'Delete ALL recorded results — fresh start (e.g. after the suite changes)', onclick: clearAll }, icon('trash'), 'Clear');
 
     ui.head = el('div', { class: 'pane-head' },
+      // Bench has no dock icon — it is reached from the Models header — so it owes the
+      // user the way back rather than leaving them on a screen with no exit.
+      el('button', { class: 'btn sm ghost', title: 'Back to Models', onclick: () => openApp('models') }, icon('cpu'), 'Models'),
       el('span', { class: 'ttl row', style: { gap: '7px' } }, icon('graph'), 'LLM Bench'),
       ui.pickBtn, ui.skillBtn, ui.reasonBtn, ui.run, ui.stop, ui.sweep, ui.radar,
       el('span', { class: 'grow' }),

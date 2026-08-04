@@ -200,18 +200,28 @@ export function rankedBars(items, { width = 340, rowH = 26, format = fmtNum, onP
  * Intensity is bucketed rather than continuous so a single huge day (rent) does
  * not flatten every other day to invisible.
  */
-export function calendarHeat(days, { month, max = 0, weekStart = 'monday', format = fmtNum, onPick } = {}) {
+/**
+ * A month heat grid. Reads `value` when the caller supplies one, else `spent`.
+ *
+ * `signed` switches it from "how much" to "which way": positive days shade toward the
+ * good colour, negative toward the bad, with intensity from the absolute size. That is
+ * the difference between a spend calendar and a NET calendar — on freelance income the
+ * useful question each day is whether you came out ahead, not how much left.
+ */
+export function calendarHeat(days, { month, max = 0, weekStart = 'monday', format = fmtNum, onPick, signed = false } = {}) {
   const [y, m] = String(month || '').split('-').map(Number);
   if (!y || !m) return el('p', { class: 'empty sm' }, 'pick a month to see the calendar');
   const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
   const byDate = new Map((days || []).map(d => [d.date, d]));
-  const peak = max || Math.max(0, ...(days || []).map(d => d.spent));
+  const valOf = (d) => (d && d.value !== undefined ? d.value : d?.spent) || 0;
+  const peak = max || Math.max(0, ...(days || []).map(d => Math.abs(valOf(d))));
 
   // Bucket on a log-ish scale: quartiles of the peak, so ordinary days separate.
   const level = (v) => {
-    if (!v) return 0;
+    const a = Math.abs(v);
+    if (!a) return 0;
     if (!peak) return 1;
-    const r = v / peak;
+    const r = a / peak;
     return r > 0.5 ? 4 : r > 0.2 ? 3 : r > 0.05 ? 2 : 1;
   };
 
@@ -226,20 +236,31 @@ export function calendarHeat(days, { month, max = 0, weekStart = 'monday', forma
   for (let d = 1; d <= lastDay; d++) {
     const iso = `${month}-${String(d).padStart(2, '0')}`;
     const rec = byDate.get(iso);
-    const lv = level(rec?.spent || 0);
+    const v = valOf(rec);
+    const lv = level(v);
+    const dir = signed && v ? (v > 0 ? ' is-pos' : ' is-neg') : '';
     cells.push(el('span', {
-      class: `cal-cell l${lv}` + (onPick && rec ? ' is-clickable' : ''),
-      title: rec ? `${iso} — ${format(rec.spent)} across ${rec.count} entr${rec.count === 1 ? 'y' : 'ies'}` : `${iso} — nothing`,
+      class: `cal-cell l${lv}${dir}` + (onPick && rec ? ' is-clickable' : ''),
+      title: rec
+        ? `${iso} — ${signed ? (v >= 0 ? '+' : '−') : ''}${format(Math.abs(v))} across ${rec.count} entr${rec.count === 1 ? 'y' : 'ies'}`
+        : `${iso} — nothing`,
       onclick: onPick && rec ? () => onPick(rec) : null,
     }, el('span', { class: 'cal-day' }, String(d))));
   }
   return el('div', { class: 'cal-wrap' },
     el('div', { class: 'cal-dow' }, labels.map(l => el('span', {}, l))),
     el('div', { class: 'cal-grid' }, cells),
-    el('div', { class: 'cal-key' },
-      el('span', { class: 'muted' }, 'less'),
-      [0, 1, 2, 3, 4].map(l => el('span', { class: `cal-cell is-key l${l}` })),
-      el('span', { class: 'muted' }, 'more')));
+    signed
+      ? el('div', { class: 'cal-key' },
+        el('span', { class: 'muted' }, 'down'),
+        [4, 3, 2, 1].map(l => el('span', { class: `cal-cell is-key is-neg l${l}` })),
+        el('span', { class: 'cal-cell is-key l0' }),
+        [1, 2, 3, 4].map(l => el('span', { class: `cal-cell is-key is-pos l${l}` })),
+        el('span', { class: 'muted' }, 'up'))
+      : el('div', { class: 'cal-key' },
+        el('span', { class: 'muted' }, 'less'),
+        [0, 1, 2, 3, 4].map(l => el('span', { class: `cal-cell is-key l${l}` })),
+        el('span', { class: 'muted' }, 'more')));
 }
 
 /** Tiny inline bars — one per value, sized against the largest. For month cards. */
@@ -313,7 +334,9 @@ export function pricePoints(points, { width = 620, height = 200, merchants = [],
 }
 
 /** A meter with an optional second "stretch" marker — budgets and goals. */
-export function meter(value, target, { stretch = 0, format = fmtNum, danger = false } = {}) {
+/** `bare` drops the value/target caption — for callers that already show the numbers
+ *  above the bar, where repeating them is noise rather than information. */
+export function meter(value, target, { stretch = 0, format = fmtNum, danger = false, bare = false } = {}) {
   const pct = target > 0 ? Math.min(100, (value / target) * 100) : 0;
   const over = target > 0 && value > target;
   return el('div', { class: 'fin-meter' + (over || danger ? ' is-over' : '') },
@@ -322,7 +345,7 @@ export function meter(value, target, { stretch = 0, format = fmtNum, danger = fa
       stretch > 0 && target > 0 && stretch !== target
         ? el('span', { class: 'fin-meter-mark', style: { left: Math.min(100, target / stretch * 100) + '%' } })
         : null),
-    el('div', { class: 'fin-meter-caption' },
+    bare ? null : el('div', { class: 'fin-meter-caption' },
       el('span', {}, format(value)),
       el('span', { class: 'fin-meter-target' }, ' / ' + format(target)),
     ));

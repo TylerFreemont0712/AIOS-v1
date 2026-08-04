@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DATA, loadConfig, contextBudget, DEFAULT_CHAT_SYSTEM } from './config.js';
 import { streamChat } from './llm.js';
-import { chatToolSchemas, runTool, isWriteTool, isChatSafeWrite } from './tools.js';
+import { chatTools, chatCoreNames, leanLoadout, activateGroups, META_LOAD, runTool, isWriteTool, isChatSafeWrite } from './tools.js';
 import { profileInjection, recordTurn } from './profile.js';
 import { id as genId, now, readJSON, writeJSON, clampMiddle, jsonDirIndex } from './util.js';
 
@@ -39,6 +39,8 @@ export function createChat({ modelRef, system, tools, folder } = {}) {
     tools: tools !== undefined ? !!tools : cfg.defaults.chatTools !== false,
     folder: typeof folder === 'string' ? folder : '',
     createdAt: now(), updatedAt: now(), messages: [], usage: { input: 0, output: 0 },
+    // tool groups the model activated with load_tools; they stay active for this chat
+    toolGroups: [],
   };
   writeJSON(file(c.id), c);
   return c;
@@ -153,21 +155,55 @@ export async function sendMessage(cid, text, { modelRef, attachments } = {}) {
 
   // Read-only tool belt (unless disabled for this chat). The nudge is what actually
   // gets small models to use it instead of declining.
+  //
+  // Lean, like the agent: full schemas only for the handful chat uses on every topic,
+  // and a one-line-per-group directory for the rest, which the model activates with
+  // load_tools. Sending all of them cost ~4.2k tokens of a 32k local window on EVERY
+  // round — a quarter of the budget spent before the conversation started, mostly on
+  // finance and mail schemas that a given chat never touches.
   const useTools = c.tools !== false;
-  const toolDefs = useTools ? chatToolSchemas() : [];
-  if (toolDefs.length) {
-    system += '\n\n' + toolNudge(toolDefs);
-    // Reluctant models answer time-sensitive questions from stale memory — push harder.
-    if (toolDefs.some(t => t.name === 'web_search') && looksTimeSensitive(text)) {
-      system += '\n\n[This message looks time-sensitive. Call web_search BEFORE answering it — do not rely on memory.]';
+  const pool = useTools ? chatTools() : [];
+  const baseSystem = system;
+
+  /** The belt as it stands, given what this chat has activated so far. */
+  const buildLoadout = () => {
+    if (!pool.length) return { defs: [], names: new Set(), directory: '' };
+    const { tools, directory, dormantGroups } = leanLoadout({
+      pool, coreNames: chatCoreNames(), activeGroups: c.toolGroups || [],
+    });
+    const defs = dormantGroups.length ? [...tools, META_LOAD] : tools;
+    return { defs, names: new Set(defs.map(t => t.name)), directory };
+  };
+  /** System prompt for the current loadout. Recomposed after load_tools so the newly
+   *  activated tools are described and the directory stops offering them again. */
+  const composeSystem = (lo) => {
+    if (!lo.defs.length) return baseSystem;
+    let s = baseSystem + '\n\n' + toolNudge(lo.defs);
+    if (lo.directory) {
+      s += '\n\nMore tools exist but are not loaded yet. When the question needs one, call '
+        + 'load_tools {"groups":["<name>"]} first — its tools become callable on your next turn. Directory:\n'
+        + lo.directory;
     }
-  }
-  const toolNames = new Set(toolDefs.map(t => t.name));
+    // Reluctant models answer time-sensitive questions from stale memory — push harder.
+    if (lo.names.has('web_search') && looksTimeSensitive(text)) {
+      s += '\n\n[This message looks time-sensitive. Call web_search BEFORE answering it — do not rely on memory.]';
+    }
+    return s;
+  };
+
+  let loadout = buildLoadout();
+  system = composeSystem(loadout);
 
   try {
     // fit system + history inside the model's context window, reserving room for the reply
     const { maxTokens, inputChars } = contextBudget({ modelRef: c.modelRef, wantOutput: 8192 });
-    const budget = Math.max(2000, inputChars - system.length - JSON.stringify(toolDefs).length);
+    // Reserve against the LARGEST the belt could become, not the one we start with: the
+    // history is chosen once, but load_tools can grow the schemas underneath it mid-turn,
+    // and a budget spent on the lean loadout would then overflow the window.
+    const maxDefs = pool.length
+      ? leanLoadout({ pool, coreNames: chatCoreNames(), activeGroups: [...new Set(pool.map(t => t.group))] }).tools
+      : [];
+    const budget = Math.max(2000, inputChars - system.length - JSON.stringify(maxDefs).length);
     const msgs = [];
     let sz = 0;
     for (let i = c.messages.length - 1; i >= 0; i--) {
@@ -186,7 +222,7 @@ export async function sendMessage(cid, text, { modelRef, attachments } = {}) {
     for (let round = 0; ; round++) {
       const lastRound = round >= MAX_TOOL_ROUNDS;
       res = await streamChat({
-        modelRef: c.modelRef, system, messages: msgs, tools: lastRound ? [] : toolDefs,
+        modelRef: c.modelRef, system, messages: msgs, tools: lastRound ? [] : loadout.defs,
         signal: ctl.signal, maxTokens,
         onEvent: (ev) => {
           if (ev.type === 'text') emit(cid, { type: 'delta', delta: ev.delta });
@@ -201,7 +237,31 @@ export async function sendMessage(cid, text, { modelRef, attachments } = {}) {
       const results = [];
       for (const call of res.toolCalls) {
         if (ctl.signal.aborted) { results.push({ id: call.id, name: call.name, content: 'Cancelled.', isError: true }); continue; }
-        if (!toolNames.has(call.name) || (isWriteTool(call.name) && !isChatSafeWrite(call.name))) {
+        // Activating a group is bookkeeping, not a tool run: it changes what the NEXT
+        // round is allowed to call, so the loadout and the prompt are rebuilt here.
+        if (call.name === 'load_tools') {
+          const msg = activateGroups(c, call.args?.groups, { pool });
+          loadout = buildLoadout();
+          system = composeSystem(loadout);
+          save(c);
+          emit(cid, { type: 'tool.start', callId: call.id, name: call.name, args: call.args });
+          emit(cid, { type: 'tool.end', callId: call.id, name: call.name, ok: true, content: msg });
+          results.push({ id: call.id, name: call.name, content: msg, isError: false });
+          continue;
+        }
+        // A tool the model remembers from the directory but has not loaded: say so
+        // rather than refusing outright, or it gives up instead of loading the group.
+        if (!loadout.names.has(call.name)) {
+          const known = pool.find(t => t.name === call.name);
+          results.push({
+            id: call.id, name: call.name, isError: true,
+            content: known
+              ? `"${call.name}" is not loaded yet. Call load_tools {"groups":["${known.group}"]} first, then call it.`
+              : `Tool "${call.name}" is not available in chat (read-only + note/planner tools only — use the Agent for anything that edits files).`,
+          });
+          continue;
+        }
+        if (isWriteTool(call.name) && !isChatSafeWrite(call.name)) {
           results.push({ id: call.id, name: call.name, content: `Tool "${call.name}" is not available in chat (read-only + note/planner tools only — use the Agent for anything that edits files).`, isError: true });
           continue;
         }

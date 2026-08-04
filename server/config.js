@@ -106,7 +106,22 @@ const defaults = () => ({
   // Money. ocrModel MUST be vision-capable (a model whose preset names an mmproj that
   // exists) — receipts.js refuses to OCR with a text-only model rather than silently
   // returning nothing. Empty = pick the best vision model on this machine at scan time.
-  finance: { baseCurrency: 'JPY', ocrModel: '', itemModel: '', recapModel: '', weekStart: 'monday' },
+  // ocrTextModel only matters when ocrModel is a dedicated OCR transcriber (a preset
+  // tagged `ocr`): those read a page superbly but do not answer questions about it, so
+  // they transcribe and this model turns the transcription into the receipt. Empty =
+  // fall back to defaults.chatModel.
+  // ocrMinConfidence: a scan scoring below this out of 100 is read again (see
+  // receipts.scoreConfidence — arithmetic, missing fields, garbled text, recognised
+  // products). ocrMaxAttempts caps that at 1-3 passes; each costs ~15 s of GPU, and past
+  // the third the model does not surprise you.
+  // ocrTiles: a receipt more than twice as tall as it is wide is read in this many
+  // overlapping bands and stitched back together, so the small print (product names) is
+  // read at its own resolution instead of being downscaled away with the rest of the
+  // strip. 0 or 1 reads every photo whole; 4 is the cap. Costs one model pass per band.
+  finance: {
+    baseCurrency: 'JPY', ocrModel: '', ocrTextModel: '', itemModel: '', recapModel: '',
+    weekStart: 'monday', ocrMinConfidence: 75, ocrMaxAttempts: 3, ocrTiles: 3,
+  },
   // autoApprove: agent writes scoped to the wiki/daily note skip the approval gate.
   // autoExport: finished deep-research reports are saved into the wiki automatically.
   vault: { path: '', wikiFolder: 'AI Wiki', dailyFolder: 'Daily', autoApprove: true, autoExport: true },
@@ -126,6 +141,12 @@ const defaults = () => ({
     // units: metric | imperial (distances in directions/find_places).
     maps: { nominatimUrl: 'https://nominatim.openstreetmap.org', osrmUrl: 'https://router.project-osrm.org', googleKey: '', units: 'metric' },
   },
+  // MCP servers — external processes (or URLs) that publish tools over the Model Context
+  // Protocol. Each entry: { id, name, transport: 'stdio'|'http', command, args[], env{},
+  // cwd, url, headers{}, timeoutMs, enabled }. Their tools join the agent's belt in a
+  // group of their own (`mcp:<id>`), so the lean loadout keeps them out of the default
+  // schema budget until the model asks for them. See server/mcp.js.
+  mcp: { servers: [] },
 });
 
 let cfg = null;
@@ -159,6 +180,14 @@ export function publicConfig() {
   if (c.github) c.github = { hasToken: !!c.github.token };
   if (c.notify) c.notify = { ...c.notify, discordWebhook: undefined, hasDiscordWebhook: !!c.notify.discordWebhook };
   if (c.tools?.maps) c.tools.maps = { ...c.tools.maps, googleKey: undefined, hasGoogleKey: !!c.tools.maps.googleKey };
+  // An MCP server's env is where its API keys live. The client gets the NAMES so it can
+  // show and re-submit the row, never the values.
+  if (c.mcp?.servers) {
+    c.mcp.servers = c.mcp.servers.map(s => ({
+      ...s, env: undefined, envKeys: Object.keys(s.env || {}),
+      headers: undefined, headerKeys: Object.keys(s.headers || {}),
+    }));
+  }
   delete c.auth.token;
   return c;
 }

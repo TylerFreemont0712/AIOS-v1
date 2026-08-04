@@ -149,6 +149,21 @@ html, body {
 }
 .m-x:active { color: var(--err); }
 
+/* Quick edit: tap a line to fix what the model misread, without leaving the phone. */
+.m-line-tap { text-decoration: underline; text-decoration-style: dotted;
+  text-underline-offset: 3px; text-decoration-color: var(--faint); }
+.m-line-edit { display: block; padding: 8px 0; }
+.m-line-printed { font-size: 10.5px; color: var(--faint); margin-bottom: 5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.m-line-row { display: flex; gap: 6px; margin-top: 6px; }
+.m-input {
+  flex: 1; min-width: 0; min-height: 40px; padding: 0 10px;
+  font-size: 16px;                       /* 16px or iOS zooms the page on focus */
+  font-family: inherit; color: var(--text);
+  background: var(--surface-3); border: 1px solid var(--border); border-radius: 9px;
+}
+.m-input.num { flex: 0 0 96px; text-align: right; font-variant-numeric: tabular-nums; }
+
 /* The arithmetic verdict. On a phone there is no room to explain, so it says the
    one thing that matters: how much does not add up, and what to do about it. */
 .m-check {
@@ -157,6 +172,27 @@ html, body {
   background: color-mix(in srgb, var(--warn) 10%, transparent);
   border: 1px solid color-mix(in srgb, var(--warn) 32%, transparent);
 }
+
+/* A copy of something already in the ledger. Red rather than amber: unlike the
+   arithmetic warning there is nothing to weigh up — this one cannot be added. */
+.m-check.is-dupe {
+  color: var(--err);
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+  border-color: color-mix(in srgb, var(--err) 34%, transparent);
+}
+
+/* How sure the reading is. Same colour ramp as the desktop meter, compressed to one
+   strip — the paper is still in your hand here, so it only has to say "look at this". */
+.m-conf { --conf: var(--ok); margin: 7px 0 2px; }
+.m-conf.is-good { --conf: var(--accent); }
+.m-conf.is-fair { --conf: var(--warn); }
+.m-conf.is-low  { --conf: var(--err); }
+.m-conf-row { display: flex; align-items: center; gap: 8px; }
+.m-conf-bar { flex: 1; height: 5px; border-radius: 3px; background: var(--surface-3); overflow: hidden; }
+.m-conf-bar > i { display: block; height: 100%; border-radius: 3px; background: var(--conf); }
+.m-conf-score { font-size: 12px; font-weight: 650; color: var(--conf); font-variant-numeric: tabular-nums; }
+.m-conf-label { font-size: 11.5px; font-weight: 600; color: var(--conf); }
+.m-conf-why { font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.35; }
 
 .m-actions { display: flex; gap: 7px; margin-top: 8px; }
 .m-btn {
@@ -174,6 +210,29 @@ html, body {
   border-radius: 9px; border: 1px solid transparent;
   background: transparent; color: var(--muted); font-family: inherit; cursor: pointer;
 }
+
+/* ---------- batch progress ----------
+   One line above the cards: how many photos, how far they got, and the retry for
+   whatever failed. Turns red-edged the moment anything in the batch has failed, so a
+   glance at the top of the list is enough to know something needs a second go. */
+.m-batch {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 7px;
+  padding: 6px 9px; border-radius: 9px;
+  border: 1px solid var(--border); background: var(--surface-2);
+  font-size: 11.5px; color: var(--muted);
+}
+.m-batch.is-failed { border-color: color-mix(in srgb, var(--err) 45%, var(--border)); }
+.m-batch-n { font-weight: 650; color: var(--text); flex: none; }
+.m-batch-parts { font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.m-btn-tiny {
+  flex: none; min-height: 28px; padding: 0 10px;
+  font-size: 12px; font-weight: 600; font-family: inherit;
+  border-radius: 8px; border: 1px solid transparent;
+  background: var(--accent); color: var(--accent-text);
+  cursor: pointer; -webkit-appearance: none;
+}
+.m-btn-tiny:active { transform: scale(.97); }
+.m-btn-tiny.is-ghost { background: transparent; border-color: var(--border); color: var(--muted); font-weight: 500; }
 
 /* ---------- category chips ---------- */
 

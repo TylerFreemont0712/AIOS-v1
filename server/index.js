@@ -21,6 +21,7 @@ import * as uploads from './uploads.js';
 import * as vault from './vault.js';
 import * as wiki from './wiki.js';
 import * as forge from './toolforge.js';
+import * as mcp from './mcp.js';
 import * as learn from './learn.js';
 import * as term from './terminal.js';
 import * as research from './research.js';
@@ -107,6 +108,29 @@ app.delete('/api/tools/custom/:name', h(req => { forge.deleteCustomTool(req.para
 app.post('/api/tools/test-search', h(async req => {
   const r = await runTool('web_search', { query: req.body?.query || 'searxng json api', max_results: 5 }, { root: DATA });
   return { ok: !r.isError, output: r.content };
+}));
+
+// ---------- MCP servers ----------
+//
+// Saving a server does NOT connect it — connecting spawns someone else's process, so it
+// is always an explicit act (the Connect button, or boot for enabled servers).
+
+app.get('/api/mcp', h(() => ({ servers: mcp.status(), presets: mcp.PRESETS })));
+app.post('/api/mcp/servers', h(req => mcp.saveServer(req.body || {})));
+app.delete('/api/mcp/servers/:id', h(req => { mcp.removeServer(req.params.id); }));
+app.post('/api/mcp/servers/:id/connect', h(async req => {
+  await mcp.connect(req.params.id, { force: true });
+  return mcp.status().find(s => s.id === req.params.id);
+}));
+app.post('/api/mcp/servers/:id/disconnect', h(req => {
+  mcp.stop(req.params.id);
+  return mcp.status().find(s => s.id === req.params.id);
+}));
+// Call one tool by hand — the only way to tell "the server connected" from "the server
+// actually works" without sending an agent at it.
+app.post('/api/mcp/servers/:id/call', h(async req => {
+  const out = await mcp.callTool(String(req.body?.tool || ''), req.body?.args || {});
+  return { output: out };
 }));
 
 // ---------- projects ----------
@@ -277,6 +301,14 @@ app.post('/api/notify/test', h(() => notify.sendDiscord('🔔 AIOS test notifica
 app.get('/api/finance/overview', h(req => finance.overview(req.query)));
 app.get('/api/finance/summary', h(req => finance.summary(req.query)));
 app.get('/api/finance/insights', h(req => finance.insights(req.query)));
+// ---------- income ----------
+// Freelance income needs its own surface: what came in today, from whom, for what work,
+// and whether the year so far is ahead. Everything reads the same ledger as expenses.
+app.get('/api/finance/income', h(req => finance.incomeOverview(req.query)));
+app.get('/api/finance/income/log', h(req => finance.incomeLog(req.query)));
+app.get('/api/finance/income/sources', h(req => finance.incomeBySource(req.query)));
+app.get('/api/finance/ytd', h(req => finance.yearToDate(req.query?.year)));
+
 app.get('/api/finance/settings', h(() => finance.currencies()));
 app.get('/api/finance/models', h(() => finance.modelOptions()));
 app.get('/api/finance/categories', h(() => {
@@ -359,10 +391,20 @@ app.post('/api/finance/receipts/:id/apply', h(req => receipts.apply(req.params.i
 // Take it back out of the ledger so it can be corrected and re-posted — the "I only
 // noticed the phantom line after logging it" path. Removes its rows AND their prices.
 app.post('/api/finance/receipts/:id/revert', h(req => receipts.revertReceipt(req.params.id)));
+// Read the same photo again — this model's output varies run to run, so a second attempt
+// is often simply better. An optional `model` tries a different reader just for this one.
+app.post('/api/finance/receipts/:id/rescan', h(req => receipts.rescan(req.params.id, { model: req.body?.model, rotate: req.body?.rotate })));
 app.delete('/api/finance/receipts/:id', h(req => { receipts.deleteReceipt(req.params.id); }));
+// Read a payout screen (Uber, a marketplace) into a prefill for the income form. Shares
+// the reader with receipt scanning and nothing else: it stores no scan, creates no
+// receipt, and cannot reach the ledger — the user confirms the numbers in the form.
+app.post('/api/finance/earnings/read', h(req => receipts.readEarnings(req.body || {})));
 // What the corrections have taught it — visible and revocable, not a black box.
 app.get('/api/finance/receipt-fixes', h(req => receipts.listFixes({ limit: Number(req.query?.limit) || 200 })));
 app.delete('/api/finance/receipt-fixes/:id', h(req => { receipts.forgetFix(req.params.id); }));
+// Whether the learning is working: corrections stored, vocabulary built, and how the last
+// ten scans scored against the ten before them.
+app.get('/api/finance/receipt-learning', h(() => receipts.learningStats()));
 
 // ---------- planner ----------
 app.get('/api/planner/events', h(req => planner.eventsInRange(req.query.from, req.query.to)));
@@ -607,12 +649,29 @@ async function route(client, m) {
     case 'sub': client.subs.add(m.topic); return;
     case 'unsub': client.subs.delete(m.topic); return;
 
-    case 'agent.user': agent.userMessage(m.sessionId, String(m.text || ''), uploads.resolveAttachments(m.attachments)); return;
+    // `await`, not fire-and-forget. Both of these can reject BEFORE their own try/catch
+    // begins — agent.js getSession and chat.js getChat throw 404 on a stale id, and the
+    // whole of chat.sendMessage's 77-line prologue sits outside its try. Un-awaited, that
+    // rejection had no handler at all: Node 26 defaults to --unhandled-rejections=throw, so
+    // one browser tab posting to a chat another tab had just deleted exited the process,
+    // skipping the SIGTERM cleanup and orphaning the detached llama-server. Awaiting hands
+    // it to the caller's try/catch, which already answers the client with {t:'error'}.
+    case 'agent.user': await agent.userMessage(m.sessionId, String(m.text || ''), uploads.resolveAttachments(m.attachments)); return;
     case 'agent.cancel': agent.cancel(m.sessionId); return;
     case 'agent.approve': agent.approve(m.sessionId, m.callId, m.decision === 'always' ? 'always' : m.decision === 'allow' ? 'allow' : 'deny'); return;
     case 'agent.plan': agent.resolvePlan(m.sessionId, m.decision === 'approve' ? 'approve' : 'reject', typeof m.text === 'string' ? m.text : undefined); return;
 
-    case 'chat.send': chat.sendMessage(m.chatId, String(m.text || ''), { modelRef: m.modelRef, attachments: uploads.resolveAttachments(m.attachments) }); return;
+    case 'chat.send':
+      try {
+        await chat.sendMessage(m.chatId, String(m.text || ''), { modelRef: m.modelRef, attachments: uploads.resolveAttachments(m.attachments) });
+      } catch (e) {
+        // `live.set(cid, ctl)` happens early in sendMessage's prologue, before its own try.
+        // A throw after that point would leave the chat permanently answering "Already
+        // generating." — moot while the rejection killed the process, live now that it does not.
+        try { chat.stop(m.chatId); } catch { /* nothing was in flight */ }
+        throw e;
+      }
+      return;
     case 'chat.stop': chat.stop(m.chatId); return;
 
     case 'research.cancel': research.cancel(m.id); return;
@@ -656,6 +715,16 @@ function lanUrls(withToken = false) {
 
 mail.startAutoScan();   // no-op until mail.enabled + scanIntervalMin are set
 
+// Connect enabled MCP servers in the background. Deliberately not awaited: these are
+// third-party processes and one of them being slow, broken, or absent must not hold up
+// the hub. Their tools appear on the agent's belt as each handshake completes.
+mcp.startEnabled();
+
+// Scans stored before the duplicate guard existed carry no fingerprint, which would leave
+// exactly the receipts already in the ledger unprotected. One-time, then a no-op.
+try { receipts.backfillFingerprints(); }
+catch (e) { console.error('[receipts] could not index existing scans:', e.message); }
+
 server.listen(cfg.server.port, cfg.server.host, () => {
   const urls = lanUrls(true);
   console.log(`
@@ -671,5 +740,15 @@ ${urls.slice(1).map(u => `  On your LAN  :  ${u}`).join('\n') || '  (no LAN inte
 `);
 });
 
-process.on('SIGINT', () => { console.log('\nshutting down…'); server.close(); process.exit(0); });
-process.on('SIGTERM', () => { server.close(); process.exit(0); });
+// MCP servers are our child processes; leaving them running would orphan them.
+// A personal hub holds state nothing else does: a scan mid-pass, an agent run, open
+// terminals, the llama-server it spawned. Node 26 exits on an unhandled rejection by
+// default, so one un-awaited promise anywhere took all of that down and skipped the
+// cleanup below. The individual offenders are fixed; this is so the next one is a logged
+// line rather than an outage.
+process.on('unhandledRejection', (e) => {
+  console.error('[aios] unhandled promise rejection (kept running):', e?.stack || e);
+});
+
+process.on('SIGINT', () => { console.log('\nshutting down…'); mcp.stopAll(); server.close(); process.exit(0); });
+process.on('SIGTERM', () => { mcp.stopAll(); server.close(); process.exit(0); });

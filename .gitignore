@@ -3,3 +3,12 @@ data/
 *.log
 .DS_Store
 scripts/searxng/config/
+
+# Model weights, wherever they land. `data/` above already covers the directory AIOS
+# downloads into (data/llm/models/), so this is the belt-and-braces rule: a gguf is
+# gigabytes and always re-downloadable, and one dropped anywhere in the tree — the repo
+# root, a scratch folder — must never reach a commit. .part files are half-finished
+# downloads and are worth even less.
+*.gguf
+*.gguf.part
+*.safetensors

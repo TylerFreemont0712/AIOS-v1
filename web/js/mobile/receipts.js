@@ -78,43 +78,86 @@ async function handleFiles(files) {
   // process one at a time — the vision model serves one request anyway, and a
   // parallel burst would just fight over VRAM.
   const items = files.map((file) => {
-    const item = { key: 'q' + (++state.seq), name: file.name || 'photo.jpg', file, thumb: '', status: 'waiting', error: '', receipt: null };
+    const item = {
+      key: 'q' + (++state.seq), name: file.name || 'photo.jpg', file, thumb: '',
+      status: 'waiting', error: '', receipt: null, uploadId: null, attempts: 0,
+    };
     state.queue.unshift(item);
     return item;
   });
   render();
+  await runQueue(items);
+}
+
+/** One photo at a time — the vision model serves one request anyway. */
+async function runQueue(items) {
   for (const item of items) await processOne(item);
   loadContext();
 }
 
+/**
+ * Push one photo through prepare → upload → read, resuming from wherever it got to.
+ *
+ * Each stage records what it produced (the uploadId, then the receipt row), so a retry
+ * picks up from the furthest point that succeeded instead of starting over: a failed
+ * READ re-reads the photo the box already holds, and a failed UPLOAD does not re-decode
+ * a 12-megapixel HEIC that decoded fine the first time. On a phone on a flaky LAN this
+ * is the difference between one tap and photographing the receipt again.
+ */
 async function processOne(item) {
   const set = (status, extra = {}) => { Object.assign(item, { status, ...extra }); render(); };
+  item.error = '';
+  item.attempts = (item.attempts || 0) + 1;
   try {
-    set('preparing');
-    // A PDF or a video shared in from another app is not a receipt; say so before
-    // spending a decode on it.
-    if (!isImageFile(item.file)) {
-      throw new Error(`${item.name} is${item.file.type ? ` a ${item.file.type},` : ''} not a photo. Receipts need an image.`);
+    // The box already made a row for this photo. Re-read THAT one — a second
+    // /scan on the same upload would leave two receipts to reconcile by hand.
+    if (item.receipt?.id) {
+      set('reading');
+      return land(item, await post(`/finance/receipts/${item.receipt.id}/rescan`, {}), set);
     }
-    // force: receipts are always worth downscaling, even a JPEG straight from the
-    // camera — 1600px reads perfectly and uploads in a fraction of the time.
-    const prepped = await prepareImage(item.file, { force: true });
-    if (!prepped) toast(undecodableHint(item.file), '');    // ffmpeg on the box gets a turn
-    const body = prepped ? prepped.blob : item.file;
-    item.thumb = URL.createObjectURL(body);
-    set('uploading');
-    const up = await uploadBlob(body, prepped ? prepped.name : item.name);
-    item.file = null;                                  // release the original
+    if (!item.uploadId) {
+      set('preparing');
+      // A PDF or a video shared in from another app is not a receipt; say so before
+      // spending a decode on it.
+      if (!isImageFile(item.file)) {
+        throw new Error(`${item.name} is${item.file.type ? ` a ${item.file.type},` : ''} not a photo. Receipts need an image.`);
+      }
+      // force: receipts are always worth downscaling, even a JPEG straight from the
+      // camera — 1600px reads perfectly and uploads in a fraction of the time.
+      const prepped = await prepareImage(item.file, { force: true });
+      if (!prepped) toast(undecodableHint(item.file), '');    // ffmpeg on the box gets a turn
+      const body = prepped ? prepped.blob : item.file;
+      if (!item.thumb) item.thumb = URL.createObjectURL(body);   // retries reuse the first one
+      set('uploading');
+      const up = await uploadBlob(body, prepped ? prepped.name : item.name);
+      item.uploadId = up.id;
+      item.file = null;                                // release the original
+    }
     set('reading');
-    const rec = await post('/finance/receipts/scan', { uploadId: up.id });
-    if (rec.status !== 'parsed') {
-      set('failed', { error: rec.error || 'could not read that receipt', receipt: rec });
-      return;
-    }
-    set('parsed', { receipt: rec, chosenCategory: rec.parsed?.category || '' });
+    land(item, await post('/finance/receipts/scan', { uploadId: item.uploadId }), set);
   } catch (e) {
     set('failed', { error: e.message });
   }
+}
+
+/** Land a scan result on the card — read, or failed with the reason showing. */
+function land(item, rec, set) {
+  if (rec.status !== 'parsed') {
+    set('failed', { error: rec.error || 'could not read that receipt', receipt: rec });
+    return;
+  }
+  set('parsed', { receipt: rec, chosenCategory: rec.parsed?.category || '' });
+}
+
+/** Is there anything left to resume from? Only false once the photo itself is gone. */
+const canRetry = (item) => item.status === 'failed' && !!(item.receipt?.id || item.uploadId || item.file);
+
+const IN_FLIGHT = ['waiting', 'preparing', 'uploading', 'reading', 'saving'];
+const isBusy = () => state.queue.some(q => IN_FLIGHT.includes(q.status));
+
+async function retryFailed() {
+  if (isBusy()) return;
+  await runQueue(state.queue.filter(canRetry));
 }
 
 async function applyReceipt(item, mode) {
@@ -133,6 +176,9 @@ async function applyReceipt(item, mode) {
   } catch (e) {
     item.status = 'parsed';
     toast(e.message, 'err');
+    // A refused duplicate is explained by the card itself once it knows — re-read the
+    // receipt so the note and the missing Add button appear together with the message.
+    try { item.receipt = await get(`/finance/receipts/${rec.id}`); } catch { /* keep what we have */ }
     render();
   }
 }
@@ -203,8 +249,21 @@ function render() {
           class: 'm-dot' + (state.online === true ? ' is-up' : state.online === false ? ' is-down' : ''),
           title: state.online ? 'Connected to AIOS' : 'Not connected',
         })),
+      // Offline used to be a dead end: the capture buttons disable themselves and
+      // nothing on the screen re-checks the connection, so the only way back was a
+      // reload. One tap retries the load instead.
       el('div', { class: 'm-sub' }, state.online === false
-        ? 'Cannot reach AIOS — is it running on your network?'
+        ? [
+          el('span', {}, 'Cannot reach AIOS — is it running on your network?'),
+          el('button', {
+            class: 'm-btn-tiny', style: { marginLeft: '8px' },
+            onclick: async (e) => {
+              e.target.disabled = true;
+              await loadContext();
+              if (state.online) { loadRecent(); toast('Connected', 'ok'); }
+            },
+          }, 'Try again'),
+        ]
         : `${money(state.monthSpent)} spent this month`)),
 
     captureBar(),
@@ -213,6 +272,7 @@ function render() {
       state.queue.length
         ? el('section', { class: 'm-section' },
           el('h2', { class: 'm-section-title' }, 'This batch'),
+          batchStrip(),
           el('ul', { class: 'm-list' }, state.queue.map(queueCard)))
         : null,
 
@@ -276,7 +336,7 @@ const pickers = {
 };
 
 function captureBar() {
-  const busy = state.queue.some(q => ['waiting', 'preparing', 'uploading', 'reading'].includes(q.status));
+  const busy = isBusy();
   const blocked = busy || state.online === false;
 
   return el('section', { class: 'm-capture' },
@@ -307,34 +367,119 @@ function queueCard(item) {
       el('div', { class: 'm-merchant' },
         done ? (p.merchant || 'Unnamed receipt') : item.status === 'failed' ? 'Could not read' : item.name),
       pending ? el('div', { class: 'm-status' }, el('span', { class: 'm-spin' }), pending) : null,
-      item.error ? el('div', { class: 'm-err' }, item.error) : null,
+      item.error
+        ? el('div', { class: 'm-err' }, item.error + (item.attempts > 1 ? ` · tried ${item.attempts} times` : ''))
+        : null,
       done
         ? el('div', {},
           el('div', { class: 'm-total' }, money(p.total)),
           el('div', { class: 'm-meta' },
             [p.date, p.paymentMethod, `${(p.items || []).length} item${(p.items || []).length === 1 ? '' : 's'}`]
               .filter(Boolean).join(' · ')),
+          duplicateNote(item),
+          confidenceStrip(p),
           checkNote(p),
           (p.items || []).length ? el('ul', { class: 'm-items' },
-            p.items.map((it, i) => el('li', { class: it.warn?.length ? 'is-suspect' : '' },
-              el('span', {}, it.qty > 1 ? `${it.name} ×${it.qty}` : it.name),
-              el('span', {}, Number(it.amount).toLocaleString('en-US')),
-              // A phantom line is the common failure, and it has to be removable here:
-              // the phone is where receipts get photographed, so it is where they get
-              // corrected. The removal is what teaches the shop-specific fix.
-              item.status === 'applied' ? null : el('button', {
-                class: 'm-x', title: 'Not on the receipt',
-                onclick: () => dropLine(item, i),
-              }, '×')))) : null,
+            p.items.map((it, i) => lineRow(item, it, i))) : null,
           item.status === 'applied'
             ? el('div', { class: 'm-meta' }, `Filed under ${item.chosenCategory || p.category} · ${item.savedCount} entr${item.savedCount === 1 ? 'y' : 'ies'}`)
             : el('div', {}, categoryChips(item, p), actions(item, p)))
         : null,
       item.status === 'failed'
         ? el('div', { class: 'm-actions' },
+          // Retry names the step it will resume from, so it is obvious whether the photo
+          // is still going up the wire or already sitting on the box waiting to be read.
+          canRetry(item)
+            ? el('button', {
+              class: 'm-btn is-primary', disabled: isBusy(),
+              onclick: () => runQueue([item]),
+            }, item.receipt?.id || item.uploadId ? 'Read again' : 'Send again')
+            : null,
           el('button', { class: 'm-btn-ghost', onclick: () => { state.queue = state.queue.filter(q => q !== item); render(); } }, 'Dismiss'))
         : null),
   );
+}
+
+/**
+ * What happened to the batch, in one line.
+ *
+ * Per-card spinners answer "is this one working?" but not "did all six get through?",
+ * which is the question you actually have while standing in the shop deciding whether
+ * to put the paper away. Counts, plus one button that retries everything that failed.
+ */
+function batchStrip() {
+  const q = state.queue;
+  if (!q.length) return null;
+  const count = (...st) => q.filter(x => st.includes(x.status)).length;
+  const working = count(...IN_FLIGHT);
+  const failed = q.filter(x => x.status === 'failed');
+  const parts = [
+    working ? `${working} working` : null,
+    count('parsed') ? `${count('parsed')} read` : null,
+    count('applied') ? `${count('applied')} filed` : null,
+    failed.length ? `${failed.length} failed` : null,
+  ].filter(Boolean);
+  const settled = !working && q.every(x => x.status === 'applied' || x.status === 'failed');
+
+  return el('div', { class: 'm-batch' + (failed.length ? ' is-failed' : '') },
+    el('span', { class: 'm-batch-n' }, `${q.length} photo${q.length === 1 ? '' : 's'}`),
+    el('span', { class: 'm-batch-parts' }, parts.join(' · ')),
+    el('span', { class: 'm-grow' }),
+    failed.some(canRetry) && !working
+      ? el('button', { class: 'm-btn-tiny', onclick: retryFailed },
+        failed.length === 1 ? 'Retry' : `Retry ${failed.length}`)
+      : null,
+    settled
+      ? el('button', { class: 'm-btn-tiny is-ghost', onclick: () => { state.queue = []; render(); loadRecent(); } }, 'Clear')
+      : null);
+}
+
+/**
+ * One line, tappable into a quick edit.
+ *
+ * The phone is where receipts get photographed, so it has to be where they get corrected
+ * — walking to a desktop to fix one misread word is the difference between a habit and an
+ * abandoned feature. Tap the row to rename it or fix the amount; × removes a line that was
+ * never there. Both are the same corrections the desktop editor makes, and both feed the
+ * per-shop learning on apply.
+ */
+function lineRow(item, it, i) {
+  const editing = item.editing === i;
+  if (!editing) {
+    return el('li', { class: it.warn?.length ? 'is-suspect' : '' },
+      el('span', {
+        class: 'm-line-tap',
+        onclick: () => { if (item.status !== 'applied') { item.editing = i; render(); } },
+      }, it.qty > 1 ? `${it.name} ×${it.qty}` : it.name),
+      el('span', {}, Number(it.amount).toLocaleString('en-US')),
+      item.status === 'applied' ? null : el('button', {
+        class: 'm-x', title: 'Not on the receipt', onclick: () => dropLine(item, i),
+      }, '×'));
+  }
+  const name = el('input', { class: 'm-input', value: it.name || '', placeholder: 'what it is' });
+  const amt = el('input', { class: 'm-input num', type: 'number', inputmode: 'decimal', value: it.amount ?? '' });
+  return el('li', { class: 'm-line-edit' },
+    el('div', { class: 'm-line-printed' }, it.printed || ''),
+    el('div', { class: 'm-line-row' }, name, amt),
+    el('div', { class: 'm-line-row' },
+      el('button', { class: 'm-btn-ghost', onclick: () => { item.editing = null; render(); } }, 'Cancel'),
+      el('button', {
+        class: 'm-btn is-primary',
+        onclick: () => saveLine(item, i, { name: name.value.trim(), amount: Number(amt.value) || 0 }),
+      }, 'Save')));
+}
+
+/** Persist one edited line. Marks it `edited` so apply() files it under the name the
+ *  user typed rather than re-deriving one from the misread printed text. */
+async function saveLine(item, index, patchLine) {
+  const p = item.receipt?.parsed;
+  if (!p) return;
+  const items = p.items.map((x, i) => (i === index ? { ...x, ...patchLine, edited: true } : x));
+  try {
+    item.receipt = await patch(`/finance/receipts/${item.receipt.id}`, { ...p, items });
+    item.editing = null;
+    render();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 /** Do the lines add up? An invented line makes the sum overshoot by its own amount,
@@ -347,6 +492,36 @@ function checkNote(p) {
     c.delta > 0
       ? `The lines add up to ${amt} more than the receipt — one is probably not real. Remove it with ×.`
       : `The lines add up to ${amt} less than the receipt — one was missed.`);
+}
+
+/**
+ * How sure the reading is, as a bar.
+ *
+ * Compressed to one strip because a phone has no room for the reasons the desktop lists —
+ * and on a phone the reasons matter less anyway: the paper is still in your hand, so the
+ * useful instruction is simply "look at this one" or "this looks fine".
+ */
+function confidenceStrip(p) {
+  const c = p.confidence;
+  if (!c || typeof c.score !== 'number') return null;
+  const LABEL = { high: 'Looks right', good: 'Probably right', fair: 'Worth a look', low: 'Check this' };
+  const worst = (c.reasons || []).filter(r => r.delta < 0).sort((a, b) => a.delta - b.delta)[0];
+  return el('div', { class: 'm-conf is-' + c.level },
+    el('div', { class: 'm-conf-row' },
+      el('span', { class: 'm-conf-bar' }, el('i', { style: { width: c.score + '%' } })),
+      el('span', { class: 'm-conf-score' }, `${c.score}%`),
+      el('span', { class: 'm-conf-label' }, LABEL[c.level] || '')),
+    // One reason, the worst one. More than that on a phone is a wall nobody reads.
+    c.level === 'high' ? null : el('div', { class: 'm-conf-why' },
+      [worst?.text, c.reads > 1 ? `read ${c.reads} times` : ''].filter(Boolean).join(' · ')));
+}
+
+/** Already in the ledger — say so before the Add button is tapped, not after. */
+function duplicateNote(item) {
+  const d = item.receipt?.duplicate;
+  if (!d) return null;
+  return el('div', { class: 'm-check is-dupe' },
+    `Already logged: ${d.merchant || 'a receipt'} on ${d.date} with the same items and prices. This copy cannot be added.`);
 }
 
 /** Remove a line and save it, so the correction is recorded before applying. */
@@ -373,13 +548,29 @@ function categoryChips(item, p) {
   }, c)));
 }
 
+async function rescan(item) {
+  try {
+    item.status = 'reading'; render();
+    const fresh = await post(`/finance/receipts/${item.receipt.id}/rescan`, {});
+    item.receipt = fresh;
+    item.status = fresh.status === 'parsed' ? 'parsed' : 'failed';
+    item.error = fresh.status === 'parsed' ? '' : (fresh.error || 'could not read it that time either');
+    item.chosenCategory = fresh.parsed?.category || item.chosenCategory;
+    render();
+  } catch (e) { item.status = 'parsed'; toast(e.message, 'err'); render(); }
+}
+
 function actions(item, p) {
   const many = (p.items || []).length > 1;
+  // A known duplicate keeps Re-read (the reading may be wrong, and a corrected one is no
+  // longer a duplicate) but loses the buttons that would only ever return an error.
+  const dupe = !!item.receipt?.duplicate;
   return el('div', { class: 'm-actions' },
-    el('button', { class: 'm-btn is-primary', onclick: () => applyReceipt(item, 'total') },
+    el('button', { class: 'm-btn', title: 'Read the photo again', onclick: () => rescan(item) }, 'Re-read'),
+    dupe ? null : el('button', { class: 'm-btn is-primary', onclick: () => applyReceipt(item, 'total') },
       'Add ' + money(p.total)),
-    many ? el('button', { class: 'm-btn', onclick: () => applyReceipt(item, 'items') },
-      `Split ${p.items.length}`) : null);
+    dupe || !many ? null : el('button', { class: 'm-btn', onclick: () => applyReceipt(item, 'items') },
+      `Split ${p.items.length}`));
 }
 
 function recentCard(r) {

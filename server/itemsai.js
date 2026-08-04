@@ -26,6 +26,55 @@ Rules, in order of importance:
 4. name_en is natural English. name_ja is the generic Japanese term (牛乳), not the printed brand string.
 5. Return STRICT JSON only. No prose, no markdown fences.`;
 
+/**
+ * The result shape, enforced by the decoder.
+ *
+ * Note what this removes: the prompt below carefully describes three mutually-exclusive
+ * entry forms and warns against echoing the template, and pickResults() then SCORES the
+ * candidate blocks to find the real answer among the model's restatements. A grammar
+ * makes the template-echo failure impossible, because a restatement is not a valid parse.
+ * Both defences stay for providers that ignore response_format.
+ */
+const RESULTS_SCHEMA = {
+  name: 'item_results',
+  schema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['results'],
+    properties: {
+      results: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['index', 'item_id', 'create', 'skip'],
+          properties: {
+            index: { type: 'number' },
+            // Exactly one of these carries the answer; the other two are null. Modelling
+            // it as a union would be cleaner, but strict mode needs every key present and
+            // llama.cpp's converter handles nullable unions far more predictably.
+            item_id: { type: ['string', 'null'] },
+            skip: { type: ['boolean', 'null'] },
+            create: {
+              type: ['object', 'null'],
+              additionalProperties: false,
+              required: ['name_en', 'name_ja', 'category', 'subcategory', 'unit', 'typical_size'],
+              properties: {
+                name_en: { type: 'string' },
+                name_ja: { type: 'string' },
+                category: { type: 'string' },
+                subcategory: { type: 'string' },
+                unit: { type: 'string', enum: ['ml', 'g', 'each'] },
+                typical_size: { type: 'number' },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+};
+
 function buildPrompt(lines, cat) {
   const catalogue = cat.length
     ? cat.map(c => `  ${c.id}  ${c.nameEn}${c.nameJa ? ` / ${c.nameJa}` : ''}  [${c.category}${c.subcategory ? '/' + c.subcategory : ''}, per ${c.unit}]`).join('\n')
@@ -112,7 +161,11 @@ export async function resolveNames(rawNames, { model, signal } = {}) {
     modelRef,
     system: SYSTEM,
     messages: [{ role: 'user', text: buildPrompt(needsModel, items.catalogue({ limit: 250 })) }],
-    maxTokens: 2600,
+    // Grammar-constrained, same reasoning as receipts.js: the decoder guarantees the
+    // shape, so a reply that is 90% deliberation still ends in a parseable object.
+    // pickResults() below stays as the fallback for providers that ignore the schema.
+    schema: RESULTS_SCHEMA,
+    maxTokens: 4096,
     sampling: { temperature: 0 },
     signal,
   });

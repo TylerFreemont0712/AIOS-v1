@@ -32,7 +32,7 @@ open it on any other computer/tablet on your network and it just works.
 | **Projects** | The hub's registry: register existing folders, create new ones (README + git init), git branch/dirty badges, favorites, notes, jump straight into Agent/Files/Shell |
 | **Second Brain** | Your Obsidian vault: browse/edit/search notes, clickable `[[wikilinks]]`, backlinks, tag chips, an interactive link **graph**, daily-note capture — plus AI that answers *from your notes with citations*, summarizes, and **grows the wiki** by writing interlinked atomic notes into an `AI Wiki/` folder |
 | **Learning Corner** | An AI tutor: a subject **tree**, AI-designed capability roadmaps, web-grounded lessons, and **assessments** with per-question grading (multiple-choice, short-answer, ordering) and per-topic **mastery** tracking |
-| **Finances** | A real ledger: earnings, expenses, budgets, goals, recurring entries and presets across five tabs sharing one period selector; multi-currency, CSV export — plus **receipt capture** (photograph it, a local vision model reads it, you review, it posts) and **item price tracking** that tells you which shop is actually cheaper per unit |
+| **Finances** | A real ledger: earnings, expenses, budgets, goals, recurring entries and presets across five tabs sharing one period selector; multi-currency, CSV export — plus **receipt capture** (photograph it, a local vision model reads it, you review, it posts) and **item price tracking** that tells you which shop is actually cheaper per unit. Every scan **scores its own confidence** and re-reads itself (turning the photo when nothing was legible) until it is convincing or has had three goes; the same purchase **cannot be logged twice**; and what you correct is remembered per shop, so the next receipt from there arrives already fixed |
 | **Studio** | ComfyUI cockpit: text→image, image→image and 4× upscale, Animagine + Lightning-LoRA sampling plans, pixel-space hi-res, an LLM prompt generator — and AIOS owns the ComfyUI/llama lifecycle so the 8GB card never double-books |
 | **Models & Bench** | The llama-launcher, absorbed: per-model presets (context, offload, KV quant, flash-attn, vision projector), live GPU/VRAM, log pane, VRAM-fit hints — plus a **deterministic** benchmark scoring every local model per category with TTFT and tok/s (no LLM judge) |
 | **Planner** | Calendar, recurring events, birthdays, reminders and tasks, folded into Home's next-three-days |
@@ -148,6 +148,45 @@ The bundled config enables a broad engine set (Google, Bing, DuckDuckGo, Brave,
 Wikipedia, Mojeek, Qwant) so one engine getting rate-limited doesn't zero out your
 searches; `npm run searxng -- regen` rewrites the config and restarts.
 
+## MCP servers
+
+An **MCP server** is a small program that publishes tools over the Model Context
+Protocol — driving Godot, a browser, a database, whatever someone has written one
+for. AIOS connects to the ones you configure and its tools join the agent's belt
+beside the built-ins: same approval gate, same Settings rows, same everything.
+
+Add one in **Settings → Tools → MCP servers**. Presets fill in Godot, the official
+filesystem server, Playwright and Context7; anything else is a command and its
+arguments (or a URL for a remote server). Saving does *not* start it — **Connect**
+does, because spawning a program should be something you asked for. **Try** runs one
+of its tools by hand, which is how you tell "it connected" from "it works".
+
+```
+Godot:  git clone https://github.com/Coding-Solo/godot-mcp && cd godot-mcp
+        npm install && npm run build
+        → command: node   args: /abs/path/to/godot-mcp/build/index.js
+        → env GODOT_PATH=/path/to/godot   (optional — it probes common locations)
+```
+
+How it fits the rest of the hub:
+
+- **Namespaced.** A server with id `godot` publishes `godot_launch_editor`, and its
+  tools sit in a group called `mcp:godot`. Two servers can both offer a `search`
+  without colliding, and a built-in name always wins over a remote one.
+- **Free until used.** Each server is its own lean-loadout group, so its schemas
+  stay out of the prompt until the model calls `load_tools`. Adding five servers
+  costs a 32k local model nothing on turns that don't need them.
+- **Gated by default.** MCP's `readOnlyHint` annotation is optional, so any tool
+  that doesn't explicitly declare itself read-only goes through the approval mode.
+  An unannotated tool is treated as one that writes.
+- **Isolated.** These are other people's processes: they crash, hang, or fail to
+  start. A broken server contributes no tools and shows its own stderr in Settings;
+  it never delays a turn or takes the agent down. Enabled servers connect at boot,
+  reconnect on use after a crash, and are killed with the hub rather than orphaned.
+
+Both transports are supported: **stdio** (a local command — what nearly every MCP
+server ships as) and **streamable HTTP** (a URL, for remote servers).
+
 ## Deep research
 
 The **Research** app runs a real research loop on the server, so even a small local
@@ -215,7 +254,8 @@ server/            zero-build Node (ESM), no framework beyond express + ws
   wiki.js          typed notes, autolinking, Home MOC, packed-memory recall
   learn.js         AI tutor: subjects, roadmaps, lessons, assessments (+ learndb.js)
   finance.js       ledger, budgets, goals, recurring, FX (+ financedb.js, financeai.js)
-  receipts.js      photo → vision-model OCR → reviewed → posted to the ledger
+  receipts.js      photo → vision-model OCR → scored, re-read if doubtful → reviewed
+                   → posted once (duplicate-guarded) → corrections learned per shop
   items.js         brand-free product catalogue + price history (+ itemsai.js)
   uploads.js       attachment intake: byte-sniffing + ffmpeg transcode (HEIC → JPEG)
   llmctl.js        AIOS owns llama-server: profiles, presets, mmproj, hot model swaps
@@ -235,7 +275,8 @@ Roadmap.md         idea bucket for future features
 data/              your stuff (gitignored): config, chats, agent sessions, research,
                    uploads, comfy renders, and four SQLite stores: learn, bench,
                    finance, plus per-project .aios/ memory
-scripts/           build-vendor.mjs · check.mjs · audit.mjs · e2e.mjs · searxng.mjs
+scripts/           build-vendor.mjs · check.mjs · audit.mjs · toolcheck.mjs · e2e.mjs
+                   searxng.mjs
                    gguf/split_omni_gguf.py (single-file omni GGUF → text + mmproj)
                    aios-launch.sh + aios.desktop + aios.svg (desktop shortcut)
                    aios.service (systemd unit)
@@ -243,6 +284,15 @@ scripts/           build-vendor.mjs · check.mjs · audit.mjs · e2e.mjs · sear
 
 `npm run check` bundles the frontend and parse-checks the server — run it after
 hacking on AIOS (or let the Agent run it after hacking on itself).
+`npm run audit` exercises every subsystem against a throwaway data dir.
+`npm run toolcheck` goes one level lower and **runs every tool on the agent's belt**
+against a fixture project, git repo and vault — the only way to notice a tool that
+has quietly rotted, since a broken one looks exactly like a working one until
+something calls it. Results are classified (`pass` / `env` / `skip`), so tools that
+need the internet, a model, or credentials this box lacks are reported rather than
+failed; only a real break exits non-zero. It borrows the machine's providers so the
+model-backed tools are genuinely exercised — `--no-model` audits the offline surface
+alone, and a bare word filters by group (`npm run toolcheck -- vault`).
 `npm run vendor` rebuilds `web/vendor/` from npm packages.
 
 ## Starting it

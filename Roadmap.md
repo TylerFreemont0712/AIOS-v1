@@ -11,7 +11,7 @@ cool if…" get captured so they aren't lost.
 **Item IDs are stable and section-scoped** (`B9`, `D11`). They are never renumbered — a shipped
 item's line is deleted and its ID retires with it, so cross-references in this file, in commit
 messages, and in `comfyui-plan.md` keep pointing at the right thing. New items take the next
-free number in their section. **55 open items** — 7 cuts, 17 backend, 11 UI, 17 features, 3 money.
+free number in their section. **59 open items** — 7 cuts, 18 backend, 12 UI, 19 features, 3 money.
 
 Every forward-looking item carries a **code hook** (the file/function to start from) so it is
 actionable. Claims marked **✅ verified <date>** were checked against this machine, not
@@ -29,7 +29,7 @@ reason each one earns its slot.
 | # | Item | Effort | Why it's top-10 |
 |---|---|---|---|
 | 1 | **B1** — fix the `sendFile`/`h()` race | S | ✅ **Confirmed live bug** at `server/index.js:171`. Corrupts every Files-app download. One line. |
-| 2 | **B3** — structured output via `json_schema` | M | Deletes a whole *class* of failure. ✅ 22 call sites hand-parse model JSON today; llama.cpp can make invalid output impossible. |
+| 2 | **B3** — finish rolling out `json_schema` | S | ✅ Transport + the two finance callers shipped 2026-07-27. `mail`, `learn`, `vault`, `router`, `comfy` still hand-parse. |
 | 3 | **D2** — MCP client | M | ✅ ~9,650 registry servers become AIOS tools for one adapter. The biggest capability-per-line win available. |
 | 4 | **B2** — SQLite-aware backups | S | Four WAL databases now hold hand-entered money and learning data. This box has hard-crashed under load. Overdue. |
 | 5 | **B4** — SSRF guard on `fetch_url` | S | ✅ No protection today; a fetched web page can steer the agent at `127.0.0.1:8188` or the LAN router. |
@@ -41,6 +41,13 @@ reason each one earns its slot.
 
 Two of these are near-free and unblock the rest: **A5** (one SQLite helper) turns **B2** from a
 four-file change into one, and **B3** lands before **D18** and **§F** need it.
+
+**Filed 2026-07-27, not yet ranked into the ten above** — both follow directly from the receipt
+work that shipped that day, and both are S: **D19** closes the one known blind spot in the new
+duplicate guard (it matches the *reading*, so a second scan that misreads one character slips
+through — a perceptual hash of the *photo* catches it), and **B18** calibrates the confidence
+weights against the 8-receipt bench, since the 75 re-read floor is currently an unfitted
+constant deciding how much GPU every scan spends.
 
 ---
 
@@ -71,9 +78,11 @@ On a provider abstraction (Anthropic + Ollama + any OpenAI-compatible endpoint, 
   web-grounded lessons, and **assessments with per-question grading + per-topic mastery**
   (SQLite; multiple-choice, short-answer, ordering).
 - **Finances** — a full ledger (earnings, expenses, budgets, goals, recurring entries, presets),
-  five tabs over one period selector, CSV export, multi-currency with a re-denominating rate
-  table, **receipt capture** (photo → vision-model OCR → reviewed → posted), and **item price
-  tracking** (brand-free catalogue, confirmed-alias point of truth, unit-price shop comparison).
+  seven tabs over one period selector, CSV export, multi-currency with a re-denominating rate
+  table; an **Income tab** for freelance work (four logging modes, hours/pieces recorded,
+  a daily log, per-payer effective rates, year-to-date with a run-rate projection);
+  **receipt capture** (photo → vision-model OCR → reviewed → posted); and **item price
+  tracking** (brand-free catalogue, confirmed-alias point of truth, unit-price comparison).
 - **Models / Bench** — the llama-launcher **absorbed into the web UI** (per-model presets, live
   GPU/VRAM, log pane, VRAM-fit hints, mmproj pairing), a **deterministic model benchmark**
   (`data/bench.db`: score + TTFT + tok/s per model per category, no LLM judge), and seamless
@@ -88,9 +97,257 @@ On a provider abstraction (Anthropic + Ollama + any OpenAI-compatible endpoint, 
   **GitHub** (profile, heatmap, repos, PRs, issues, publish/clone).
 - **Plumbing** — SearXNG (bundled), PDF ingestion, ffmpeg-backed image intake, sampling
   controls, shifting context window, service probes, desktop launcher, and
-  `npm run check | audit | e2e` (14 e2e suites + 43 audit checks, mock-provider driven).
+  `npm run check | audit | e2e` (14 e2e suites + 58 audit checks, mock-provider driven).
 
 ### Recently shipped
+
+**2026-08-04 — the small print gets read, and typing a number stops fighting back**
+
+- 🐛 **You could not type a multi-digit amount into the income form.** Every keystroke
+  repainted the field slot to keep the running total honest, and emptying that slot detaches
+  the `<input>` the caret is in — a detached input is a blurred one. "1200" landed as four
+  separate one-character edits. Split into `paintMode()` (chips + fields, on mode change
+  only) and `paintPreview()` (the live total, which contains nothing focusable). Same bug
+  the receipt editor had and the same fix; the receipt one carried a comment explaining it,
+  which is how this one was found.
+- **The keyboard now finishes what it starts.** Adding a receipt line puts the caret in it,
+  Enter on the last line adds another (Enter elsewhere steps down the table), and Enter in
+  the income form logs it. Adding several missed lines was the case that mattered: it is
+  exactly what you do when the model read the receipt badly, and it cost a click per line.
+- **A long receipt is read in overlapping bands.** The same finding that made cropping worth
+  more than the model swap, one step further: a model resizes its input before it reads
+  anything, so a cropped till receipt at 3-6:1 loses most of its vertical resolution — and
+  that is the resolution the *product names* are printed in. Totals are large text and
+  survive, which is exactly the reported symptom: right total, wrong names, sometimes an
+  item code where a name should be. `uploads.sliceTall()` cuts a strip into bands of about
+  1.4:1 with a 14% overlap; `stitchTranscripts()` joins them by finding **two or more
+  identical lines** agreeing across a seam. One matching line is never a seam — a lone
+  "¥180" repeats innocently — and when nothing agrees the halves are simply concatenated,
+  because a duplicated line overshoots the total and lands in front of the reviewer, while a
+  dropped one balances and is silently wrong. Only line-oriented readers can be tiled;
+  dots.ocr answers with one layout object per image and keeps the whole photo.
+  `finance.ocrTiles` (default 3, cap 4, 1 = off), exposed in Settings → Finances.
+- **An item code is not a product name.** Both prompts now say so, and `looksLikeCode()`
+  flags a name that is a bare run of digits. Flagged, never dropped — something *was* bought
+  on that line, and the reviewer's correction is what the catalogue learns from. Deliberately
+  narrow (no letters, no CJK, 3+ digits) so "500ml" and "2%" never trip it: a warning on a
+  real product teaches people to ignore warnings.
+- **Income from a screenshot.** A payout screen already states the payout, the platform's
+  cut, the trips and the hours; logging it meant reading four numbers off a phone and typing
+  them into another screen, which is the kind of task that stops getting done after a
+  fortnight. `readEarnings()` shares the reader and *nothing else* — no scan stored, no fix
+  written, no path to the ledger — because a payout screen has no shop, no basket and no
+  arithmetic of its own to check a reading against. It fills the income form in the mode the
+  reading supports (gross + cut → gross − fee, hours → hourly, jobs → per item, otherwise a
+  flat amount), and a figure worked out from the other two is declared as such.
+- ⚠️ **Two tests were found asserting behaviour that had been deliberately changed** — the
+  re-read loop and `crawl_site`'s place in the chat belt. Both now pin the *current*
+  contract, in both directions. See the correction under the re-read bullet below.
+- **Coverage:** three new audit checks (`a long receipt is read in bands and stitched back`,
+  `an item code is not a product name`, `a payout screen fills the form, not the ledger`).
+  **58 hard checks, 0 failing; 14/14 e2e suites.**
+
+
+**2026-07-27 — receipts: no duplicates, a visible confidence score, and a learning loop that
+covers amounts and shop names**
+
+Three things a scanner needs before it can be trusted with money unattended.
+
+- **One purchase cannot be logged twice.** The same receipt photographed on the phone and
+  again at the desk used to post twice and silently double a day's spend — nothing
+  downstream could tell the copy from the original. `receipts.receiptFingerprint()` keys a
+  scan on **date + currency + total + the sorted line items**, deliberately *not* the shop
+  name: that is the field two readings of one receipt are most likely to word differently
+  ("7-ELEVEN" vs "セブン-イレブン"), and letting a copy through because the shop wobbled
+  defeats the point. A receipt with no line items falls back to including the shop, because
+  two ¥500 lunches on one day is a real thing where an identical basket is not. Stored on
+  `finance_receipt.fingerprint` (indexed), checked in `apply()`, and **refused outright with
+  409** — no "add it anyway", which is a button that gets clicked past exactly when it
+  matters. The review screen and the phone card show it *before* the Log button, and hide
+  the button rather than offering one whose only outcome is an error. Reverting the original
+  frees the copy: the guard is about the ledger, not the scan. `backfillFingerprints()` runs
+  once at boot so scans stored *before* the guard existed are covered too — otherwise the
+  hole would sit exactly where it is least expected, over the receipts already logged
+  (✅ indexed 7 on this machine).
+- **Every scan scores itself, 0-100, and says why.** `receipts.scoreConfidence()` is
+  deterministic — no second model call, and no self-reported confidence from a model that
+  has no idea when it is wrong. It weighs the arithmetic (by far the strongest signal, since
+  a receipt is a closed system), fields that are printed on every receipt ever issued,
+  garbled codepoints, per-line price-probe objections, summary lines the model handed over
+  as products, and **how much of the basket the catalogue recognises** — a line matching a
+  string the user personally confirmed is near-certainly read right. `normalize()` now
+  *declares* the two substitutions it used to make silently (`dateGuessed`, `totalDerived`)
+  so a reading held together by defaults cannot look as good as one read off the paper. The
+  number appears as a meter with reasons in the review editor, a pill in the list, and a
+  compressed strip on the phone.
+- **An unreadable scan turns the photo and reads it again, up to three times.** The two
+  failure modes want opposite responses, and telling them apart is most of the value:
+  **nothing legible** is what a receipt at the wrong angle looks like, so the photo gets
+  turned (180° first — undoing a wrong `detectSideways` guess — then 90°); **legible but
+  does not add up** means the paper was read and a number misjudged, and that one is handed
+  over as-is. ⚠️ **Corrected 2026-08-04:** it used to be re-read on the theory that the
+  model varies run to run. It does not — every call is temperature 0 under a fixed grammar,
+  so a second look at byte-identical input reproduces the reading that just failed the
+  floor. That was 25-40 s of GPU for an outcome that could not change, and on the rescan
+  path (where an explicit angle pins the loop) it was *every* remaining pass. Retries read a
+  *throwaway rotated copy*, so the picture the reviewer checks against is only re-encoded
+  once, for the winning angle. The best-scoring pass wins; readings are never merged,
+  because a receipt stitched from two disagreeing sources is one nobody can check against
+  the paper. An explicit `rotate` is an instruction — retries may re-read it, never re-turn
+  it. Tunable via `finance.ocrMinConfidence` (75) and `finance.ocrMaxAttempts` (3, 1-3).
+- **The correction loop learned three things it was missing.**
+  - `amount` fixes were recorded and never replayed. They are now — but **only when the
+    model repeats the identical misread**, so a genuinely new price is never overwritten by
+    last month's correction. That would be a hallucination the app invented itself, which
+    is worse than the misread it set out to fix.
+  - **Shop names are learned and replayed.** This matters more than it looks: the merchant
+    is the key every other fix is filed under, so a misread name meant none of that shop's
+    drops or renames could be found. Gated on the same two-hits rule, because a user may
+    type something branch-specific.
+  - 🐛 **Fixed a destructive bug in `learnFromEdit`.** Correcting the *printed text* — the
+    牛丼 → 牛乳 case that field is editable for — changes the very key the diff matches on,
+    so the line looked deleted and was filed as a `drop`. That taught the scanner to
+    **silently bin a real product every time it was printed**. Unmatched model lines are now
+    paired against the user's unclaimed lines on the amount before "deleted" is concluded.
+- **The loop can show its work.** `GET /api/finance/receipt-learning` reports corrections
+  stored vs. in force, catalogue vocabulary, and the last 10 scans' average confidence
+  against the 10 before — rendered as a strip above the receipt list. A correction loop that
+  cannot show it is working is indistinguishable from one that isn't.
+- **Coverage:** three new audit tests (`one purchase cannot be logged twice`, `a doubtful
+  reading is read again`, `a reading scores its own confidence`) plus extensions to the
+  existing learning test. The retry loop runs against a scripted model in a subprocess and
+  counts the calls, so the control flow — how many passes, which angle, which one wins — is
+  pinned. **52 hard checks, 0 failing.**
+
+
+**2026-07-27 — receipt reading rebuilt: 63% → 100% of totals correct**
+Benchmarked over **8 real receipts** with hand-checked ground truth (two chains, 1-8 line
+items, three photographed sideways), through the real HTTP path:
+
+| pipeline | parsed | **totals right** | item counts | avg |
+|---|---|---|---|---|
+| Gemma-4-E4B, single stage (was the default) | 100% | 63% | 25% | 21s |
+| dots.ocr, two stage | 75% | 38% | 63% | 24s |
+| **DeepSeek-OCR → E4B, two stage** | **100%** | **100%** | **88%** | 28s |
+
+- **Two stages, because one model cannot do both halves.** A dedicated OCR model reads a
+  page far better than a general VLM but does not answer questions about it: driven
+  end-to-end with our schema, dots.ocr scored 25% and hit the token cap on five of eight.
+  Asked only to transcribe, it read a receipt the VLM had scored ¥3,138 (true ¥799) and
+  returned every number exactly. So the reader transcribes and a text model structures —
+  each doing the job it was trained for. `llmctl.refIsTranscriber()` decides, from an `ocr`
+  tag on the model's preset, so adding another reader is configuration.
+- **Crop to the document first — this was worth more than the model swap.** A receipt fills
+  only **37-46%** of the frame on every real example, and the model downsamples whatever it
+  is handed, so most of the pixel budget was going to woodgrain. One receipt transcribed to
+  **86 characters** uncropped (it found the card slip and missed every product) and **698**
+  cropped — that single change took the pipeline from 88% to 100%. `uploads.cropToContent()`
+  thresholds between the darkest and brightest deciles, requires a quarter of a row to be
+  bright before it counts as paper, and declines when there is nothing to gain. The crop is
+  a *temporary* upload; the reviewer's photo stays whole.
+- Stage 2 retries once on failure (cheap — no image, usually no model swap).
+- New models live in `data/llm/models/` (14GB); `*.gguf` added to `.gitignore` tree-wide,
+  and **B2** now carries a ⚠️ to exclude them from backups.
+
+
+**2026-07-27 — the receipt gets straightened before the model sees it**
+- ✅ **Angle was a leading cause of bad reads, and it is now measured, not assumed.** Three
+  of the photos on this machine were taken with the receipt lying across a landscape frame,
+  so the model was asked to read Japanese rotated 90° — the case the OCR literature calls
+  out as the weakest for these models. A controlled A/B on one of them, same photo, same
+  model: **rotation suppressed → the scan failed outright with no JSON; auto-rotated →
+  parsed, correct shop and date, item names largely right.** A later manual re-read at 270°
+  produced the exact right total (¥2,160).
+- **Detection is deliberately dumb and was validated 5/5** against every real receipt here:
+  a till receipt is a long narrow strip, so a **landscape photo of one means it is lying
+  sideways**. Only near-square photos fall through to the subtler test — where the
+  brightness steps are, since they occur across the strip's short axis. A projection
+  measure *alone* scored 4/5 and was least confident exactly where it was wrong (1.1×),
+  so aspect leads and projection breaks ties.
+- **Direction is counter-clockwise**, because on all three real examples the header sat on
+  the right — where it lands when a right-handed person puts a receipt down. A wrong guess
+  costs one click: the review editor says what it did and offers "turned the wrong way?",
+  and rotating the photo pane now grows a **"Re-read at N°"** button that saves the angle
+  and re-runs the scan.
+- New `uploads.imageSize()`, `greyRaster()` and `rotateStored()` (rotates the stored file
+  in place, so the photo you check against is the one the model was given).
+  `scan()`/`rescan()` take a `rotate` override; `0` means "leave it alone".
+
+
+**2026-07-27 — an Income tab, for freelance work**
+- **New tab.** Income is not "expenses with the sign flipped" — the questions are what came
+  in today, from which client, for how many hours, and is the year ahead. It reads the same
+  `finance_txn` rows, so a logged hour immediately moves the Overview net, the goal meter
+  and the year-to-date.
+- **Four ways to log money**, because it does not always arrive the same shape: a flat
+  **amount**; **hourly** (hours × rate); **per item** (pieces × price — words, lessons,
+  deliveries); and **gross − fee**, which takes what the client paid and the platform's cut
+  and logs what you actually keep, recording the gross in the note. A live line shows the
+  result before you commit. Plus one-tap **quick-log chips** from the existing presets.
+- **Work is recorded, not just money.** New `finance_txn.units` + `unit` columns, so hourly
+  and per-item entries carry their hours or pieces. That is what makes "what am I actually
+  earning per hour" answerable — per payer, per period and year to date.
+- **The daily log** groups entries by day (Today / Yesterday / weekday), each with its own
+  total and hours; double-click or right-click an entry to edit, duplicate or delete.
+- **Where it came from** ranks payers by share, with entries, hours and effective rate.
+- **Overview: daily spend became daily NET.** `calendarHeat` gained a `signed` mode —
+  direction by hue, magnitude by intensity, so a +8,000 day and a −8,000 day read as
+  equally strong opposites. On freelance income the daily question is which way you came out.
+- **Year-to-date card** on the Overview and in the Income hero: in / out / net, run rate per
+  day, hours logged, and a projection for the full year. The figure a tax return starts from.
+- ✅ Caught in testing: the per-payer rollup aliased its group key `source`, but `finance_txn`
+  already **has** a `source` column — SQLite grouped by that instead and collapsed every
+  client into one row. Now grouped by the expression, with a regression test.
+
+**2026-07-27 — steering the OCR, and correcting it after the fact**
+- **Your corrected name now outranks the model's.** ✅ A real bug: a receipt printed 牛乳
+  (milk), the OCR read 牛丼 (beef bowl), the user renamed it to "Milk" — and the catalogue
+  still filed "Beef Bowl", because resolution ran on the *printed* string and never
+  consulted the correction. Worse, the edit then promoted 牛丼 → Beef Bowl to a **confirmed**
+  alias, cementing it. Edited lines now bypass the classifier entirely
+  (`items.itemForName`), and the printed text is bound to the user's item instead.
+- **The printed text is editable too.** When the OCR misreads the characters themselves,
+  fixing only the tidy name leaves the catalogue keyed on the wrong string.
+- **The photo sits beside the fields** on desktop — zoom (wheel/±/double-click), rotate
+  either way, drag to pan, reset, open full size. Cross-checking a thermal receipt against
+  a text field is the whole job, and 牛乳-vs-牛丼 is invisible without it.
+- **Re-read button**, desktop and phone: `POST /api/finance/receipts/:id/rescan`, ~15s,
+  refuses once applied. Worth pressing when something about the *input* changed — the photo
+  was turned, a different reader was picked in Settings, or the correction loop has since
+  learned a fix that `replayFixes()` will now apply. Not worth pressing otherwise; see the
+  2026-08-04 correction above.
+- **Quick edits on the phone** — tap a line to fix its name or amount, × to remove it.
+- **OCR priming from settled vocabulary.** Confirmed aliases (never unconfirmed ones — that
+  would feed the model its own misreads back) go into the prompt as "products bought
+  before", tilting 牛乳-vs-牛丼 toward the word that actually occurs in this kitchen.
+- **Measured on a real 8-line Japanese drugstore receipt:** it now parses and balances
+  exactly (2132 = 2132) where the same photo failed twice before.
+
+**2026-07-27 — schema-constrained output: "did not return usable JSON" is fixed at the decoder**
+- **Diagnosed, not guessed.** The failed scans stored 3,130 characters of *"Here's a
+  thinking process to arrive at the desired JSON output: 1. Analyze the Request…"* and were
+  cut off before the object began. Successful ones are ~330 characters. It was never a
+  formatting problem — Gemma 4 is a thinking model and was spending the whole 2400-token
+  budget narrating.
+- **`response_format: {type:'json_schema'}` now flows through `streamChat({ schema })`**
+  (llama.cpp → GBNF grammar; Ollama → `format`). ✅ Verified genuinely enforced on this box:
+  a schema containing an enum came back with exactly that enum value, which no model
+  volunteers. Wired into `receipts.js` and `itemsai.js` — the two financial JSON callers.
+- **Thinking cannot be switched off for this model.** ✅ `enable_thinking:false`,
+  `reasoning_effort:none|low` and `thinking:{type:disabled}` were each measured against the
+  live server: all three are no-ops for Gemma's template, which emits 180-250 reasoning
+  tokens regardless. So the fix is headroom, not suppression — 4096 first pass, one retry
+  at 8192, and `stopReason === 'length'` reported as truncation rather than "bad JSON".
+- **The prompt got shorter, not longer.** With the grammar owning the shape, the JSON
+  template block came out of the prompt; only policy remains. Long rule lists measurably
+  lengthen this model's deliberation, which is what pushed scans past the cap.
+- **Result: 3/3 consecutive scans parsed** (was intermittent), ~14-18s each, totals correct
+  and reconciliation balanced every time.
+- **Model size answer: bigger is worse here.** ✅ `gemma-4-12b-it-qat` (6.5GB + a 175MB
+  projector on an 8GB card) managed **18.4 tok/s against the E4B's 82**, and on an
+  unbounded array it decoded **6,876 tokens on a one-item receipt without stopping** — a
+  10-minute timeout, no result. The E4B split stays the right OCR model. The runaway also
+  bought a `maxItems: 100` bound in the schema: a grammar guarantees shape, not termination.
 
 **2026-07-27 — fixing a receipt *after* it is in the ledger, and bulk item naming**
 - **Undo & edit an applied receipt.** `POST /api/finance/receipts/:id/revert` removes the
@@ -265,7 +522,13 @@ and `/m` are already plain handlers with the error callback; this one was missed
 add an audit check that greps for `sendFile` inside `h(`, so it cannot come back.
 *Hook:* `server/index.js:171`.
 
-**B2. 🔥 Make backups SQLite-aware — S.** Data now lives in JSON **and four** WAL databases
+**B2. 🔥 Make backups SQLite-aware — S.** ⚠️ **Must exclude `*.gguf`.** `data/llm/models/` now
+holds **14GB** of model weights, against a few hundred MB of actual data — a naive `tar data/`
+would produce a 14GB archive of things that are all re-downloadable from Hugging Face. Exclude
+model weights (and `.part` files) wherever they sit; back up the ledger, the vault index, the
+chats and the config.
+
+Data now lives in JSON **and four** WAL databases
 (`bench.db`, `learn.db`, `finance.db`, and whatever §F adds). A naive `tar data/` mid-write
 captures a torn WAL. Add `scripts/backup.mjs`: `PRAGMA wal_checkpoint(TRUNCATE)` on each `.db`,
 tar `data/` + registered `.aios/` dirs into `backups/` with keep-last-N, and a `--restore` that
@@ -274,7 +537,9 @@ refuses to run while the server is up. This machine has hard-crashed under load 
 Do **A5** first and this is one file. *Hook:* new `scripts/backup.mjs`; `financedb.js:backupOnBoot`
 already has the checkpoint pattern.
 
-**B3. 🔥 Structured output via `json_schema` / GBNF — M.** ✅ 22 call sites across 8 modules
+**B3. 🔥 Structured output via `json_schema` / GBNF — S (was M).** Landed 2026-07-27 for the
+transport (`streamChat({ schema })`, OpenAI-compat + Ollama) and for `receipts.js` /
+`itemsai.js`. What remains is adopting it in the other callers: ✅ 22 call sites across 8 modules
 (`receipts`, `itemsai`, `financeai`, `mail`, `learn`, `vault`, `router`, `comfy`) coax JSON out
 of models by *prompting* for it and then hand-parsing the reply. The defensive machinery this
 grew is itself the evidence: `util.jsonBlocks()` walks every balanced brace-block,
@@ -388,6 +653,18 @@ what Claude Code and Copilot emit, so an opt-in OTLP exporter behind a config fl
 be inspected with standard tooling. Keep it off by default — local-first means no telemetry
 unless asked. *Hook:* `server/llm.js:streamChat` (perf is already computed), new `server/log.js`.
 
+**B18. 🔥 Calibrate the confidence weights against the receipt bench — S.** The penalties in
+`scoreConfidence()` are *reasoned* — arithmetic dominates, recognition is a capped bonus that
+can never mask a receipt that does not add up — but they are hand-set, and the 75 floor with
+them. That is one unfitted constant deciding how much GPU every scan costs and how much the
+user is asked to check. The 8 hand-checked receipts from the 2026-07-27 bench are already the
+ground truth: score each, plot score against "was the total actually right", and pick the
+threshold where re-reading stops paying. Two numbers worth knowing and currently unknown —
+**how often a ≥75 scan is wrong** (false confidence, the expensive direction) and **how often
+a re-read actually improves the score** (if it rarely does, the cap should be 2, not 3).
+*Hook:* `server/receipts.js:scoreConfidence`, the bench receipts, `scripts/audit.mjs`
+`'a reading scores its own confidence'`.
+
 ## C. UI / UX
 
 **C1. 🔥 Unified notification center (topbar bell) — M.** Runs finish while you're in another
@@ -455,6 +732,17 @@ schema prompt.
 widgets are divs with click handlers: no roles, no focus traps, no Escape contract in places, and
 the dock isn't tab-navigable. One pass for roles/aria-labels/focus order pays off for keyboard
 use generally, not just screen readers. *Hook:* `web/js/ui.js` primitives.
+
+**C12. ✨ Show where the scanner is still weak — S.** The learning strip above the receipt
+list answers "is it improving?" in aggregate. The more actionable question is *where it
+isn't*: average confidence **per shop**, and which printed strings are corrected most often.
+A shop that consistently scores 50 is usually one artefact — a receipt printer that renders
+katakana badly, a layout that folds the total under the barcode — and knowing which one turns
+a vague "the OCR is bad sometimes" into a fixable target (a per-merchant prompt hint, or just
+photographing that chain's receipts differently). All the data is already recorded:
+`finance_receipt.confidence` + `merchant` from `parsed`, and `finance_receipt_fix.hits`.
+*Hook:* `server/receipts.js:learningStats()` (add a per-merchant rollup),
+`web/js/apps/finance.js:learningStrip`.
 
 ## D. New features worth building
 
@@ -543,15 +831,17 @@ Groceries on day 12" alerts through **C1**, recurring-entry drift detection (a s
 quietly went up), and a month-end recap the `recapModel` writes. The data is all there — this is
 queries plus a card. *Hook:* `server/finance.js:summary`, `server/financeai.js`.
 
-**D18. ✨ Receipt scan: a second pass when the arithmetic fails — S.** The reconciliation
-check now says *when* a reading is wrong; the cheap next step is to act on it. When
-`check.ok === false`, re-ask the same model once with its own extraction plus the
-discrepancy ("your lines come to 480, the receipt says 300 — which line is not on the
-image?") and keep whichever answer reconciles. It only runs on the receipts that failed,
-so the cost is bounded, and it targets exactly the failure the user reported. Worth doing
-**after B3**: schema-constrained output makes the second pass reliable to parse.
-*Hook:* `server/receipts.js:scan` (after `normalize`), `reconcile()` already supplies the
-number to quote back.
+**D18. ✨ Receipt scan: a *targeted* second pass when the arithmetic fails — S.** Partly
+shipped 2026-07-27: `scan()` now re-reads a low-confidence scan up to three times and keeps
+the best. What it does **not** do is tell the model what was wrong — each pass starts from
+nothing, so a model that hallucinated the same line twice hallucinates it a third time. The
+remaining half: on a `short`/`overshoot` verdict, hand the model back its own extraction
+plus the discrepancy ("your lines come to 480, the receipt says 300 — which line is not on
+the image?") as one of the retry passes, and keep it only if it reconciles *and* scores
+higher. Cheap, bounded to the scans that already failed, and it attacks the one failure the
+generic re-read cannot: a confident, repeatable invention.
+*Hook:* `server/receipts.js:planAngle`/the retry loop in `scan()` — the ladder is already
+there, this adds a rung; `reconcile()` supplies the number to quote back.
 
 
 **D13. 🧪 Files: git gutter + inline AI edit — M.** Bring the working-diff data already exposed at
@@ -588,6 +878,30 @@ the gallery), then **inpainting** (mask + repaint, built-in nodes) and **Control
 jump available in Studio, and Phase 0 is already paid for.
 *Hook:* `server/comfy.js` workflow builders + `generate()` output handling,
 `web/js/apps/studio.js` workflow picker.
+
+**D19. 🔥 Catch the duplicate the *fingerprint* cannot — S.** The guard shipped 2026-07-27
+matches on date + total + line items, which is exact by design: it is the only key that
+cannot produce a false positive on real spending. Its blind spot is the case it was built
+for. Photograph one receipt twice and the second read misjudges a single character or a
+single yen, and the fingerprints differ — two rows, doubled spend, no warning. The fix is a
+*second, softer* key over the **photo** rather than the reading: a perceptual hash (aHash or
+dHash over `uploads.greyRaster()`, which already produces the grid) stored beside the
+fingerprint, with a Hamming-distance lookup at scan time. Two photos of one piece of paper
+are visually near-identical however the model reads them. Soft key ⇒ soft treatment: a
+"you may have already logged this" banner with a link to the other scan, **not** a block —
+the exact key stays the only thing allowed to refuse.
+*Hook:* `server/receipts.js:receiptFingerprint`/`duplicateOf`, `uploads.greyRaster()`,
+new `finance_receipt.phash` column.
+
+**D20. ✨ Let a confident scan file itself — S.** Now that a scan scores itself, the payoff
+is not having to review the easy ones. A receipt that reconciles, matches confirmed
+catalogue vocabulary and clears a (high, user-set) bar could post straight to the ledger,
+with a notification instead of a queue entry, and a one-tap undo — `revertReceipt()` already
+unwinds rows *and* their price observations cleanly, so the escape hatch exists. Ships best
+**after D19** (a mis-filed duplicate is worse when nobody looked) and after the weights are
+calibrated per **B18**. Off by default: this is money, and the whole design so far has been
+"the scan is a draft, never a result".
+*Hook:* `server/receipts.js:scan` tail + `apply()`, `finance.autoPostAbove` config key.
 
 ## E. Monetization / return-on-investment 💰
 
@@ -677,6 +991,13 @@ re-litigate.
 - **`sharp` / `pillow-heif` / ImageMagick** for image conversion. ffmpeg is already on the box and
   decodes HEIC natively without libheif (✅ verified against the Nokia HEIF conformance suite),
   so the conversion costs one subprocess and zero dependencies.
+- **Reading the JAN barcode above each receipt line.** Sound in theory — Japanese receipts
+  print a 13-digit code per line, digits OCR better than katakana, and a JAN is a globally
+  unique product id, so it would be a perfect catalogue key. Tried it (schema field +
+  prompt) and measured: **0 of 4 codes captured, and asking degraded everything else** —
+  the total came back 3302 against a real 2302, with amounts shuffled between lines. The
+  consistent finding for this model is that it gets *worse* the more you ask of it in one
+  pass. Revisit only with a stronger reader, or as a separate second pass over a crop.
 - **Multi-user as a near-term goal.** Parked as **D15** — real work in every store's schema, and
   only justified if **E1** happens.
 

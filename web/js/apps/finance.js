@@ -20,6 +20,7 @@ import {
 
 const TABS = [
   ['overview', 'Overview'],
+  ['income', 'Income'],
   ['history', 'History'],
   ['items', 'Items'],
   ['ledger', 'Ledger'],
@@ -42,6 +43,31 @@ const RANGES = [
   ['this-year', 'This year'],
   ['all', 'All time'],
 ];
+
+/** Replace a node's children in place, skipping the nulls conditional children produce.
+ *  Repainting one region instead of the whole panel is what keeps a focused input
+ *  focused — replaceChildren alone rejects the nulls, so it needs this wrapper. */
+const fill = (node, ...kids) => {
+  node.replaceChildren(...kids.flat(Infinity).filter(k => k !== null && k !== undefined && k !== false));
+  return node;
+};
+
+/**
+ * Put the caret in `node` once the browser has actually laid it out.
+ *
+ * Focus is only honoured on a node that is in the document, and the callers here focus a
+ * field they have just built — inside a modal that is still being assembled, or a table
+ * row appended microseconds ago. A frame's delay costs nothing perceptible and removes
+ * the whole class of "focus() silently did nothing". `select()` on top, because every
+ * caller is offering a field whose current contents are a starting point to replace
+ * (a fresh 0, a carried-over rate), not something to append to.
+ */
+const focusSoon = (node) => {
+  if (!node) return;
+  requestAnimationFrame(() => {
+    try { node.focus({ preventScroll: false }); node.select?.(); } catch { /* gone already */ }
+  });
+};
 
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const todayStr = () => new Date().toISOString().slice(0, 10);
@@ -128,7 +154,15 @@ export default {
             S.calendar = await get(`/finance/calendar?${qs()}`);
           }
           if (S.tab === 'ledger') await loadLedger();
-          if (S.tab === 'receipts') S.receipts = await get('/finance/receipts?limit=30');
+          if (S.tab === 'receipts') {
+            [S.receipts, S.learning] = await Promise.all([
+              get('/finance/receipts?limit=30'),
+              // Never fatal: the scan list is the point of this tab, and losing the
+              // "is it improving" strip must not take it down with it.
+              get('/finance/receipt-learning').catch(() => null),
+            ]);
+          }
+          if (S.tab === 'income') S.income = await get(`/finance/income?${qs()}`);
         }
         if (S.tab === 'history') sub.textContent = S.year;
         if (S.tab === 'items') {
@@ -153,15 +187,30 @@ export default {
     }
 
     function render() {
+      // Typing in a search box re-runs the query and re-renders the whole tab, which
+      // destroys the very field you are typing in — you get one word in, pause, and the
+      // next keystroke goes nowhere. Both search boxes carry .fin-search, so remember
+      // the caret across the rebuild instead of restructuring every tab around a
+      // toolbar that survives it.
+      const active = document.activeElement;
+      const hadFocus = active?.classList.contains('fin-search') && content.contains(active);
+      const caret = hadFocus ? [active.selectionStart, active.selectionEnd] : null;
+
       content.innerHTML = '';
       const view = {
         overview: renderOverview, history: renderHistory, items: renderItems,
-        ledger: renderLedger, plan: renderPlan, receipts: renderReceipts,
+        ledger: renderLedger, plan: renderPlan, receipts: renderReceipts, income: renderIncome,
       }[S.tab];
       if (!view) return;
       const ready = S.tab === 'history' ? S.yearData : S.tab === 'items' ? S.itemsData : S.data;
       if (!ready) return content.append(el('p', { class: 'empty' }, 'Loading…'));
       view();
+
+      const next = hadFocus && content.querySelector('.fin-search');
+      if (next) {
+        next.focus();
+        if (caret) next.setSelectionRange(caret[0], caret[1]);   // not jumped to the end
+      }
     }
 
     // ---------- shared bits ----------
@@ -243,9 +292,12 @@ export default {
               legend(cats, { format: money, onPick: drillCategory }))
             : teach('No expenses in this period.', 'Add one with the button top-right, or scan a receipt.')),
 
-          card(S.calendar ? 'Daily spend' : 'Calendar', S.calendar
-            ? calendarHeat(S.calendar.days, {
-              month: S.calendar.range.start.slice(0, 7), max: S.calendar.max, format: money,
+          // Daily NET, not daily spend: on a freelance income the question each day
+          // answers is "did I come out ahead", which spend alone cannot say.
+          card(S.calendar ? 'Daily net' : 'Calendar', S.calendar
+            ? calendarHeat(S.calendar.days.map(dy => ({ ...dy, value: dy.net })), {
+              month: S.calendar.range.start.slice(0, 7), max: S.calendar.maxNet || S.calendar.max,
+              format: money, signed: true,
               onPick: (dy) => { S.tab = 'ledger'; S.search = ''; paintTabs(); jumpToDay(dy.date); },
             })
             : el('p', { class: 'empty sm' }, '—')),
@@ -262,6 +314,24 @@ export default {
                 ? el('p', { class: 'fin-goal-hint' }, `${d.goal.majorPct}% of the stretch target`)
                 : null)
             : teach('No goal set.', 'Set a monthly side-income target in Plan.')),
+
+          // Year to date, because a month in isolation cannot tell you whether the year
+          // is working. This is also the number a tax return starts from.
+          d.ytd ? card(`${d.ytd.year} so far`, el('div', { class: 'fin-ytd' },
+            el('div', { class: 'fin-ytd-row' },
+              el('span', {}, 'In'), el('strong', { class: 'is-in' }, money(d.ytd.earned))),
+            el('div', { class: 'fin-ytd-row' },
+              el('span', {}, 'Out'), el('strong', { class: 'is-out' }, money(d.ytd.spent))),
+            el('div', { class: 'fin-ytd-row is-net' },
+              el('span', {}, 'Net'),
+              el('strong', { class: d.ytd.net < 0 ? 'is-neg' : '' },
+                (d.ytd.net < 0 ? '−' : '+') + fmtNum(Math.abs(d.ytd.net)) + ' ' + S.currency)),
+            el('div', { class: 'fin-ytd-meta' },
+              `${d.ytd.days} days · ${money(d.ytd.perDay)}/day`,
+              d.ytd.isCurrent ? ` · on track for ${compact(d.ytd.projectedNet)}` : '',
+              d.ytd.hours ? ` · ${d.ytd.hours} h logged` : ''),
+            el('button', { class: 'btn ghost xs', onclick: () => { S.tab = 'income'; paintTabs(); refresh(); } }, 'Income →')))
+            : null,
 
           card('Budgets', d.budgets.items.length
             ? el('ul', { class: 'fin-budget-mini' }, d.budgets.items.slice(0, 5).map(b =>
@@ -1045,6 +1115,309 @@ export default {
       }
     }
 
+    // ---------- income ----------
+    //
+    // Freelance income is not "expenses with the sign flipped". The questions are
+    // different — what came in today, from which client, for how many hours, and is the
+    // year ahead or behind — so it gets its own surface rather than a filter on the
+    // ledger. Everything here writes the same finance_txn rows the rest of the app reads,
+    // so a logged hour immediately moves the Overview net, the goal meter and the YTD.
+
+    /** How money can arrive. Each mode is a different arithmetic, not a different table. */
+    const INCOME_MODES = [
+      { id: 'amount', label: 'Amount', hint: 'A flat payment.' },
+      { id: 'hourly', label: 'Hourly', hint: 'Hours worked × your rate. Records the hours, so effective rate is knowable later.' },
+      { id: 'unit', label: 'Per item', hint: 'Pieces × price each — words, articles, lessons, deliveries.' },
+      { id: 'fee', label: 'Gross − fee', hint: 'What the client paid minus the platform cut. Logs the net you actually keep.' },
+    ];
+
+    function renderIncome() {
+      const d = S.income;
+      if (!d) { content.append(el('p', { class: 'empty sm' }, 'Loading…')); return; }
+      const s = d.summary, y = d.ytd;
+      const monthly = d.monthly.items.map(m => ({ label: MONTH_NAMES[Number(m.month.slice(5, 7)) - 1], a: m.earned, b: m.spent, net: m.net }));
+      const cats = d.byCategory.items.map(c => ({ label: c.category, value: c.total }));
+
+      content.append(
+        // ---- hero: this period, then the year ----
+        el('div', { class: 'fin-hero' },
+          el('div', { class: 'fin-hero-main' },
+            el('div', { class: 'fin-hero-label' }, 'Earned this period'),
+            el('div', { class: 'fin-hero-value' }, money(s.earned)),
+            el('div', { class: 'fin-hero-meta' },
+              s.hours
+                ? el('span', {}, `${s.hours} h logged · ${money(s.effectiveRate)}/h effective`)
+                : el('span', { class: 'muted' }, `${d.log.days.length} day${d.log.days.length === 1 ? '' : 's'} with income`))),
+          el('div', { class: 'fin-hero-split' },
+            el('div', { class: 'fin-hero-stat is-in' },
+              el('span', { class: 'fin-hero-stat-label' }, `${y.year} in`),
+              el('span', { class: 'fin-hero-stat-value' }, money(y.earned))),
+            el('div', { class: 'fin-hero-stat is-out' },
+              el('span', { class: 'fin-hero-stat-label' }, `${y.year} out`),
+              el('span', { class: 'fin-hero-stat-value' }, money(y.spent))),
+            el('div', { class: 'fin-hero-stat' },
+              el('span', { class: 'fin-hero-stat-label' }, 'Year net'),
+              el('span', { class: 'fin-hero-stat-value' + (y.net < 0 ? ' is-neg' : '') },
+                (y.net < 0 ? '−' : '+') + money(Math.abs(y.net)).replace(/^\S+\s/, S.currency + ' ')),
+              y.isCurrent
+                ? el('span', { class: 'fin-delta' }, `on track for ${compact(y.projectedNet)}`)
+                : null))),
+
+        // ---- quick log: the presets, one tap ----
+        el('div', { class: 'fin-quick' },
+          el('span', { class: 'fin-quick-label' }, 'Log'),
+          ...d.presets.map(p => el('button', {
+            class: 'fin-chip', title: presetHint(p),
+            onclick: () => logPreset(p),
+          }, p.name, el('span', { class: 'fin-chip-rate' }, presetRate(p)))),
+          el('button', { class: 'fin-chip is-add', onclick: () => openIncomeForm() }, '+ Log income'),
+          el('button', {
+            class: 'fin-chip is-add', title: 'Screenshot an Uber, delivery or marketplace payout screen and it fills the form in',
+            onclick: () => openEarningsShot(),
+          }, icon('image'), 'From a screenshot'),
+          el('button', { class: 'btn sm ghost', onclick: () => openPresetEditor() }, icon('plus'), 'New quick-log')),
+
+        el('div', { class: 'fin-grid' },
+          card('Twelve months', groupedBars(monthly, {
+            width: chartWidth(2), aLabel: 'earned', bLabel: 'spent',
+            onPick: (m, i) => {
+              const picked = d.monthly.items[i];
+              if (!picked) return;
+              S.month = picked.month; S.range = ''; rangeSel.value = ''; monthInput.value = S.month;
+              refresh();
+            },
+          }), 'span2'),
+
+          card('Where it came from', d.bySource.items.length
+            ? el('ul', { class: 'fin-source-list' }, d.bySource.items.map(src => el('li', {},
+              el('div', { class: 'fin-source-head' },
+                el('span', { class: 'fin-source-name' }, src.source),
+                el('span', { class: 'fin-source-total' }, money(src.total))),
+              meter(src.total, d.bySource.total, { format: money, bare: true }),
+              el('div', { class: 'fin-source-meta' },
+                `${src.share}% · ${src.count} entr${src.count === 1 ? 'y' : 'ies'}`,
+                src.rate ? ` · ${money(src.rate)}/h` : '',
+                src.lastDate ? ` · last ${src.lastDate}` : ''))))
+            : teach('Nothing yet this period.', 'Log something with a client name and it shows up here.')),
+
+          card('By type', cats.length
+            ? el('div', { class: 'fin-donut-wrap' },
+              donut(cats, { centerLabel: fmtNum(d.byCategory.total), centerSub: S.currency }),
+              legend(cats, { format: money }))
+            : teach('No income categorised yet.', 'Freelance, Main Job, Investment…')),
+
+          card('Side-income goal', d.goal && (d.goal.minGoal || d.goal.majorGoal)
+            ? el('div', {},
+              el('div', { class: 'fin-goal-label' }, prettyMonth(d.goal.month)),
+              meter(d.goal.progress, d.goal.minGoal || d.goal.majorGoal, { stretch: d.goal.majorGoal, format: money }),
+              d.goal.majorGoal && d.goal.majorPct !== null
+                ? el('p', { class: 'fin-goal-hint' }, `${d.goal.majorPct}% of the stretch target`)
+                : null)
+            : teach('No goal set.', 'A monthly side-income target lives in Plan.')),
+
+          d.recurring.length
+            ? card('Recurring income', el('ul', { class: 'fin-budget-mini' }, d.recurring.map(r =>
+              el('li', {},
+                el('span', { class: 'fin-budget-name' }, r.name),
+                el('span', { class: 'mono' }, `${money(r.amount)} · ${r.cadence}`)))))
+            : null,
+        ),
+
+        // ---- the daily log ----
+        card(`Daily log · ${d.log.days.length} day${d.log.days.length === 1 ? '' : 's'}`,
+          d.log.days.length
+            ? el('div', { class: 'fin-daylog' }, d.log.days.map(day => el('div', { class: 'fin-day' },
+              el('div', { class: 'fin-day-head' },
+                el('span', { class: 'fin-day-date' }, dayLabel(day.date)),
+                el('span', { class: 'grow' }),
+                day.hours ? el('span', { class: 'fin-day-hours' }, `${day.hours} h`) : null,
+                el('span', { class: 'fin-day-total' }, money(day.total))),
+              el('ul', { class: 'fin-day-entries' }, day.entries.map(t => el('li', {
+                ondblclick: () => openTxnEditor(t),
+                oncontextmenu: (e) => {
+                  e.preventDefault();
+                  menu(e.clientX, e.clientY, [
+                    { label: 'Edit', icon: 'edit', onclick: () => openTxnEditor(t) },
+                    { label: 'Duplicate to today', icon: 'plus', onclick: () => openTxnEditor({ ...t, id: null, date: todayStr() }) },
+                    '-',
+                    { label: 'Delete', icon: 'trash', danger: true, onclick: () => removeTxn(t) },
+                  ]);
+                },
+              },
+                el('span', { class: 'fin-entry-src' }, t.merchant || t.category),
+                el('span', { class: 'fin-entry-note' },
+                  [t.units && t.unit ? `${t.units} ${t.unit}${t.units === 1 ? '' : 's'}` : '', t.note].filter(Boolean).join(' · ')),
+                el('span', { class: 'fin-entry-amt' }, money(t.amountBase))))))))
+            : teach('Nothing logged in this period.', 'Use a quick-log chip above, or “Log income” for hours, per-item and platform-fee entries.'),
+          'span3'),
+      );
+    }
+
+    const presetRate = (p) => p.payUnit === 'hour' ? `${money(p.amount)}/h`
+      : p.payUnit === 'minute' ? `${money(p.amount)}/min` : money(p.amount);
+    const presetHint = (p) => `${p.category}${p.isMainJob ? ' · main job' : ''} — ${presetRate(p)}`;
+    const dayLabel = (iso) => {
+      const t = todayStr();
+      if (iso === t) return 'Today';
+      const y = new Date(Date.parse(t) - 86400000).toISOString().slice(0, 10);
+      if (iso === y) return 'Yesterday';
+      return new Date(iso + 'T00:00:00').toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+    };
+
+    /** One tap on a quick-log chip. Hourly/per-minute presets ask for the amount of work. */
+    async function logPreset(p) {
+      const body = { date: todayStr() };
+      if (p.payUnit === 'flat') {
+        body.count = 1;
+      } else {
+        const field = el('input', { class: 'input', type: 'number', step: '0.25', min: '0.25', value: '1' });
+        const ok = await modal({
+          title: p.name,
+          sub: `${presetRate(p)} — how ${p.payUnit === 'hour' ? 'many hours' : 'long in minutes'}?`,
+          body: el('div', { class: 'fin-form' }, row(p.payUnit === 'hour' ? 'Hours' : 'Minutes', field)),
+          actions: [{ label: 'Cancel', value: false }, { label: 'Log', value: true, kind: 'primary' }],
+        });
+        if (!ok) return;
+        body.units = Number(field.value) || 1;
+      }
+      try {
+        const r = await post(`/finance/presets/${p.id}/log`, body);
+        toast(`Logged ${money(r.created.reduce((a, t) => a + t.amountBase, 0))}`, 'ok');
+        refresh();
+      } catch (e) { toast(e.message, 'err'); }
+    }
+
+    /**
+     * Log income, in whichever shape the money actually arrived.
+     *
+     * The mode only changes the arithmetic that produces the amount — every mode writes
+     * one ordinary income row, so nothing downstream has to know which was used. Hourly
+     * and per-item additionally record `units`, which is what makes "what am I really
+     * earning per hour" answerable months later.
+     */
+    async function openIncomeForm(seed = {}) {
+      let mode = seed.mode || 'hourly';
+      const cats = S.income?.categories || S.categories.income || [];
+      const sources = S.income?.sources || [];
+
+      const date = el('input', { class: 'input', type: 'date', value: seed.date || todayStr() });
+      const source = el('input', { class: 'input', placeholder: 'client or platform', value: seed.merchant || '', list: 'fin-src-list' });
+      const srcList = el('datalist', { id: 'fin-src-list' }, sources.map(x => el('option', { value: x.value })));
+      const cat = el('select', { class: 'input select' }, cats.map(c => el('option', { value: c, selected: c === (seed.category || 'Freelance') }, c)));
+      const cur = el('select', { class: 'input select' },
+        (S.income?.settings?.codes || [S.currency]).map(c => el('option', { value: c, selected: c === S.currency }, c)));
+      const note = el('input', { class: 'input', placeholder: 'what was it for (optional)', value: seed.note || '' });
+      const mainJob = el('input', { type: 'checkbox' });
+
+      // mode-specific inputs
+      const amount = el('input', { class: 'input', type: 'number', step: '1', min: '0', placeholder: '0' });
+      const rate = el('input', { class: 'input', type: 'number', step: '1', min: '0', placeholder: 'rate' });
+      const qty = el('input', { class: 'input', type: 'number', step: '0.25', min: '0', placeholder: 'hours', value: '1' });
+      const gross = el('input', { class: 'input', type: 'number', step: '1', min: '0', placeholder: 'gross' });
+      const feePct = el('input', { class: 'input', type: 'number', step: '0.1', min: '0', max: '100', placeholder: '%', value: '10' });
+      const feeFlat = el('input', { class: 'input', type: 'number', step: '1', min: '0', placeholder: 'or fixed fee' });
+
+      // A seed carries numbers when the form was opened from a read payout screen. They
+      // are only ever a starting point — the fields stay editable and nothing is logged
+      // until the user presses the button, which is the whole reason this fills a form
+      // instead of writing a row.
+      for (const [node, v] of [[amount, seed.amount], [rate, seed.rate], [qty, seed.qty],
+        [gross, seed.gross], [feeFlat, seed.fee]]) {
+        if (v !== undefined && v !== null && v !== '') node.value = v;
+      }
+      if (seed.currency) cur.value = seed.currency;
+
+      const preview = el('div', { class: 'fin-form-preview' });
+      const modeRow = el('div', { class: 'fin-chips' });
+      const fieldSlot = el('div', {});
+
+      const computed = () => {
+        if (mode === 'amount') return { amount: Number(amount.value) || 0 };
+        if (mode === 'hourly') return { amount: (Number(rate.value) || 0) * (Number(qty.value) || 0), units: Number(qty.value) || 0, unit: 'hour' };
+        if (mode === 'unit') return { amount: (Number(rate.value) || 0) * (Number(qty.value) || 0), units: Number(qty.value) || 0, unit: 'item' };
+        const g = Number(gross.value) || 0;
+        const fee = Number(feeFlat.value) > 0 ? Number(feeFlat.value) : g * (Number(feePct.value) || 0) / 100;
+        return { amount: Math.max(0, g - fee), fee: Math.round(fee * 100) / 100, gross: g };
+      };
+
+      // Repainted in TWO independent pieces, and the split is not cosmetic.
+      //
+      // This form used to rebuild the chips and the field slot on every keystroke, to keep
+      // the running total honest. Emptying the slot detaches the <input> the caret is in,
+      // and a detached input is a blurred one — so typing "1200" into Amount landed as
+      // four separate one-character edits, each into a freshly re-attached empty-ish
+      // field. Multi-digit numbers were effectively impossible to type. The live total is
+      // the only thing that has to react to typing, and it contains nothing focusable, so
+      // that is the only thing a keystroke now repaints.
+      const paintPreview = () => {
+        const c = computed();
+        fill(preview,
+          el('span', { class: 'fin-form-preview-label' }, INCOME_MODES.find(m => m.id === mode).hint),
+          el('strong', {}, c.amount > 0 ? `You keep ${money(c.amount)}` : 'Enter the numbers'),
+          mode === 'fee' && c.fee > 0 ? el('span', { class: 'muted' }, ` (fee ${money(c.fee)})`) : null);
+      };
+
+      // The first field of the chosen mode is the one you always type into, so switching
+      // mode puts the caret there — a mode chip is a click you make on the way to typing,
+      // never a destination.
+      let firstField = amount;
+      const paintMode = ({ focus = false } = {}) => {
+        fill(modeRow, INCOME_MODES.map(m => el('button', {
+          class: 'fin-chip' + (m.id === mode ? ' is-on' : ''),
+          onclick: () => { mode = m.id; paintMode({ focus: true }); },
+        }, m.label)));
+        const fieldsFor = mode === 'amount' ? [['Amount', amount]]
+          : mode === 'hourly' ? [['Hours', qty], ['Rate per hour', rate]]
+            : mode === 'unit' ? [['How many', qty], ['Price each', rate]]
+              : [['Gross paid', gross], ['Platform fee %', feePct], ['…or fixed fee', feeFlat]];
+        fill(fieldSlot, fieldsFor.map(([label, node]) => row(label, node)));
+        firstField = fieldsFor[0][1];
+        paintPreview();
+        if (focus) focusSoon(firstField);
+      };
+      for (const inp of [amount, rate, qty, gross, feePct, feeFlat]) inp.addEventListener('input', paintPreview);
+      paintMode();
+
+      // Enter anywhere in the numbers logs it, so the whole entry is keyboard-only:
+      // open, type, Enter. Without this the caret has to leave the field it is already in
+      // to reach a button, which is the slow half of logging an hour of work.
+      for (const inp of [amount, rate, qty, gross, feePct, feeFlat]) {
+        inp.addEventListener('keydown', (e) => {
+          if (e.key !== 'Enter') return;
+          e.preventDefault();
+          inp.closest('.modal')?.querySelector('.modal-actions .btn.primary')?.click();
+        });
+      }
+
+      // modal() focuses the first focusable thing in the body, which here is a mode chip.
+      // The mode is usually already right, so land in the number instead.
+      focusSoon(firstField);
+      const ok = await modal({
+        title: 'Log income', sub: seed.readFrom, wide: true,
+        body: el('div', { class: 'fin-form' },
+          modeRow, fieldSlot, preview, srcList,
+          row('Date', date), row('From', source), row('Type', cat), row('Currency', cur),
+          row('Note', note),
+          el('label', { class: 'fin-form-check' }, mainJob, el('span', {}, 'Main job (excluded from the side-income goal)'))),
+        actions: [{ label: 'Cancel', value: null }, { label: 'Log it', value: true, kind: 'primary' }],
+      });
+      if (!ok) return;
+
+      const c = computed();
+      if (!(c.amount > 0)) return toast('That comes to zero — check the numbers', 'err');
+      const noteParts = [note.value.trim()];
+      if (mode === 'fee' && c.fee > 0) noteParts.push(`gross ${c.gross} − fee ${c.fee}`);
+      try {
+        await post('/finance/txns', {
+          date: date.value, kind: 'income', amount: c.amount, currency: cur.value,
+          category: cat.value, merchant: source.value.trim(), note: noteParts.filter(Boolean).join(' · '),
+          isMainJob: mainJob.checked, units: c.units || 0, unit: c.unit || '',
+        });
+        toast(`Logged ${money(c.amount)}`, 'ok');
+        refresh();
+      } catch (e) { toast(e.message, 'err'); }
+    }
+
     // ---------- receipts ----------
     //
     // A vision model reading a crumpled thermal receipt gets most lines right and then
@@ -1057,6 +1430,55 @@ export default {
     // Which receipts are expanded, and the in-progress edit for each. Kept on the app
     // state (not the DOM) so a background refresh can't discard half-typed corrections.
     S.openReceipts = S.openReceipts || {};
+    S.rcView = S.rcView || {};   // per-receipt zoom/rotate/pan for the photo pane
+
+    /**
+     * How sure the reading is, as a bar you can read at a glance.
+     *
+     * The number matters less than the sentence under it. "78/100" tells a reviewer
+     * nothing actionable; "the lines come to 200 more than the receipt says" tells them
+     * exactly where to look. So the meter is the summary and the reasons are the content —
+     * and the reasons are the same checks that drove the automatic re-reads, which is why
+     * a scan that was read three times and still scores 40 is worth opening.
+     */
+    function confidenceMeter(conf) {
+      if (!conf || typeof conf.score !== 'number') return null;
+      const LABEL = { high: 'Confident', good: 'Probably right', fair: 'Worth checking', low: 'Check this carefully' };
+      const bad = conf.reasons?.filter(r => r.delta < 0) || [];
+      const good = conf.reasons?.filter(r => r.delta > 0) || [];
+
+      return el('div', { class: 'fin-conf is-' + conf.level },
+        el('div', { class: 'fin-conf-head' },
+          el('span', { class: 'fin-conf-score' }, String(conf.score)),
+          el('div', { class: 'fin-conf-bar' }, el('i', { style: { width: conf.score + '%' } })),
+          el('span', { class: 'fin-conf-label' }, LABEL[conf.level] || 'Unscored')),
+        conf.reads > 1
+          ? el('div', { class: 'fin-conf-reads' },
+            `Read ${conf.reads} times automatically`
+            + (conf.angle ? `, turning it ${conf.angle}° on the way` : '')
+            + ' — this is the best of them.')
+          : null,
+        bad.length || good.length
+          ? el('ul', { class: 'fin-conf-why' },
+            bad.map(r => el('li', { class: 'is-bad' }, r.text)),
+            good.map(r => el('li', { class: 'is-ok' }, r.text)))
+          : null);
+    }
+
+    /**
+     * Already in the ledger. Shown while reviewing rather than only on the way out,
+     * because finding out that a scan was a duplicate only after correcting all its
+     * lines is the annoying version of a guardrail.
+     */
+    function duplicateBanner(dupe, currency) {
+      if (!dupe) return null;
+      const m = (n) => `${currency || S.currency} ${Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+      return el('div', { class: 'fin-chk is-bad' }, icon('shield'),
+        el('span', {},
+          el('strong', {}, 'Already logged. '),
+          `${dupe.merchant || 'A receipt'} on ${dupe.date} for ${m(dupe.total)} is in the ledger with the same items `
+          + 'and prices. This copy cannot be added — delete it, or undo the original if that one was wrong.'));
+    }
 
     /** The reconciliation banner — the single most useful thing on this screen. */
     function checkBanner(chk, currency) {
@@ -1084,14 +1506,80 @@ export default {
     }
 
     /** The editable draft for one receipt. */
+    /**
+     * The photo, beside the fields, so you can actually check the reading.
+     *
+     * This is the difference between "trust the model" and "verify it": a thermal receipt
+     * misread of 牛乳 as 牛丼 is invisible in a text field and obvious against the paper.
+     * Zoom to read the small print, rotate because a photo taken sideways is common, and
+     * drag to pan when zoomed in. Kept out of the phone view — there is no room beside the
+     * fields there, and the photo is already in your hand.
+     */
+    function receiptViewer(r) {
+      const st = (S.rcView[r.id] ||= { zoom: 1, rot: 0, x: 0, y: 0 });
+      const img = el('img', { class: 'fin-rc-img', src: mediaUrl(`/uploads/${r.uploadId}`), alt: 'the receipt photo', draggable: 'false' });
+      const stage = el('div', { class: 'fin-rc-stage' }, img);
+
+      const apply = () => {
+        img.style.transform = `translate(${st.x}px, ${st.y}px) scale(${st.zoom}) rotate(${st.rot}deg)`;
+        stage.style.cursor = st.zoom > 1 ? 'grab' : 'default';
+      };
+      const zoom = (mult) => { st.zoom = Math.min(8, Math.max(1, st.zoom * mult)); if (st.zoom === 1) { st.x = 0; st.y = 0; } apply(); };
+
+      // Wheel zooms, so the page does not scroll away under you while you are reading.
+      stage.addEventListener('wheel', (e) => { e.preventDefault(); zoom(e.deltaY < 0 ? 1.15 : 1 / 1.15); }, { passive: false });
+      stage.addEventListener('dblclick', () => { st.zoom = st.zoom > 1 ? 1 : 3; st.x = 0; st.y = 0; apply(); });
+      stage.addEventListener('pointerdown', (e) => {
+        if (st.zoom <= 1) return;
+        e.preventDefault();
+        const x0 = e.clientX - st.x, y0 = e.clientY - st.y;
+        stage.setPointerCapture(e.pointerId);
+        stage.style.cursor = 'grabbing';
+        const move = (ev) => { st.x = ev.clientX - x0; st.y = ev.clientY - y0; apply(); };
+        const up = () => { stage.removeEventListener('pointermove', move); stage.removeEventListener('pointerup', up); stage.style.cursor = 'grab'; };
+        stage.addEventListener('pointermove', move);
+        stage.addEventListener('pointerup', up);
+      });
+      apply();
+
+      // Rotating re-renders the editor, not just the image: the action row grows a
+      // "Re-read at N°" button once the angle differs from what the model was given.
+      const btn = (label, title, fn, rerender) => el('button', {
+        class: 'btn ghost xs', title,
+        onclick: () => { fn(); apply(); if (rerender) render(); },
+      }, label);
+      return el('div', { class: 'fin-rc-photo' },
+        stage,
+        el('div', { class: 'fin-rc-tools' },
+          btn('−', 'Zoom out', () => zoom(1 / 1.3)),
+          btn('+', 'Zoom in', () => zoom(1.3)),
+          btn('⟲', 'Rotate left', () => { st.rot = (st.rot - 90) % 360; }, true),
+          btn('⟳', 'Rotate right', () => { st.rot = (st.rot + 90) % 360; }, true),
+          btn('Reset', 'Back to fit', () => { st.zoom = 1; st.rot = 0; st.x = 0; st.y = 0; }, true),
+          el('a', { class: 'btn ghost xs', href: mediaUrl(`/uploads/${r.uploadId}`), target: '_blank', rel: 'noopener', title: 'Open the full-size photo' }, '↗')));
+    }
+
     function receiptEditor(r) {
       const draft = S.openReceipts[r.id];
       const cats = S.categories?.expense || [];
-      const wrap = el('div', { class: 'fin-rc-edit' });
 
-      const redraw = () => {
-        // Recompute the check locally so the banner reacts as you type, without a
-        // round trip. The server recomputes it authoritatively on save.
+      // Built once, then repainted in four independent regions: the reconciliation
+      // banner, the category chips, the line rows, and the action row.
+      //
+      // This used to rebuild the whole editor on every keystroke in a number field.
+      // That tore the focused <input> out of the document and took the caret with it,
+      // so typing "112" into a price landed as three separate one-character edits with
+      // the field deselected after each — the value ended up as "2". Nothing repainted
+      // below contains a field you can be typing in, except the line table, which is
+      // only rebuilt when a row is actually added or removed.
+      const chkSlot = el('div', { class: 'fin-rc-slot' });
+      const chipRow = el('div', { class: 'fin-chips' });
+      const lineBody = el('tbody');
+      const actionRow = el('div', { class: 'fin-rc-actions' });
+
+      /** Recompute the check locally so the banner reacts as you type, without a round
+       *  trip. The server recomputes it authoritatively on save. */
+      const recheck = () => {
         const sum = draft.items.reduce((s, i) => s + (Number(i.amount) || 0), 0);
         const expected = draft.subtotal ?? (draft.total != null && draft.tax != null ? draft.total - draft.tax : draft.total);
         const delta = Math.round((sum - (expected ?? sum)) * 100) / 100;
@@ -1100,27 +1588,143 @@ export default {
           : expected == null ? { verdict: 'unchecked', itemsSum: sum, expected: null, delta: 0 }
             : Math.abs(delta) <= tol ? { verdict: 'balanced', itemsSum: sum, expected, delta }
               : { verdict: delta > 0 ? 'overshoot' : 'short', itemsSum: sum, expected, delta };
-        wrap.innerHTML = '';
-        wrap.append(body());
+        fill(chkSlot, checkBanner(draft.check, draft.currency));
+        paintActions();          // "Log ¥…" and "Split N" both read off the draft
       };
 
+      // step 'any': receipts in a currency with decimals (and the rounding the model
+      // sometimes produces) are legitimate values, and step="1" only marks them invalid
+      // without stopping them — a red field for a correct number.
       const num = (obj, key, opts = {}) => el('input', {
-        class: 'input xs num', type: 'number', step: opts.step || '1', min: '0',
+        class: 'input xs num', type: 'number', step: opts.step || 'any', min: '0',
+        inputmode: opts.step === '1' ? 'numeric' : 'decimal',
         value: obj[key] ?? '',
         oninput: (e) => {
           const v = e.target.value.trim();
           obj[key] = v === '' ? null : Number(v);
-          if (opts.live) redraw();
+          if (opts.live) recheck();
         },
+        onkeydown: opts.onkeydown,
       });
 
-      const body = () => el('div', {},
-        checkBanner(draft.check, draft.currency),
+      /** Mark a line as hand-corrected without repainting the row the caret is in. */
+      const markEdited = (it, e) => { it.edited = true; e.target.closest('tr')?.classList.add('is-edited'); };
+
+      const paintChips = () => fill(chipRow, cats.map(c => el('button', {
+        class: 'fin-chip' + (c === draft.category ? ' is-on' : ''),
+        onclick: () => { draft.category = c; paintChips(); },
+      }, c)));
+
+      /**
+       * Add a line and put the caret in it.
+       *
+       * Typing a missed line is a four-field job, and it starts at the left. Leaving the
+       * caret wherever it was means every added line costs a click before it costs a
+       * keystroke — which is most of the friction in correcting a receipt the model read
+       * badly, because that is exactly when several lines have to be added in a row.
+       */
+      const addLine = () => {
+        draft.items.push({ printed: '', name: '', qty: 1, amount: null });
+        paintLines({ focus: draft.items.length - 1 });
+        recheck();
+      };
+
+      /** Tab out of the last Amount and you are done with that line, so Enter there means
+       *  "next line" — the same key that ends a row in every spreadsheet. Enter anywhere
+       *  else in the table means the same thing, so the shortcut needs no explaining. */
+      const lineKeys = (i) => (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        if (i === draft.items.length - 1) addLine();
+        else focusSoon(lineBody.children[i + 1]?.querySelector('input'));
+      };
+
+      const lineRow = (it, i) => el('tr', { class: (it.warn?.length ? 'is-suspect' : '') + (it.edited ? ' is-edited' : '') },
+        // Printed text is EDITABLE, not a label. When the OCR misreads the characters
+        // themselves — 牛乳 as 牛丼 — fixing only the tidy name leaves the catalogue
+        // keyed on the wrong string, so the same mistake recurs on the next receipt.
+        el('td', {}, el('input', {
+          class: 'input xs mono', value: it.printed || '', title: 'Exactly as printed on the paper — correct it if the reading is wrong',
+          oninput: e => { it.printed = e.target.value; markEdited(it, e); },
+          onkeydown: lineKeys(i),
+        })),
+        el('td', {},
+          el('input', {
+            class: 'input xs', value: it.name || '',
+            oninput: e => { it.name = e.target.value; markEdited(it, e); },
+            onkeydown: lineKeys(i),
+          }),
+          it.warn?.length ? el('div', { class: 'fin-rc-warn' }, it.warn.join(' · ')) : null),
+        el('td', { class: 'num' }, num(it, 'qty', { step: '1', onkeydown: lineKeys(i) })),
+        el('td', { class: 'num' }, num(it, 'amount', { live: true, onkeydown: lineKeys(i) })),
+        el('td', {}, el('button', {
+          class: 'btn ghost xs', title: 'Not on the receipt — remove it',
+          onclick: () => { draft.items.splice(i, 1); paintLines(); recheck(); },
+        }, icon('trash'))));
+
+      /** `focus` is a row index: repainting the table replaces every <input> in it, so the
+       *  caret has to be placed on the new node, after the rebuild, not before. */
+      const paintLines = ({ focus = -1 } = {}) => {
+        fill(lineBody, draft.items.length
+          ? draft.items.map(lineRow)
+          : el('tr', {}, el('td', { colspan: '5', class: 'muted' }, 'No lines. Add one, or just log the total.')));
+        if (focus >= 0) focusSoon(lineBody.children[focus]?.querySelector('input'));
+      };
+
+      const paintActions = () => {
+        const rot = ((S.rcView[r.id]?.rot || 0) % 360 + 360) % 360;
+        fill(actionRow,
+          el('button', {
+            class: 'btn sm', title: 'Add a line and start typing it (Enter on the last line does the same)',
+            onclick: addLine,
+          }, icon('plus'), 'Add a line'),
+          el('span', { class: 'grow' }),
+          el('button', {
+            class: 'btn sm', title: 'Read the photo again. Worth it after turning it, after picking a different reader in Settings, or once corrections have been learned since — otherwise the same photo gives the same reading',
+            onclick: () => rescanReceipt(r),
+          }, icon('refresh'), 'Re-read'),
+          // Rotate the preview until it reads right, then have the model read THAT.
+          rot
+            ? el('button', {
+              class: 'btn sm primary', title: 'Save this angle and read it again',
+              onclick: () => rescanReceipt(r, rot),
+            }, `Re-read at ${rot}°`)
+            : null,
+          el('button', { class: 'btn sm', onclick: () => saveDraft(r, false) }, 'Save corrections'),
+          el('button', {
+            class: 'btn sm primary', title: 'One ledger row for the whole receipt',
+            onclick: () => saveDraft(r, 'total'),
+          }, `Log ${money(draft.total)}`),
+          draft.items.length > 1
+            ? el('button', {
+              class: 'btn sm', title: 'One ledger row per line item',
+              onclick: () => saveDraft(r, 'items'),
+            }, `Split ${draft.items.length}`)
+            : null);
+      };
+
+      const fields = el('div', { class: 'fin-rc-fields' },
+        duplicateBanner(r.duplicate, draft.currency),
+        confidenceMeter(draft.confidence),
+        chkSlot,
+
+        // Angle was a leading cause of bad reads, so when the photo was straightened
+        // automatically, say so — and make the other direction one click away, because
+        // the direction is a heuristic and a wrong guess should cost almost nothing.
+        r.oriented?.rotated
+          ? el('div', { class: 'fin-chk is-learn' }, icon('refresh'),
+            el('span', {}, `Straightened it ${r.oriented.rotated === 270 ? 'anticlockwise' : r.oriented.rotated + '°'} before reading — ${r.oriented.why}. `,
+              el('button', { class: 'fin-linkbtn', onclick: () => rescanReceipt(r, 180) }, 'turned the wrong way?')))
+          : null,
 
         draft.learned?.length
           ? el('div', { class: 'fin-chk is-learn' }, icon('sparkle'),
             el('span', {}, `Applied what you taught it: `,
-              ...draft.learned.map(l => el('code', {}, l.kind === 'drop' ? `dropped “${l.line}”` : `renamed “${l.line}” → ${l.to}`))))
+              ...draft.learned.map(l => el('code', {},
+                l.kind === 'drop' ? `dropped “${l.line}”`
+                  : l.kind === 'amount' ? `“${l.line}” ${l.from} → ${l.to}`
+                    : l.kind === 'merchant' ? `shop “${l.line}” → ${l.to}`
+                      : `renamed “${l.line}” → ${l.to}`))))
           : null,
         draft.dropped?.length
           ? el('div', { class: 'fin-chk is-warn' }, icon('eye'),
@@ -1139,58 +1743,55 @@ export default {
           el('label', {}, el('span', {}, 'Tax'), num(draft, 'tax', { live: true })),
           el('label', {}, el('span', {}, 'Total'), num(draft, 'total', { live: true }))),
 
-        cats.length
-          ? el('div', { class: 'fin-chips' }, cats.map(c => el('button', {
-            class: 'fin-chip' + (c === draft.category ? ' is-on' : ''),
-            onclick: () => { draft.category = c; redraw(); },
-          }, c)))
-          : null,
+        cats.length ? chipRow : null,
 
-        // line items
         el('table', { class: 'fin-rc-lines' },
           el('thead', {}, el('tr', {},
             el('th', {}, 'Printed on the receipt'), el('th', {}, 'Item'),
             el('th', { class: 'num' }, 'Qty'), el('th', { class: 'num' }, 'Amount'), el('th', {}))),
-          el('tbody', {}, draft.items.length
-            ? draft.items.map((it, i) => el('tr', { class: it.warn?.length ? 'is-suspect' : '' },
-              el('td', {}, el('code', { class: 'fin-rc-printed', title: it.printed || '' }, it.printed || '—')),
-              el('td', {},
-                el('input', { class: 'input xs', value: it.name || '', oninput: e => { it.name = e.target.value; } }),
-                it.warn?.length ? el('div', { class: 'fin-rc-warn' }, it.warn.join(' · ')) : null),
-              el('td', { class: 'num' }, num(it, 'qty')),
-              el('td', { class: 'num' }, num(it, 'amount', { live: true })),
-              el('td', {}, el('button', {
-                class: 'btn ghost xs', title: 'Not on the receipt — remove it',
-                onclick: () => { draft.items.splice(i, 1); redraw(); },
-              }, icon('trash')))))
-            : [el('tr', {}, el('td', { colspan: '5', class: 'muted' }, 'No lines. Add one, or just log the total.'))])),
+          lineBody),
 
-        el('div', { class: 'fin-rc-actions' },
-          el('button', {
-            class: 'btn sm', onclick: () => {
-              draft.items.push({ printed: '', name: '', qty: 1, amount: null });
-              redraw();
-            },
-          }, icon('plus'), 'Add a line'),
-          el('span', { class: 'grow' }),
-          el('button', { class: 'btn sm', onclick: () => saveDraft(r, false) }, 'Save corrections'),
-          el('button', {
-            class: 'btn sm primary', title: 'One ledger row for the whole receipt',
-            onclick: () => saveDraft(r, 'total'),
-          }, `Log ${money(draft.total)}`),
-          draft.items.length > 1
-            ? el('button', {
-              class: 'btn sm', title: 'One ledger row per line item',
-              onclick: () => saveDraft(r, 'items'),
-            }, `Split ${draft.items.length}`)
-            : null),
+        actionRow,
 
         r.edited
           ? el('div', { class: 'fin-rc-note' }, 'You have already corrected this scan; the model’s original reading is kept for comparison.')
           : null);
 
-      redraw();
-      return wrap;
+      paintChips();
+      paintLines();
+      recheck();          // paints the banner and the action row
+
+      // Two columns on a desktop: the fields you type into, and the paper you check them
+      // against. Falls back to one column when the pane is narrow.
+      return el('div', { class: 'fin-rc-edit' },
+        r.uploadId ? el('div', { class: 'fin-rc-split' }, fields, receiptViewer(r)) : fields);
+    }
+
+    /** Ask the model to read the photo again. */
+    async function rescanReceipt(r, rotate) {
+      const draft = S.openReceipts[r.id];
+      const touched = draft && (r.edited || draft.items?.some(i => i.edited));
+      if (touched && !await confirmBox(
+        'Re-read this photo?',
+        'Your corrections to this scan will be replaced by the new reading.', 'Re-read')) return;
+      try {
+        toast(rotate ? `Rotating ${rotate}° and reading again…` : 'Reading it again — a few seconds…');
+        const fresh = await post(`/finance/receipts/${r.id}/rescan`, rotate ? { rotate } : {});
+        if (rotate) delete S.rcView[r.id];        // the stored photo moved; drop the view transform
+        S.receipts = await get('/finance/receipts?limit=30');
+        if (fresh.status === 'parsed' && fresh.parsed) {
+          S.openReceipts[r.id] = JSON.parse(JSON.stringify({ items: [], ...fresh.parsed }));
+          const conf = fresh.parsed.confidence;
+          const c = fresh.parsed.check;
+          const how = conf ? ` — ${conf.score}% sure${conf.reads > 1 ? ` after ${conf.reads} passes` : ''}` : '';
+          toast(c && c.ok === false ? `Read again${how}, but the lines still do not add up` : `Read again${how}`,
+            c && c.ok === false ? '' : 'ok');
+        } else {
+          delete S.openReceipts[r.id];
+          toast(fresh.error || 'Could not read it that time either', 'err');
+        }
+        render();
+      } catch (e) { toast(e.message, 'err'); }
     }
 
     /** Pull an applied receipt back out of the ledger and open it for correction. */
@@ -1222,7 +1823,7 @@ export default {
           currency: draft.currency, time: draft.time, paymentMethod: draft.paymentMethod,
           items: draft.items
             .filter(it => (it.name || '').trim() && Number(it.amount) > 0)
-            .map(it => ({ printed: it.printed || it.name, name: it.name, qty: it.qty || 1, amount: it.amount })),
+            .map(it => ({ printed: it.printed || it.name, name: it.name, qty: it.qty || 1, amount: it.amount, edited: !!it.edited })),
         };
         await patch(`/finance/receipts/${r.id}`, payload);
         if (!applyMode) {
@@ -1237,7 +1838,47 @@ export default {
         }
         S.receipts = await get('/finance/receipts?limit=30');
         await refresh();
-      } catch (e) { toast(e.message, 'err'); }
+      } catch (e) {
+        toast(e.message, 'err');
+        await refreshReceipts();
+      }
+    }
+
+    /**
+     * What the scanner has picked up, and whether it is working.
+     *
+     * A correction loop that cannot show its work is indistinguishable from one that does
+     * nothing, and the user has no way to tell which they have. So: how many corrections
+     * are stored, how many are trusted enough to fire on their own, how much vocabulary
+     * the catalogue has to steer the reading with, and — the only number that really
+     * answers the question — how the last ten scans scored against the ten before them.
+     */
+    function learningStrip() {
+      const L = S.learning;
+      if (!L || (!L.corrections.total && !L.vocab.confirmed && L.confidence.recent === null)) return null;
+      const stat = (value, label, title) => el('div', { class: 'fin-learn-stat', title: title || '' },
+        el('strong', {}, value), el('span', {}, label));
+
+      const t = L.confidence.trend;
+      return el('div', { class: 'fin-learn' },
+        icon('sparkle'),
+        stat(L.corrections.active, `correction${L.corrections.active === 1 ? '' : 's'} in force`,
+          `${L.corrections.total} recorded in total; one fires automatically once you have made it ${L.corrections.activeAfter} times.`),
+        stat(L.vocab.confirmed, 'confirmed product names',
+          `${L.vocab.aliases} printed strings mapped across ${L.vocab.items} catalogue items. These are fed back into the prompt so the model prefers words you actually buy.`),
+        L.confidence.recent !== null
+          ? stat(`${L.confidence.recent}%`,
+            t === null ? 'average confidence'
+              : t > 0 ? `average confidence · up ${t}`
+                : t < 0 ? `average confidence · down ${-t}` : 'average confidence · steady',
+            L.confidence.before !== null
+              ? `The last 10 scans averaged ${L.confidence.recent}, the 10 before them ${L.confidence.before}.`
+              : `Across the last ${L.confidence.n} scored scans.`)
+          : null,
+        el('span', { class: 'grow' }),
+        L.scans.total
+          ? el('span', { class: 'fin-learn-note' }, `${L.scans.edited} of ${L.scans.total} scans corrected by hand`)
+          : null);
     }
 
     function renderReceipts() {
@@ -1246,11 +1887,13 @@ export default {
         el('div', { class: 'fin-toolbar' },
           el('button', { class: 'btn sm primary', onclick: openReceiptFlow }, icon('sparkle'), 'Scan a receipt'),
           el('span', { class: 'fin-count' }, 'Read on this machine by the local vision model — no image leaves the network. Check it before it lands in the ledger.')),
+        learningStrip(),
         list.length
           ? el('ul', { class: 'fin-receipt-list' }, list.map(r => {
             const p = r.parsed || {};
             const items = p.items || [];
             const suspect = p.check && p.check.ok === false;
+            const conf = r.confidence;
             const open = !!S.openReceipts[r.id];
             return el('li', { class: 'fin-receipt is-' + r.status + (suspect ? ' is-suspect' : '') + (open ? ' is-open' : '') },
               el('div', { class: 'fin-receipt-row' },
@@ -1261,6 +1904,14 @@ export default {
                 el('div', { class: 'fin-receipt-main' },
                   el('div', { class: 'fin-receipt-title' },
                     p.merchant || (r.status === 'failed' ? 'Could not read' : 'Unread'),
+                    // The score first: it is the one badge that says how much of the rest
+                    // of this row to believe.
+                    conf ? el('span', {
+                      class: 'fin-badge fin-conf-pill is-' + conf.level,
+                      title: (conf.reasons || []).map(x => x.text).join('\n')
+                        + (conf.reads > 1 ? `\n\nRead ${conf.reads} times — this is the best of them.` : ''),
+                    }, `${conf.score}%`) : null,
+                    r.duplicate ? el('span', { class: 'fin-badge is-bad', title: `Already logged on ${r.duplicate.date}` }, 'duplicate') : null,
                     suspect ? el('span', { class: 'fin-badge is-bad', title: 'The line items do not match the total' }, 'check me') : null,
                     r.edited ? el('span', { class: 'fin-badge', title: 'You corrected this scan' }, 'edited') : null),
                   el('div', { class: 'fin-receipt-meta' },
@@ -1269,7 +1920,7 @@ export default {
                 r.status === 'parsed'
                   ? el('div', { class: 'fin-receipt-actions' },
                     el('button', {
-                      class: 'btn sm' + (suspect || open ? ' primary' : ''),
+                      class: 'btn sm' + (suspect || open || r.duplicate ? ' primary' : ''),
                       onclick: () => {
                         if (open) delete S.openReceipts[r.id];
                         // Deep-copy so edits are discardable and a refresh can't stomp them.
@@ -1277,7 +1928,11 @@ export default {
                         render();
                       },
                     }, icon(open ? 'chevD' : 'edit'), open ? 'Close' : 'Review & edit'),
-                    !open ? el('button', { class: 'btn sm', title: 'One row for the receipt total', onclick: () => applyReceipt(r, 'total') }, 'Log total') : null)
+                    // No quick-log on a known duplicate: the server would refuse it anyway,
+                    // and offering a button whose only outcome is an error is a small lie.
+                    !open && !r.duplicate
+                      ? el('button', { class: 'btn sm', title: 'One row for the receipt total', onclick: () => applyReceipt(r, 'total') }, 'Log total')
+                      : null)
                   : null,
                 // Already logged, and you have just spotted a line that shouldn't be there.
                 // Editing the ledger row alone would fix the total but leave the scan wrong
@@ -1453,13 +2108,86 @@ export default {
       picker.click();
     }
 
+    /**
+     * Log a shift from a screenshot of the app that paid for it.
+     *
+     * The friction this removes is specific and daily: an Uber or delivery payout screen
+     * already states the payout, the platform's cut, the trips and the hours — and logging
+     * it means reading four numbers off a phone and typing them into another screen, which
+     * is exactly the kind of task that stops getting done after a fortnight.
+     *
+     * It reads into the FORM, never into the ledger. An earnings screen has no arithmetic
+     * of its own to check the reading against — unlike a receipt, whose lines must sum to
+     * its total — so the only real check available is the user glancing at four numbers
+     * they can already see on their phone. Making them press the button is that check.
+     */
+    async function openEarningsShot() {
+      const picker = el('input', { type: 'file', accept: IMAGE_ACCEPT, style: { display: 'none' } });
+      document.body.append(picker);
+      picker.onchange = async () => {
+        const file = picker.files?.[0];
+        picker.remove();
+        if (!file) return;
+        try {
+          toast('Uploading…');
+          const up = await uploadFile(file);
+          toast('Reading the screen — a few seconds…');
+          const res = await post('/finance/earnings/read', { uploadId: up.id });
+          if (!res.parsed) return toast(res.error || 'Could not read that screenshot', 'err');
+          const p = res.parsed;
+
+          // What was read, in the words of what it will log — so a wrong reading is
+          // obvious before the form is even filled in, not after a row appears.
+          const said = [
+            p.net !== null ? `${money(p.net)} kept` : null,
+            p.fee ? `${money(p.fee)} fee` : null,
+            p.jobs ? `${p.jobs} job${p.jobs === 1 ? '' : 's'}` : null,
+            p.hours ? `${p.hours} h` : null,
+          ].filter(Boolean).join(' · ');
+          toast(`Read ${p.payer || 'the screen'}: ${said}`, 'ok');
+
+          // Hourly and per-job modes multiply a rate by a count, and a payout screen states
+          // the product rather than the factors. Back the rate out of it: the amount then
+          // comes to what was actually paid, and the hours or jobs get RECORDED, which is
+          // the only reason to pick those modes over a flat amount. It is an effective rate,
+          // not an agreed one — which is exactly what the Income tab reports it as anyway.
+          const per = (n) => (p.net !== null && n ? Math.round((p.net / n) * 100) / 100 : undefined);
+          const qty = p.mode === 'hourly' ? p.hours : p.mode === 'unit' ? p.jobs : undefined;
+
+          await openIncomeForm({
+            mode: p.mode, date: p.date, merchant: p.payer, currency: p.currency,
+            amount: p.net, gross: p.gross, fee: p.fee,
+            qty, rate: per(qty),
+            note: [p.jobs ? `${p.jobs} jobs` : '', p.hours ? `${p.hours}h online` : ''].filter(Boolean).join(', '),
+            readFrom: `Read from a screenshot${p.derived?.length ? ` — ${p.derived.join(' and ')} worked out from the other figures, so check ${p.derived.length > 1 ? 'them' : 'it'}` : ''}${p.dateGuessed ? ' · no date on the screen, so today is assumed' : ''}`,
+          });
+        } catch (e) { toast(e.message, 'err'); }
+      };
+      picker.click();
+    }
+
     async function applyReceipt(r, mode) {
       try {
         const res = await post(`/finance/receipts/${r.id}/apply`, { mode });
         toast(`Added ${res.created.length} transaction${res.created.length === 1 ? '' : 's'}`, 'ok');
         S.receipts = await get('/finance/receipts?limit=30');
         render();
-      } catch (e) { toast(e.message, 'err'); }
+      } catch (e) {
+        toast(e.message, 'err');
+        // A refused duplicate is the one failure the row itself should now explain, so
+        // reload rather than leaving a row that still offers the button that just failed.
+        await refreshReceipts();
+      }
+    }
+
+    /** Pull the list back in and redraw, swallowing errors — a failed refresh must never
+     *  replace a screen the user is working on with an error page. */
+    async function refreshReceipts() {
+      try {
+        S.receipts = await get('/finance/receipts?limit=30');
+        S.learning = await get('/finance/receipt-learning').catch(() => S.learning);
+        render();
+      } catch { /* the list on screen is still usable */ }
     }
 
     function exportCsv() {

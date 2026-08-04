@@ -120,9 +120,14 @@ ok(/first/.test(noteBody) && /second/.test(noteBody), 'both entries preserved in
 // ---------- registry + chat gating (offline) ----------
 console.log('\nregistry & chat gating:');
 const chatNames = new Set(tools.chatTools().map(t => t.name));
-for (const t of ['directions', 'find_places', 'weather', 'wikipedia', 'crawl_site', 'translate', 'calculate', 'convert', 'datetime', 'quick_note'])
+for (const t of ['directions', 'find_places', 'weather', 'wikipedia', 'translate', 'calculate', 'convert', 'datetime', 'quick_note'])
   ok(chatNames.has(t), `chat can call ${t}`);
 ok(!chatNames.has('write_file') && !chatNames.has('bash'), 'chat still cannot call write_file / bash');
+// crawl_site is read-only and would pass the gate on merit — it is held out on cost. It
+// walks a whole site over many fetches, which stalls a chat turn, and the Research app
+// does that job properly. Asserted rather than merely dropped, so putting it back is a
+// decision someone makes on purpose.
+ok(!chatNames.has('crawl_site'), 'crawl_site stays out of chat (Research app does site walks)');
 ok(tools.isChatSafeWrite('quick_note') && tools.isChatSafeWrite('task_add'), 'quick_note & task_add are chat-safe writes');
 ok(!tools.isChatSafeWrite('write_file') && !tools.isChatSafeWrite('vault_write'), 'write_file & vault_write are NOT chat-safe');
 const cat = tools.toolCatalog();

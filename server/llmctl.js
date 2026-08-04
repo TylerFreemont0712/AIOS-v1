@@ -280,6 +280,25 @@ export function visionModels() {
 }
 
 /**
+ * Is this ref a dedicated OCR transcriber rather than a general vision model?
+ *
+ * The distinction decides the whole pipeline. A transcriber (dots.ocr, DeepSeek-OCR)
+ * reads a page far more faithfully than a general VLM but does not answer questions about
+ * it — asked for a JSON receipt object it burns its budget and returns nothing useful.
+ * Measured here: dots.ocr scored 25% on totals when driven like a VLM, and transcribed
+ * every number on the same receipt correctly when asked to do its own job.
+ *
+ * Declared by the `ocr` tag on the model's preset, so adding a new one is configuration.
+ */
+export function refIsTranscriber(ref) {
+  const s = String(ref || '').trim();
+  const alias = s.includes(':') ? s.slice(s.indexOf(':') + 1) : s;
+  const m = findByAlias(alias);
+  if (!m) return false;
+  return presetFor(m.file, m.sizeGB).tags.includes('ocr');
+}
+
+/**
  * Can this model ref read an image? Returns true / false / null when unknowable.
  *
  * `null` matters: a ref pointing at an OpenAI-compatible endpoint we do not manage

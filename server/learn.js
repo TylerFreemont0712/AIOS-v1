@@ -29,6 +29,11 @@ import {
 } from './learndb.js';
 
 const live = new Map(); // subjectId -> AbortController
+
+/** Is a generation job running for this subject? The lock is what makes every generator
+ *  answer "already generating — wait or cancel"; without a way to ask, a caller can only
+ *  discover the state by being refused. */
+export const isGenerating = (subjectId) => live.has(String(subjectId || ''));
 const err = (msg, status = 400) => Object.assign(new Error(msg), { status });
 
 let publish = () => { };
@@ -339,9 +344,9 @@ const tutorRules = (cap = 3800) => {
 
 function makeLlm(subjectId, ctl, modelRef, usage) {
   const today = new Date().toDateString();
-  return async (prompt, { stream = false, maxTokens = 2048, onReason, system } = {}) => {
+  return async (prompt, { stream = false, maxTokens = 2048, onReason, system, schema } = {}) => {
     const res = await streamChat({
-      modelRef, maxTokens, signal: ctl.signal,
+      modelRef, maxTokens, signal: ctl.signal, schema,
       system: system || `You are a rigorous, warm personal tutor. Today is ${today}. Follow the output format EXACTLY — no preamble, no commentary.`,
       messages: [{ role: 'user', text: prompt }],
       onEvent: (ev) => {
@@ -353,6 +358,43 @@ function makeLlm(subjectId, ctl, modelRef, usage) {
     return res.text || '';
   };
 }
+
+/**
+ * The roadmap's shape, handed to the provider as a grammar rather than described in the
+ * prompt and hoped for.
+ *
+ * Asking a 9B for "STRICT JSON only (no fences, no commentary)" and then fishing the
+ * object back out of prose is the difference between the Learning app working on a local
+ * model and not: measured on this box, the unconstrained prompt returned something
+ * unparseable and the subject died with "the model did not return a usable roadmap".
+ * llm.js has carried constrained decoding for a while — json_schema for OpenAI-compatible
+ * servers, `format` for Ollama — and receipts.js has been relying on it to read paper
+ * reliably. The tutor had simply never been wired to it.
+ */
+const ROADMAP_SCHEMA = {
+  name: 'roadmap',
+  schema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['modules'],
+    properties: {
+      modules: {
+        type: 'array', minItems: 6, maxItems: 12,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['title', 'summary', 'kind', 'topics'],
+          properties: {
+            title: { type: 'string', description: 'the capability milestone' },
+            summary: { type: 'string', description: 'one sentence: what the student can DO after' },
+            kind: { type: 'string', enum: ['standard', 'project', 'capstone'] },
+            topics: { type: 'array', minItems: 3, maxItems: 6, items: { type: 'string' } },
+          },
+        },
+      },
+    },
+  },
+};
 
 /** String-aware first-JSON-object extractor (same approach as util.extractJSON). */
 function extractJSON(text) {
@@ -445,11 +487,16 @@ Follow the "Roadmap design" rules above: 6-12 capability modules in strict prere
 Output STRICT JSON only (no fences, no commentary):
 {"modules":[{"title":"<capability milestone>","summary":"<one sentence: what the student can DO after>","kind":"standard|project|capstone","topics":["<lesson-sized topic>","..."]}]}
 Each module: 3-6 topics, each topic sized to one lesson.`,
-      { maxTokens: 6000, onReason: think });
+      { maxTokens: 6000, onReason: think, schema: ROADMAP_SCHEMA });
 
+    // extractJSON stays: the schema is a request, not a guarantee — a provider that
+    // ignores response_format still lands here, and it costs nothing when it was obeyed.
     const j = extractJSON(out);
     const mods = Array.isArray(j?.modules) ? j.modules.filter(m => m && m.title) : [];
-    if (mods.length < 3) throw new Error('the model did not return a usable roadmap — try again (or a different model)');
+    if (mods.length < 3) {
+      throw new Error('the model did not return a usable roadmap — try again (or a different model). '
+        + `It replied with ${out.trim().length} characters${out.trim() ? `, starting "${out.trim().slice(0, 80).replace(/\s+/g, ' ')}…"` : ''}.`);
+    }
 
     // Preserve done-ness across a regenerate, matched by title.
     const prevDone = new Map(all('SELECT title, done FROM modules WHERE subject_id = ?', s.id).map(m => [m.title.toLowerCase(), m.done]));

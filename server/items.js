@@ -219,6 +219,24 @@ export function deleteAlias(id) {
   if (!r.changes) throw missing('alias not found');
 }
 
+/**
+ * Has this exact printed string been seen and classified before? Read-only.
+ *
+ * The companion to priceProbe, and separate from resolveLocal for the same reason: this
+ * runs while a scan is still being *judged*, so it must not learn a fuzzy alias or bump a
+ * hit count off the back of a reading nobody has confirmed yet. A confirmed hit is the
+ * strongest evidence available that the OCR read the characters correctly — the user
+ * personally settled that this exact string is that product.
+ */
+export function aliasLookup(rawName) {
+  const key = normalize(rawName);
+  if (!key) return null;
+  const a = one('SELECT item_id, confirmed FROM finance_item_alias WHERE norm = ?', key);
+  if (!a) return null;
+  if (!one('SELECT id FROM finance_item WHERE id = ? AND deleted = 0', a.item_id)) return null;
+  return { itemId: a.item_id, confirmed: !!a.confirmed };
+}
+
 const bumpAlias = (key) => run('UPDATE finance_item_alias SET hits = hits + 1 WHERE norm = ?', key);
 
 // ---------- matching ----------
@@ -489,6 +507,34 @@ export function assignPurchases(pairs) {
     catch (e) { out.failed.push({ purchaseId: p.purchaseId, error: e.message }); }
   }
   return out;
+}
+
+/**
+ * The catalogue entry a *person* means when they type a name — creating it if needed.
+ *
+ * This exists because the user's typed name has to outrank the model's classification.
+ * The failure it fixes: a receipt printed 牛乳 (milk), the OCR misread it as 牛丼 (beef
+ * bowl), the user corrected the name to "Milk" in the review editor — and the catalogue
+ * still filed it as "Beef Bowl", because resolution ran on the *printed* string and the
+ * correction was never consulted. Worse, the edit then promoted 牛丼 → Beef Bowl to a
+ * confirmed alias, cementing the error.
+ *
+ * Matching is deliberately generous (normalized, English or Japanese) so "milk", "Milk"
+ * and "牛乳" all land on one entry rather than minting near-duplicates.
+ */
+export function itemForName(name, { category = 'Groceries' } = {}) {
+  const wanted = String(name || '').trim();
+  if (!wanted) return null;
+  const key = normalize(wanted);
+  if (!key) return null;
+
+  for (const row of all('SELECT * FROM finance_item WHERE deleted = 0')) {
+    if (normalize(row.name_en) === key || (row.name_ja && normalize(row.name_ja) === key)) return outItem(row);
+  }
+  // Japanese in, Japanese field out — otherwise the catalogue ends up with 牛乳 sitting in
+  // the English column and the pair can never be matched again.
+  const isJa = /[぀-ヿ㐀-鿿]/.test(wanted);
+  return createItem(isJa ? { nameEn: wanted, nameJa: wanted, category } : { nameEn: wanted, category });
 }
 
 /** Line items nobody has classified yet, newest first, grouped by printed name so

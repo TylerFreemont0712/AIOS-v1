@@ -288,6 +288,130 @@ await hard('tools: registry + read tools on disk', async () => {
   return `${names.length} tools enabled · runTool ok`;
 });
 
+await hard('mcp: an external server\'s tools join the belt', async () => {
+  const mcp = await S('mcp.js');
+  const t = await S('tools.js');
+
+  // A minimal MCP server over stdio: handshake, a paginated tools/list, and calls.
+  // Written here rather than shipped as a fixture so the audit stays self-contained.
+  const stub = path.join(tmpData, 'stub-mcp.mjs');
+  fs.writeFileSync(stub, `
+let buf = '';
+const send = (m) => process.stdout.write(JSON.stringify(m) + '\\n');
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (c) => {
+  buf += c;
+  let nl;
+  while ((nl = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+    if (line) handle(JSON.parse(line));
+  }
+});
+function handle({ id, method, params }) {
+  if (method === 'initialize') return send({ jsonrpc: '2.0', id, result: { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'stub', version: '1' } } });
+  if (method === 'notifications/initialized') return;
+  if (method === 'tools/list') {
+    if (!params?.cursor) return send({ jsonrpc: '2.0', id, result: { tools: [
+      { name: 'echo', description: 'Echo back.', inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, annotations: { readOnlyHint: true } }
+    ], nextCursor: 'p2' } });
+    return send({ jsonrpc: '2.0', id, result: { tools: [
+      { name: 'mutate', description: 'Unannotated, so it must be gated.', inputSchema: { type: 'object', properties: {} } },
+      { name: 'boom', description: 'Fails.', inputSchema: { type: 'object', properties: {} }, annotations: { readOnlyHint: true } }
+    ] } });
+  }
+  if (method === 'tools/call') {
+    const n = params?.name;
+    if (n === 'echo') return send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'echo: ' + params.arguments?.text }] } });
+    if (n === 'boom') return send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'it broke' }], isError: true } });
+    return send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'ok' }] } });
+  }
+  if (id !== undefined) send({ jsonrpc: '2.0', id, error: { code: -32601, message: 'no ' + method } });
+}
+`);
+
+  mcp.saveServer({ id: 'stub', name: 'Stub', transport: 'stdio', command: process.execPath, args: [stub] });
+  assert(mcp.listMcpTools().length === 0, 'saving a server must not connect it');
+
+  await mcp.connect('stub');
+  const tools = mcp.listMcpTools();
+  assert(tools.length === 3, `expected 3 tools across both pages, got ${tools.length}`);
+  assert(tools.every(x => x.name.startsWith('stub_')), 'tools must be namespaced by server id');
+  assert(tools.every(x => x.group === 'mcp:stub'), 'tools must land in their own lean-loadout group');
+
+  // the belt, the gate, and the directory the model reads
+  assert(t.enabledTools().some(x => x.name === 'stub_echo'), 'MCP tools must reach enabledTools');
+  assert(t.toolGroups().includes('mcp:stub'), 'the group must be offerable to load_tools');
+  assert(!t.isWriteTool('stub_echo'), 'readOnlyHint must skip the approval gate');
+  assert(t.isWriteTool('stub_mutate'), 'an UNANNOTATED tool must be gated as a write');
+  assert(t.toolCatalog().some(x => x.mcp && x.server === 'stub'), 'Settings must list MCP tools');
+
+  const ok = await t.runTool('stub_echo', { text: 'hi' }, { root: tmpProj });
+  assert(!ok.isError && ok.content === 'echo: hi', 'runTool must dispatch to MCP: ' + ok.content);
+  const bad = await t.runTool('stub_boom', {}, { root: tmpProj });
+  assert(bad.isError && /it broke/.test(bad.content), 'a server-reported error must surface as one');
+
+  // an explicit stop means stopped — no silent respawn behind the user's back
+  mcp.stop('stub');
+  assert(!t.enabledTools().some(x => x.name === 'stub_echo'), 'a stopped server must leave the belt');
+  const gone = await t.runTool('stub_echo', { text: 'x' }, { root: tmpProj });
+  assert(gone.isError && /server "stub"/.test(gone.content), 'the error must name the server, not blame the tool');
+  assert(mcp.status()[0].status === 'stopped', 'stop() must not be undone by a later call');
+
+  // one broken server must not disturb anything else
+  const before = t.enabledTools().length;
+  mcp.saveServer({ id: 'nope', transport: 'stdio', command: 'definitely-not-a-real-binary-xyz' });
+  await mcp.connect('nope').then(() => { throw new Error('a missing command should not connect'); }, () => { });
+  assert(mcp.status().find(s => s.id === 'nope').status === 'down', 'a failed server must report down');
+  assert(t.enabledTools().length === before, 'a broken server must not change the belt');
+
+  for (const badCfg of [{}, { id: 'has-dash', command: 'x' }, { id: 'nocmd' }, { id: 'nourl', transport: 'http' }]) {
+    let refused = false;
+    try { mcp.saveServer(badCfg); } catch { refused = true; }
+    assert(refused, `bad config accepted: ${JSON.stringify(badCfg)}`);
+  }
+
+  mcp.removeServer('stub'); mcp.removeServer('nope');
+  mcp.stopAll();
+  return 'stdio handshake · paginated discovery · namespaced · gated by annotation · dispatch · isolated failures';
+});
+
+await hard('chat: the belt is lean, not just short', async () => {
+  const t = await S('tools.js');
+  const pool = t.chatTools();
+  const core = t.chatCoreNames();
+  const lo = t.leanLoadout({ pool, coreNames: core, activeGroups: [] });
+  const chars = (x) => JSON.stringify(x).length;
+
+  // The whole point: a fresh chat pays for a handful of schemas, not all of them.
+  assert(lo.tools.length < pool.length / 2, `core is ${lo.tools.length} of ${pool.length} — not lean`);
+  assert(chars(lo.tools) + lo.directory.length < chars(pool.map(x => x.parameters)) , 'lean loadout is not smaller than the full one');
+  assert(lo.directory.length > 0 && lo.dormantGroups.length > 0, 'nothing was deferred');
+  // ~1.5k tokens on a 32k local window; it was ~4.2k before the split.
+  const tok = Math.ceil((chars([...lo.tools, t.META_LOAD]) + lo.directory.length) / 4);
+  assert(tok < 2200, `per-round tool cost regressed to ~${tok} tokens`);
+
+  // The things a chat does on ANY topic must not cost a round-trip to reach.
+  for (const n of ['web_search', 'agenda_view', 'quick_note', 'datetime']) {
+    assert(lo.tools.some(x => x.name === n), `${n} should be core — it is needed regardless of topic`);
+  }
+  // Every dormant tool must be reachable: named in the directory, in a loadable group.
+  const dormant = pool.filter(x => !core.has(x.name));
+  for (const d of dormant.slice(0, 40)) {
+    assert(lo.directory.includes(d.name), `${d.name} is deferred but missing from the directory`);
+  }
+  // Loading a group actually delivers it.
+  const g = lo.dormantGroups[0];
+  const after = t.leanLoadout({ pool, coreNames: core, activeGroups: [g] });
+  assert(after.tools.length > lo.tools.length, `load_tools on "${g}" delivered nothing`);
+  assert(!after.dormantGroups.includes(g), 'a loaded group must leave the directory');
+
+  // activateGroups is what the tool call runs; a typo must teach, not silently no-op.
+  const state = {};
+  assert(/Activated/.test(t.activateGroups(state, [g], { pool })) && state.toolGroups.includes(g), 'activateGroups did not activate');
+  assert(/No valid groups|Unknown/.test(t.activateGroups(state, ['nonsense'], { pool })), 'a bad group name must be explained');
+  return `${pool.length} reachable · ${lo.tools.length} core (~${tok} tok/round) · ${lo.dormantGroups.length} groups on demand`;
+});
+
 await hard('chat: read-only tool belt', async () => {
   const t = await S('tools.js');
   const names = t.chatTools().map(x => x.name);
@@ -336,6 +460,47 @@ await hard('agent: session store', async () => {
   a.deleteSession(s.id);
   p.removeProject(proj.id);
   return 'create · update · delete';
+});
+
+await hard('agent: a long run checkpoints rarely, not every step', async () => {
+  const a = await S('agent.js');
+  const BUDGET = 30_000;                       // ~18k-token window minus system + tools
+  const turn = (bytes) => ([
+    { role: 'assistant', text: 'a'.repeat(700), toolCalls: [{ name: 'read_file', args: {} }] },
+    { role: 'tools', results: [{ name: 'read_file', content: 'r'.repeat(bytes) }] },
+  ]);
+
+  // One user prompt, then 40 tool calls — the long-horizon shape. Count how often
+  // compaction would be due; each one costs a model call.
+  const dueCount = (bytes) => {
+    let transcript = [{ role: 'user', text: 'do the thing' }], due = 0;
+    for (let t = 0; t < 40; t++) {
+      if (a.fitHistory({ transcript }, BUDGET).lossy) {
+        due++;
+        const cut = a.checkpointCut(transcript, BUDGET * 0.35);
+        transcript = [{ role: 'user', kind: 'checkpoint', text: 'S'.repeat(2400) }, ...transcript.slice(cut)];
+      }
+      transcript.push(...turn(bytes));
+    }
+    return due;
+  };
+  for (const bytes of [3000, 7000, 12_000]) {
+    const n = dueCount(bytes);
+    assert(n <= 6, `${bytes}-byte tool results produced ${n} checkpoints over 40 calls`);
+  }
+
+  // Whatever the sizes, what actually reaches the model always fits — the trim is the
+  // safety net, so compaction is never load-bearing for correctness.
+  const huge = [{ role: 'user', text: 'go' }, ...turn(400_000)];
+  const { messages, lossy } = a.fitHistory({ transcript: huge }, BUDGET);
+  assert(lossy, 'a 400KB tool result must register as a real loss');
+  assert(JSON.stringify(messages).length <= BUDGET, 'trimmed history still overflows the window');
+
+  // The cut never separates an assistant from the results of the calls it made.
+  const pairs = [{ role: 'user', text: 'go' }];
+  for (let t = 0; t < 20; t++) pairs.push(...turn(2000));
+  assert(pairs[a.checkpointCut(pairs, BUDGET * 0.35)]?.role !== 'tools', 'cut orphaned a tool-results message');
+  return 'trims before compacting · bounded checkpoints · payload always fits · pairs kept whole';
 });
 
 // ---------- apps ----------
@@ -947,28 +1112,367 @@ await hard('receipts: hallucination guards', async () => {
   return 'reconciliation · over-total · 21 summary/product cases · placeholder names';
 });
 
+await hard('receipts: one purchase cannot be logged twice', async () => {
+  const r = await S('receipts.js');
+  const { run } = await S('financedb.js');
+  const { now } = await S('util.js');
+
+  // The reported problem: the same receipt photographed twice (phone, then desktop) posts
+  // twice and silently doubles a day's spend. The key is what a person would compare —
+  // the date, the products and the prices — deliberately NOT the shop name, because that
+  // is the field two readings of one receipt are most likely to word differently.
+  const basket = (over = {}) => r.normalizeParsed({
+    merchant: 'Dupe Mart', date: '2026-05-04', currency: 'JPY',
+    items: [
+      { printed: '牛乳', name: 'Milk', qty: 1, amount: 220 },
+      { printed: 'パン', name: 'Bread', qty: 1, amount: 180 },
+    ], subtotal: 400, tax: 32, total: 432, ...over,
+  });
+  const seed = (id, parsed) => {
+    run(`INSERT INTO finance_receipt (id,upload_id,status,model,raw,parsed,parsed_ai,error,txn_ids,fingerprint,confidence,created_at,updated_at)
+         VALUES (?,'','parsed','audit','',?,'','','[]',?,-1,?,?)`,
+      id, JSON.stringify(parsed), r.receiptFingerprint(parsed), now(), now());
+    return id;
+  };
+
+  const fp = r.receiptFingerprint(basket());
+  assert(fp, 'a complete receipt should have a fingerprint');
+  assert(fp === r.receiptFingerprint(basket({ merchant: 'ダイエー' })), 'the shop name must not change the key');
+  assert(fp === r.receiptFingerprint(basket({ items: [...basket().items].reverse() })), 'line order must not change the key');
+  assert(fp !== r.receiptFingerprint(basket({ date: '2026-05-05' })), 'another day is another receipt');
+
+  seed('dup1', basket());
+  assert((await r.apply('dup1', { mode: 'total' })).created.length === 1, 'the first copy should post');
+
+  // The second copy, read slightly differently, is refused outright — no confirm step:
+  // an "add it anyway" button gets clicked past exactly when it matters.
+  seed('dup2', basket({ merchant: 'ダイエー' }));
+  assert(r.getReceipt('dup2').duplicate?.id === 'dup1', 'the copy should be flagged before it is applied');
+  let status = 0;
+  try { await r.apply('dup2', { mode: 'total' }); } catch (e) { status = e.status; }
+  assert(status === 409, 'applying a duplicate should be refused with 409, got ' + status);
+
+  // Two ¥500 lunches on one day are a real thing, so a receipt with no lines to compare
+  // falls back to including the shop rather than colliding on date+total alone.
+  const bare = (m) => r.normalizeParsed({ merchant: m, date: '2026-05-04', currency: 'JPY', items: [], total: 500 });
+  assert(r.receiptFingerprint(bare('Cafe A')) !== r.receiptFingerprint(bare('Cafe B')),
+    'with no line items the shop must be part of the key');
+
+  // Undoing the original frees the copy: the guard is about the ledger, not the scan.
+  r.revertReceipt('dup1');
+  assert(r.getReceipt('dup2').duplicate === null, 'reverting the original should unblock the copy');
+  assert((await r.apply('dup2', { mode: 'total' })).created.length === 1, 'the copy should post once the original is gone');
+
+  return 'fingerprint ignores the shop · refused with 409 · flagged before applying · bare receipts keyed on shop · revert unblocks';
+});
+
+await hard('receipts: a reading is re-read only when that can change it', async () => {
+  // The control flow is what matters here — how many passes, which angle, which one wins
+  // — so it runs against a SCRIPTED model in a subprocess (own data dir, own config) and
+  // counts the calls. Same shape as the schema-wiring test above.
+  //
+  // The contract is deliberately asymmetric, and the asymmetry is the point: an ILLEGIBLE
+  // reading gets the photo turned (a genuinely different input), a LEGIBLE one that simply
+  // does not reconcile is handed over as-is (the same input at temperature 0 cannot produce
+  // a different answer). Both counts below are pinned so neither half drifts back.
+  const { spawnSync } = await import('node:child_process');
+  const script = `
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+
+let queue = [], calls = 0;
+const srv = http.createServer((req, res) => {
+  let b = ''; req.on('data', c => b += c);
+  req.on('end', () => {
+    if (req.url.includes('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ data: [{ id: 'v' }] }));
+    }
+    calls++;
+    const next = queue.shift() || {};
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: ' + JSON.stringify({ choices: [{ delta: { content: JSON.stringify(next) } }] }) + '\\n\\n');
+    res.write('data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }) + '\\n\\n');
+    res.write('data: [DONE]\\n\\n'); res.end();
+  });
+});
+await new Promise(r => srv.listen(0, '127.0.0.1', r));
+const port = srv.address().port;
+
+const boot = await import(${JSON.stringify(path.join(ROOT, 'server', 'config.js'))});
+const cfg = boot.loadConfig();          // mutate the LIVE object — loadConfig() caches
+cfg.providers.custom = [{ id: 'm', name: 'Mock', baseUrl: 'http://127.0.0.1:' + port + '/v1', apiKey: 'x', kind: 'openai', models: ['v'] }];
+cfg.defaults.chatModel = 'custom_m:v';
+cfg.finance = { ...cfg.finance, ocrModel: 'custom_m:v', ocrMinConfidence: 75, ocrMaxAttempts: 3 };
+boot.saveConfig();
+
+const receipts = await import(${JSON.stringify(path.join(ROOT, 'server', 'receipts.js'))});
+const uploads = await import(${JSON.stringify(path.join(ROOT, 'server', 'uploads.js'))});
+
+// A portrait strip, so the orientation heuristic leaves it alone and the ladder starts at 0.
+const dir = fs.mkdtempSync('/tmp/aios-loop-');
+const jpg = path.join(dir, 'r.jpg');
+const ff = spawnSync('ffmpeg', ['-hide_banner','-loglevel','error','-y','-f','lavfi','-i','color=c=white:s=200x600','-frames:v','1', jpg]);
+if (ff.status !== 0) { console.log('RESULT ' + JSON.stringify({ skip: 'no ffmpeg' })); srv.close(); process.exit(0); }
+const up = uploads.saveUploadSync({ name: 'r.jpg', mime: 'image/jpeg', buffer: fs.readFileSync(jpg) });
+
+const GOOD = { merchant: 'Loop Mart', date: '2026-08-01', time: '10:00', currency: 'JPY', category: 'Groceries',
+  items: [{ printed: 'A', name: 'A', qty: 1, amount: 220 }, { printed: 'B', name: 'B', qty: 1, amount: 180 }],
+  subtotal: 400, tax: 32, total: 432, payment_method: 'cash' };
+const OVER = { ...GOOD, items: [...GOOD.items, { printed: 'Ghost', name: 'Ghost', qty: 1, amount: 200 }] };
+const BLANK = { ...GOOD, merchant: null, items: [], subtotal: null, tax: null, total: 500 };
+
+const go = async (script, opts) => { queue = script.slice(); calls = 0;
+  const r = await receipts.scan({ uploadId: up.id, ...opts }); return { r, calls }; };
+
+const sure = await go([GOOD]);
+const wrong = await go([OVER, GOOD]);
+const blank = await go([BLANK, BLANK, GOOD]);
+const blind = await go([BLANK, BLANK, BLANK]);
+const pinned = await go([BLANK, BLANK, BLANK], { rotate: 180 });
+cfg.finance.ocrMaxAttempts = 1; boot.saveConfig();
+const capped = await go([BLANK, GOOD]);
+
+srv.close(); fs.rmSync(dir, { recursive: true, force: true });
+console.log('RESULT ' + JSON.stringify({
+  sureCalls: sure.calls, sureScore: sure.r.parsed?.confidence?.score, sureReads: sure.r.parsed?.confidence?.reads,
+  wrongCalls: wrong.calls, wrongItems: wrong.r.parsed?.items?.length, wrongVerdict: wrong.r.parsed?.check?.verdict,
+  wrongReads: wrong.r.parsed?.confidence?.reads, wrongScore: wrong.r.parsed?.confidence?.score,
+  blankCalls: blank.calls, blankMerchant: blank.r.parsed?.merchant, blankAngle: blank.r.parsed?.confidence?.angle,
+  blankReads: blank.r.parsed?.confidence?.reads,
+  blindCalls: blind.calls,
+  pinnedCalls: pinned.calls, pinnedAngle: pinned.r.parsed?.confidence?.angle,
+  cappedCalls: capped.calls,
+}));`;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    encoding: 'utf8', timeout: 60_000,
+    env: { ...process.env, AIOS_DATA: fs.mkdtempSync(path.join(os.tmpdir(), 'aios-loop-')) },
+  });
+  const m = r.stdout.match(/RESULT (\{.*\})/);
+  assert(m, 'retry-loop subprocess failed: ' + (r.stderr || r.stdout).slice(0, 400));
+  const o = JSON.parse(m[1]);
+  if (o.skip) return 'skipped — ' + o.skip;
+
+  assert(o.sureCalls === 1, 'a confident reading must not be re-read, took ' + o.sureCalls);
+  assert(o.sureScore >= 75 && o.sureReads === 1, 'a clean scan should score above the floor: ' + o.sureScore);
+
+  // Legible but does not add up. Every call is temperature 0 under a fixed grammar, so
+  // asking the same question of the same pixels returns the same answer — the second pass
+  // would cost 25-40s of GPU and change nothing. The reviewer gets the reading NOW, with
+  // the arithmetic objection attached, which is the thing that actually helps them.
+  assert(o.wrongCalls === 1, 'a legible reading must not be re-read — the answer cannot change; took ' + o.wrongCalls);
+  assert(o.wrongItems === 3 && o.wrongVerdict === 'overshoot', 'the reading is handed over as read, got ' + o.wrongItems + ' items / ' + o.wrongVerdict);
+  assert(o.wrongScore < 75 && o.wrongReads === 1, 'and it must still be flagged as doubtful: ' + o.wrongScore);
+
+  // Nothing legible is the other failure entirely — that is what a receipt at the wrong
+  // angle looks like — so this case turns the photo, which IS something new to read.
+  assert(o.blankCalls === 3 && o.blankMerchant === 'Loop Mart', 'an illegible reading should be turned and read again');
+  assert(o.blankAngle === 180 || o.blankAngle === 90, 'the winning angle should be recorded, got ' + o.blankAngle);
+  assert(o.blankReads === 3, 'the UI should be told it took three goes');
+  assert(o.blindCalls === 3, 'the cap must hold when no angle ever reads, took ' + o.blindCalls);
+
+  // An explicit rotation is an instruction: the user turned the preview until it read
+  // right and asked for THAT. With the angle pinned there is nothing left to vary, so the
+  // loop stops after one pass rather than re-reading identical bytes twice more.
+  assert(o.pinnedCalls === 1 && o.pinnedAngle === 0, 'an explicit angle must never be overridden, got ' + o.pinnedCalls + ' calls at ' + o.pinnedAngle);
+  assert(o.cappedCalls === 1, 'ocrMaxAttempts=1 should disable re-reading, took ' + o.cappedCalls);
+
+  return 'legible readings read once (a re-read cannot differ) · illegible turns the photo · best pass wins · cap holds · explicit angle pinned';
+});
+
+await hard('receipts: a reading scores its own confidence', async () => {
+  const r = await S('receipts.js');
+  const p = (o) => r.normalizeParsed({ merchant: 'Sure Shop', date: '2026-05-10', currency: 'JPY', ...o });
+
+  const balanced = p({
+    items: [{ printed: '牛乳', name: 'Milk', qty: 1, amount: 220 }, { printed: 'パン', name: 'Bread', qty: 1, amount: 180 }],
+    subtotal: 400, tax: 32, total: 432,
+  });
+  const good = r.scoreConfidence(balanced);
+  assert(good.score >= 85 && good.level === 'high', 'a receipt that adds up should score high: ' + good.score);
+
+  // An invented line is the failure this whole screen exists to catch, so it has to be
+  // the single biggest thing pulling the score down.
+  const ghost = p({
+    items: [
+      { printed: '牛乳', name: 'Milk', qty: 1, amount: 220 },
+      { printed: 'パン', name: 'Bread', qty: 1, amount: 180 },
+      { printed: '幽霊', name: 'Ghost', qty: 1, amount: 200 },
+    ], subtotal: 400, tax: 32, total: 432,
+  });
+  const bad = r.scoreConfidence(ghost);
+  assert(bad.score < 60, 'a receipt that does not add up should score low: ' + bad.score);
+  assert(bad.reasons.some(x => /more than the receipt/.test(x.text)), 'the reason should name the surplus');
+
+  // The substitutions normalize() makes quietly have to reach the score, or a reading
+  // held together by defaults looks as trustworthy as one actually read off the paper.
+  const vague = p({ merchant: '', date: 'illegible', items: [], total: 500 });
+  assert(vague.dateGuessed && r.scoreConfidence(vague).level === 'low', 'a reading with nothing in it should score low');
+  const derived = p({ items: [{ printed: 'x', name: 'x', qty: 1, amount: 300 }] });
+  assert(derived.totalDerived && r.scoreConfidence(derived).reasons.some(x => /added up from the lines/.test(x.text)),
+    'a total inferred from the lines should be declared');
+
+  for (const one of [good, bad, r.scoreConfidence(vague), r.scoreConfidence(null)]) {
+    assert(one.score >= 0 && one.score <= 100, 'score out of range: ' + one.score);
+  }
+  return 'balanced scores high · phantom line dominates · guessed date/derived total declared · clamped 0-100';
+});
+
+await hard('receipts: a long receipt is read in bands and stitched back', async () => {
+  const r = await S('receipts.js');
+  const u = await S('uploads.js');
+
+  // --- the seam ---------------------------------------------------------------
+  // The bands deliberately overlap, so the shared lines arrive twice and have to be
+  // removed exactly once. Both ways of getting that wrong cost money: a line left in
+  // twice inflates the basket, one cut out takes a real purchase out of the ledger.
+  const st = (parts) => r.stitchTranscripts(parts);
+  assert(st(['a\nb']) === 'a\nb' && st([]) === '', 'one band (or none) is not stitching');
+  assert(st(['milk 220\nbread 180\neggs 300', 'bread 180\neggs 300\njam 400'])
+    === 'milk 220\nbread 180\neggs 300\njam 400', 'the shared lines should appear once');
+  assert(st(['1\n2\n3', '2\n3\n4\n5', '4\n5\n6']) === '1\n2\n3\n4\n5\n6', 'three bands should chain');
+
+  // The model does not transcribe a band edge to the character, so the seam is matched on
+  // content, not spacing.
+  assert(st(['milk 220\nbread  180\neggs 300', 'bread 180\neggs   300\njam 400']).split('\n').length === 4,
+    'the seam should survive different spacing');
+
+  // …but ONE line agreeing is not a seam. Prices and blanks repeat innocently all over a
+  // receipt, and cutting on one of those deletes a real product silently.
+  assert(st(['milk 220\n180', '180\njam 400']) === 'milk 220\n180\n180\njam 400',
+    'a single coincidental line must not be treated as the overlap');
+  assert(st(['a\nb', 'c\nd']) === 'a\nb\nc\nd', 'when nothing agrees, keep everything');
+
+  // --- the cut ----------------------------------------------------------------
+  const { spawnSync } = await import('node:child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aios-band-'));
+  const make = (w, h) => {
+    const f = path.join(dir, `${w}x${h}.jpg`);
+    const s = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi',
+      '-i', `color=c=white:s=${w}x${h}`, '-frames:v', '1', f]);
+    return s.status === 0 ? fs.readFileSync(f) : null;
+  };
+  const tall = make(600, 3000);
+  try {
+    if (!tall) return 'skipped — no ffmpeg';
+
+    const s = u.sliceTall(tall, { max: 3 });
+    assert(s && s.n === 3, 'a 5:1 strip should be read in three bands, got ' + s?.n);
+    // Every pixel row has to land in some band: a gap is a product nobody ever reads.
+    const covered = s.bandHeight * (1 + (s.n - 1) * (1 - s.overlap));
+    assert(Math.abs(covered - s.height) <= 2, `the bands should cover the strip: ${covered} vs ${s.height}`);
+    for (const b of s.bands) {
+      const d = u.imageSize(b);
+      assert(d.width === 600 && Math.abs(d.height - s.bandHeight) <= 2, 'each band should be a full-width slice');
+    }
+
+    // Slicing is an optimisation for one shape of photo, so everything else reads whole.
+    assert(u.sliceTall(make(600, 600), { max: 3 }) === null, 'a square photo has nothing to gain');
+    assert(u.sliceTall(tall, { max: 1 }) === null, 'max 1 means read it whole');
+    assert(u.sliceTall(make(600, 900), { max: 3 }) === null, 'a small photo is already readable');
+
+    // A reader that answers with one layout object per image cannot have its answers
+    // stitched, so it must never be handed a band.
+    assert(r.transcribeStyle('local:dots.ocr-3b') === 'layout-json'
+      && r.transcribeStyle('local:deepseek-ocr') === 'lines', 'the reader style gate is wrong');
+
+    return '3 bands cover the strip · seams matched on content not spacing · one line is not a seam · square/short/JSON readers opt out';
+  } finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { } }
+});
+
+await hard('finance: a payout screen fills the form, not the ledger', async () => {
+  const r = await S('receipts.js');
+  const E = (o) => r.reconcileEarnings({ payer: 'Uber', gross: null, fee: null, net: null, jobs: null, hours: null, ...o });
+
+  // A payout screen almost never prints all three figures, and the missing one follows
+  // from the other two — but ONLY from two that were actually read. Anything filled in
+  // here is declared, so the form can say which number came off the screen and which came
+  // off arithmetic; a derived figure the user cannot see on their phone is one they have
+  // no way to check.
+  const derivedNet = E({ gross: 5000, fee: 1250 });
+  assert(derivedNet.net === 3750 && derivedNet.derived.join() === 'net', 'net should follow from gross − fee');
+  const derivedFee = E({ gross: 5000, net: 3750 });
+  assert(derivedFee.fee === 1250 && derivedFee.derived.join() === 'fee', 'the cut should follow from gross − net');
+  const derivedGross = E({ net: 3750, fee: 1250 });
+  assert(derivedGross.gross === 5000 && derivedGross.derived.join() === 'gross', 'gross should follow from net + fee');
+  assert(E({ net: 3750 }).derived.length === 0, 'a payout on its own needs no arithmetic');
+
+  // Two figures read off unrelated parts of the screen produce a nonsense subtraction.
+  // Handing over just the payout is right where inventing a gross is not.
+  const nonsense = E({ net: 1000, fee: 9000, gross: 500 });
+  assert(nonsense.net === 1000 && nonsense.fee === null && nonsense.gross === null,
+    'an impossible fee should be dropped, not logged');
+
+  // The mode decides what the entry RECORDS, not just how it looks: hourly and per-job
+  // entries carry their units, which is what makes "what am I really earning per hour"
+  // answerable later. Ordered by how much the reading supports, so the fee mode — the
+  // only one that records what was skimmed — wins whenever both figures are there.
+  assert(r.earningsMode(E({ gross: 5000, fee: 1250, hours: 4, jobs: 9 })) === 'fee', 'gross + cut should log as gross − fee');
+  assert(r.earningsMode(E({ net: 3750, hours: 4, jobs: 9 })) === 'hourly', 'hours should log as hourly');
+  assert(r.earningsMode(E({ net: 3750, jobs: 9 })) === 'unit', 'jobs alone should log per item');
+  assert(r.earningsMode(E({ net: 3750 })) === 'amount', 'a bare payout should log as a flat amount');
+
+  // Read-only by construction: an earnings screen has no arithmetic of its own to check a
+  // reading against, so the user pressing the button in the form IS the check.
+  const src = fs.readFileSync(path.join(ROOT, 'server', 'receipts.js'), 'utf8');
+  const from = src.indexOf('export async function readEarnings');
+  const fn = src.slice(from, src.indexOf('\n}\n', from));
+  for (const forbidden of ['save(', 'run(', 'learnFix', 'receiptFingerprint', 'apply(']) {
+    assert(!fn.includes(forbidden), `readEarnings must not call ${forbidden} — it may not reach the ledger`);
+  }
+  return 'the third figure derived from two read ones and declared · impossible fee dropped · mode by what was read · reaches no table';
+});
+
+await hard('receipts: an item code is not a product name', async () => {
+  const r = await S('receipts.js');
+  // Narrow on purpose. A missed code is a line the reviewer reads off the photo anyway;
+  // a false positive puts a warning on a real product and teaches them to ignore warnings.
+  for (const s of ['4901234567890', '001-234', '12 345', '#4901 22', '218'])
+    assert(r.looksLikeCode(s), `${s} should read as a code`);
+  for (const s of ['牛乳', 'Milk', '500ml', '2%', '明治おいしい牛乳', '12', '', '1.5', 'A1234', 'コーヒー 2'])
+    assert(!r.looksLikeCode(s), `${s} should NOT read as a code`);
+
+  // Flagged, never dropped: something WAS bought on that line, so removing it loses a
+  // purchase. The warning is what turns it into a correction the catalogue learns from.
+  const p = r.normalizeParsed({
+    merchant: 'Code Mart', date: '2026-05-10', currency: 'JPY',
+    items: [{ printed: '4901234567890', name: '4901234567890', qty: 1, amount: 220 },
+      { printed: '牛乳', name: 'Milk', qty: 1, amount: 180 }],
+    subtotal: 400, tax: 0, total: 400,
+  });
+  assert(p.items.length === 2, 'a coded line must survive normalisation');
+  assert(p.items[0].warn?.some(w => /item code/.test(w)), 'the coded line should be flagged');
+  assert(!p.items[1].warn, 'a named line should be left alone');
+  return 'codes flagged, never dropped · products and quantities not mistaken for codes';
+});
+
 await hard('receipts: the correction loop learns', async () => {
   const r = await S('receipts.js');
   const { run } = await S('financedb.js');
   const { now } = await S('util.js');
 
-  const scanned = r.normalizeParsed({
-    merchant: 'Learn Shop', date: '2026-06-01', currency: 'JPY',
+  const scanOn = (date) => r.normalizeParsed({
+    merchant: 'Learn Shop', date, currency: 'JPY',
     items: [
       { printed: '本物の品', name: 'Real thing', qty: 1, amount: 300 },
       { printed: '幽霊の品', name: 'Phantom', qty: 1, amount: 180 },   // invented
     ], subtotal: 300, tax: 30, total: 330,
   });
+  const scanned = scanOn('2026-06-01');
   assert(!scanned.check.ok, 'the seeded scan should not reconcile');
 
-  const seed = (id) => run(`INSERT INTO finance_receipt (id,upload_id,status,model,raw,parsed,parsed_ai,error,txn_ids,created_at,updated_at)
-    VALUES (?,'','parsed','audit','',?,'','','[]',?,?)`, id, JSON.stringify(scanned), now(), now());
+  const seed = (id, parsed) => run(`INSERT INTO finance_receipt (id,upload_id,status,model,raw,parsed,parsed_ai,error,txn_ids,created_at,updated_at)
+    VALUES (?,'','parsed','audit','',?,'','','[]',?,?)`, id, JSON.stringify(parsed), now(), now());
 
   // Correct it twice — a fix is only trusted after being made more than once, so one
-  // odd misread never becomes a standing rule.
-  for (const id of ['aud1', 'aud2']) {
-    seed(id);
-    r.editReceipt(id, { ...scanned, items: scanned.items.filter(i => i.name !== 'Phantom') });
+  // odd misread never becomes a standing rule. Two separate shopping trips, because two
+  // identical baskets on one day is the duplicate the guardrail exists to refuse.
+  for (const [id, date] of [['aud1', '2026-06-01'], ['aud2', '2026-06-02']]) {
+    const p = scanOn(date);
+    seed(id, p);
+    r.editReceipt(id, { ...p, items: p.items.filter(i => i.name !== 'Phantom') });
     const rec = await r.apply(id, { mode: 'total' });
     assert(rec.learned.learned >= 1, 'apply() learned nothing from the edit');
   }
@@ -999,7 +1503,54 @@ await hard('receipts: the correction loop learns', async () => {
   try { r.editReceipt('aud1', { total: 999 }); } catch { refused = true; }
   assert(refused, 'editing an already-applied receipt must be refused');
 
-  return 'learn on apply · hits gate · deterministic replay · merchant-scoped · applied is frozen';
+  // A corrected AMOUNT replays only when the model repeats the identical misread. Prices
+  // change, and overwriting a genuinely new price with last month's would be a
+  // hallucination the app invented itself — worse than the misread it set out to fix.
+  for (let i = 0; i < 2; i++) {
+    r.learnFix({ merchant: 'Learn Shop', kind: 'amount', raw: 'コーヒー', aiValue: '980', userValue: '198' });
+  }
+  const line = (amount) => r.replayFixes(r.normalizeParsed({
+    merchant: 'Learn Shop', date: '2026-06-15', currency: 'JPY',
+    items: [{ printed: 'コーヒー', name: 'Coffee', qty: 1, amount }], total: 198,
+  })).items[0].amount;
+  assert(line(980) === 198, 'the known misread should be corrected automatically');
+  assert(line(210) === 210, 'a genuinely new price must not be overwritten by an old fix');
+
+  // The SHOP NAME is the key every other fix is filed under, so learning it is what makes
+  // the per-shop corrections findable on the next receipt from that shop.
+  for (let i = 0; i < 2; i++) {
+    r.learnFix({ merchant: '', kind: 'merchant', raw: 'LEARN SH0P', aiValue: 'LEARN SH0P', userValue: 'Learn Shop' });
+  }
+  const renamed = r.replayFixes(r.normalizeParsed({
+    merchant: 'LEARN SH0P', date: '2026-06-15', currency: 'JPY',
+    items: [
+      { printed: '本物の品', name: 'Real thing', qty: 1, amount: 300 },
+      { printed: '幽霊の品', name: 'Phantom', qty: 1, amount: 180 },
+    ], subtotal: 300, tax: 30, total: 330,
+  }));
+  assert(renamed.merchant === 'Learn Shop', 'a settled shop name should be restored');
+  assert(renamed.items.length === 1, 'fixing the shop name should make its own drops apply');
+
+  // Correcting the PRINTED text (the 牛丼 → 牛乳 case this editor exists for) changes the
+  // very key the diff matches on. Filing that as a drop would teach the scanner to bin a
+  // real product on sight, so an unmatched line is paired on the money before conceding.
+  const before = r.normalizeParsed({
+    merchant: 'Typo Shop', date: '2026-06-20', currency: 'JPY',
+    items: [{ printed: '牛丼', name: 'Beef bowl', qty: 1, amount: 250 }], subtotal: 250, tax: 0, total: 250,
+  });
+  seed('aud3', before);
+  r.editReceipt('aud3', { ...before, items: [{ printed: '牛乳', name: 'Milk', qty: 1, amount: 250, edited: true }] });
+  await r.apply('aud3', { mode: 'total' });
+  const fixes = r.listFixes().filter(f => f.raw === '牛丼');
+  assert(!fixes.some(f => f.kind === 'drop'), 'a renamed line must not be learned as a phantom: ' + JSON.stringify(fixes));
+  assert(fixes.some(f => f.kind === 'rename' && f.userValue === 'Milk'), 'the correction should be learned as a rename');
+
+  const stats = r.learningStats();
+  assert(stats.corrections.total > 0 && stats.corrections.activeAfter === 2, 'learning stats should report the gate');
+  assert('recent' in stats.confidence, 'learning stats should track the confidence trend');
+
+  return 'learn on apply · hits gate · deterministic replay · merchant-scoped · amount only on the same misread · '
+    + 'shop name restored · corrected text is a rename not a drop · applied is frozen';
 });
 
 await hard('finance: deleting a row forgets its price', async () => {
@@ -1088,6 +1639,262 @@ await hard('items: bulk review actions', async () => {
   assert(!items.unresolved({ limit: 50 }).some(g => /ポイント/.test(g.rawName)), 'the binned line should leave the queue');
 
   return 'grouped queue · one call files a whole group · non-products discardable';
+});
+
+await hard('receipts: a corrected name outranks the model', async () => {
+  const r = await S('receipts.js');
+  const items = await S('items.js');
+  const { run } = await S('financedb.js');
+  const { now } = await S('util.js');
+
+  // The reported failure, exactly: the receipt printed 牛乳 (milk), the OCR read it as
+  // 牛丼 (beef bowl), the user renamed it to "Milk" in the review editor — and the Items
+  // catalogue still said "Beef Bowl", because resolution ran on the printed string and
+  // never consulted the correction. Worse, the edit then CONFIRMED 牛丼 → Beef Bowl.
+  const parsed = r.normalizeParsed({
+    merchant: 'Name Test Super', date: '2026-07-25', currency: 'JPY',
+    items: [{ printed: '牛丼 1000ml', name: 'Beef Bowl', qty: 1, amount: 250 }],
+    subtotal: 250, tax: 0, total: 250,
+  });
+  run(`INSERT INTO finance_receipt (id,upload_id,status,model,raw,parsed,parsed_ai,error,txn_ids,created_at,updated_at)
+       VALUES ('nm1','','parsed','audit','',?,'','','[]',?,?)`, JSON.stringify(parsed), now(), now());
+
+  r.editReceipt('nm1', { ...parsed, items: [{ ...parsed.items[0], name: 'Audit Milk', edited: true }] });
+  const applied = await r.apply('nm1', { mode: 'items' });
+  assert(applied.items.userNamed === 1, 'the edited line should be treated as user-named');
+
+  const list = items.listItems({ limit: 100 });
+  const arr = Array.isArray(list) ? list : (list.items || []);
+  assert(arr.some(i => i.nameEn === 'Audit Milk'), 'the catalogue should hold the name the USER typed');
+  assert(!arr.some(i => i.nameEn === 'Beef Bowl'), 'the model\'s guess must not become a catalogue entry');
+
+  // …and the printed string is bound to the user's item, confirmed, so the same misread
+  // resolves correctly next time with no model involved.
+  const back = items.resolveLocal('牛丼 1000ml');
+  assert(back?.how === 'confirmed-alias', 'the printed text should be a confirmed alias, got ' + JSON.stringify(back));
+  const mine = arr.find(i => i.nameEn === 'Audit Milk');
+  assert(back.itemId === mine.id, 'the alias must point at the user-named item');
+
+  // The `edited` flag has to survive normalisation — correcting the PRINTED text changes
+  // the very key any diff-based detection would match on, so it cannot be inferred.
+  const kept = r.normalizeParsed({ ...parsed, items: [{ ...parsed.items[0], edited: true }] });
+  assert(kept.items[0].edited === true, 'the edited flag must survive normalize()');
+
+  // A line the user did NOT touch still goes through the model path unchanged.
+  const untouched = r.normalizeParsed({ ...parsed, items: [{ ...parsed.items[0] }] });
+  assert(!untouched.items[0].edited, 'an untouched line must not be marked edited');
+
+  return 'user name wins · no ghost catalogue entry · confirmed alias · flag survives';
+});
+
+await hard('receipts: OCR priming uses only settled vocabulary', async () => {
+  // Priming the reader with product strings it has seen before is the cheap fix for
+  // character-level misreads (牛乳 vs 牛丼 on smudged thermal paper). But it must draw ONLY
+  // on confirmed aliases: unconfirmed ones are the model's own guesses, and feeding those
+  // back is a loop that entrenches the very misread it is meant to prevent.
+  const src = fs.readFileSync(path.join(ROOT, 'server', 'receipts.js'), 'utf8');
+  const block = src.slice(src.indexOf('function learnedPromptBlock'), src.indexOf('function ocrModel'));
+  assert(/a\.confirmed = 1/.test(block), 'the vocabulary query must filter to confirmed aliases only');
+  assert(/kind = 'drop'/.test(block), 'learned phantom lines should still be listed');
+  assert(/vocab\.length >= 3/.test(block), 'too small a vocabulary should be skipped, not sent');
+  return 'confirmed-only vocabulary · phantom list · minimum size';
+});
+
+await hard('finance: income tracking', async () => {
+  const fin = await S('finance.js');
+  const y = new Date().getFullYear();
+  // Earlier checks in this suite write to the same temp ledger, so measure DELTAS rather
+  // than absolutes — an assertion that depends on test order is a flake waiting to fire.
+  const before = fin.yearToDate(y);
+
+  // Four shapes freelance money arrives in. All become ordinary income rows; only the
+  // arithmetic that produced the amount differs, plus the `units` that make an effective
+  // hourly rate knowable months later.
+  fin.addTxn({ date: `${y}-03-04`, kind: 'income', amount: 24000, currency: 'JPY', category: 'Freelance', merchant: 'Audit Client A', units: 6, unit: 'hour' });
+  fin.addTxn({ date: `${y}-03-05`, kind: 'income', amount: 8000, currency: 'JPY', category: 'Freelance', merchant: 'Audit Client A', units: 2, unit: 'hour' });
+  fin.addTxn({ date: `${y}-03-06`, kind: 'income', amount: 3000, currency: 'JPY', category: 'Side Job', merchant: 'Audit Platform', units: 12, unit: 'item' });
+  fin.addTxn({ date: `${y}-03-07`, kind: 'income', amount: 45000, currency: 'JPY', category: 'Main Job', merchant: 'Audit Employer', isMainJob: true });
+  fin.addTxn({ date: `${y}-03-08`, kind: 'expense', amount: 5000, currency: 'JPY', category: 'Groceries', merchant: 'Audit Shop' });
+
+  const q = { from: `${y}-03-01`, to: `${y}-03-31` };
+
+  // units must survive the round trip, or effective rate is unanswerable.
+  const back = fin.listTxns({ ...q, kind: 'income' }).items.find(t => t.merchant === 'Audit Client A' && t.amountBase === 24000);
+  assert(back && back.units === 6 && back.unit === 'hour', 'units/unit must persist, got ' + JSON.stringify(back && { u: back.units, k: back.unit }));
+
+  // Per payer. This is the regression that matters: the group key was aliased `source`,
+  // but finance_txn HAS a `source` column, so SQLite grouped by that instead and every
+  // client collapsed into one row.
+  const src = fin.incomeBySource(q);
+  assert(src.items.length === 3, 'income should group into 3 payers, got ' + src.items.length + ' — the source/alias collision is back');
+  const byName = Object.fromEntries(src.items.map(i => [i.source, i]));
+  assert(byName['Audit Client A'].total === 32000, 'payer totals should sum their entries');
+  assert(byName['Audit Client A'].hours === 8, 'hours should roll up per payer');
+  assert(byName['Audit Client A'].rate === 4000, 'effective rate = total / hours, got ' + byName['Audit Client A'].rate);
+  assert(byName['Audit Platform'].rate === null, 'a payer with no hours has no hourly rate');
+  assert(!byName['Audit Shop'], 'expenses must never appear as an income source');
+
+  // The daily log groups by day, newest first.
+  const log = fin.incomeLog(q);
+  assert(log.days.length === 4, 'four income days, got ' + log.days.length);
+  assert(log.days[0].date > log.days[1].date, 'the log is newest-first');
+  assert(log.days.find(d => d.date === `${y}-03-04`).hours === 6, 'per-day hours');
+
+  // Year to date, and the projection that makes a part-year legible.
+  const ytd = fin.yearToDate(y);
+  assert(ytd.earned - before.earned === 80000, `ytd should gain 80000 income, got ${ytd.earned - before.earned}`);
+  assert(ytd.spent - before.spent === 5000, `ytd should gain 5000 spend, got ${ytd.spent - before.spent}`);
+  assert(ytd.net === Math.round((ytd.earned - ytd.spent) * 100) / 100, 'ytd net must equal earned − spent');
+  assert(ytd.hours - before.hours === 8, 'ytd counts hour-units only, not the 12 items, got ' + (ytd.hours - before.hours));
+  assert(ytd.effectiveRate === Math.round(ytd.earned / ytd.hours * 100) / 100, 'ytd effective rate = earned / hours');
+  assert(ytd.isCurrent === true && ytd.range.start === `${y}-01-01`, 'the current year runs to today, not to Dec 31');
+  assert(ytd.projectedNet > ytd.net, 'a part-year projection should exceed the part-year net');
+
+  // Main-job income is excluded from the side-income goal, which is the whole point of the flag.
+  const s = fin.summary(q);
+  assert(s.earned === 80000, `March income, got ${s.earned}`);
+  assert(s.sideEarned === 35000, `side income should exclude the 45000 main job, got ${s.sideEarned}`);
+
+  // The Overview carries YTD too, so a month in isolation is never the only view.
+  assert(fin.overview({ from: q.from, to: q.to }).ytd?.year === String(y), 'overview must include ytd');
+
+  // The calendar can speak net, and its scale is the largest swing either way.
+  const cal = fin.calendar(q);
+  const d8 = cal.days.find(x => x.date === `${y}-03-08`);
+  assert(d8.net === -5000, 'an expense-only day is negative net, got ' + d8.net);
+  assert(cal.maxNet >= 45000, 'maxNet is the biggest absolute swing, got ' + cal.maxNet);
+
+  return 'units persist · per-payer rollup · effective rate · daily log · ytd + projection · side vs main · net calendar';
+});
+
+await hard('uploads: orientation detection and rotation', async () => {
+  const up = await S('uploads.js');
+  if (!up.canConvertImages()) return 'skipped — no ffmpeg on this machine';
+  const { execFileSync } = await import('node:child_process');
+  const ff = process.env.FFMPEG || '/home/linuxbrew/.linuxbrew/bin/ffmpeg';
+
+  // Synthesise a "receipt": a bright tall strip on a dark field, then the same thing
+  // lying on its side. Angle was measured as a leading cause of bad reads on this
+  // machine — the same photo failed outright unrotated and parsed once straightened.
+  const make = (w, h, sw, sh) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aios-orient-'));
+    const out = path.join(dir, 'r.jpg');
+    execFileSync(ff, ['-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', `color=c=black:s=${w}x${h}`,
+      '-f', 'lavfi', '-i', `color=c=white:s=${sw}x${sh}`,
+      '-filter_complex', '[0][1]overlay=(W-w)/2:(H-h)/2', '-frames:v', '1', out]);
+    return { buf: fs.readFileSync(out), dir };
+  };
+
+  const tall = make(600, 900, 180, 760);      // strip standing up  → portrait photo
+  const wide = make(900, 600, 760, 180);      // strip lying down   → landscape photo
+
+  const t = up.imageSize(tall.buf);
+  assert(t && t.width === 600 && t.height === 900, 'imageSize should read the dimensions, got ' + JSON.stringify(t));
+  const g = up.greyRaster(tall.buf, 64);
+  assert(g && g.n === 64 && g.data.length === 64 * 64, 'greyRaster should return an n×n plane');
+
+  // Rotation is applied to the STORED file, so the photo the reviewer checks against is
+  // the one the model was given.
+  const stored = await up.saveUploadBuffer({ name: 'wide.jpg', mime: 'image/jpeg', buffer: wide.buf });
+  const before = up.imageSize(up.readUpload(stored.id).buffer);
+  assert(before.width > before.height, 'the fixture should start landscape');
+  const after = up.rotateStored(stored.id, 270);
+  const dim = up.imageSize(up.readUpload(stored.id).buffer);
+  assert(dim.height > dim.width, `rotating 270° should make it portrait, got ${dim.width}x${dim.height}`);
+  assert(after.rotatedBy === 270, 'the meta should record the rotation, got ' + after.rotatedBy);
+  assert(after.size > 0 && after.mime === 'image/jpeg', 'the rotated file should still be a JPEG');
+
+  // A no-op rotation must not re-encode (each pass costs quality).
+  const same = up.rotateStored(stored.id, 0);
+  assert(same.size === after.size, '0° should be a no-op');
+
+  // Cropping to the document is a RESOLUTION fix, not a tidiness one: the model
+  // downsamples whatever it is handed, and a receipt fills under half the frame on every
+  // real example here. Measured — uncropped, one transcribed to 86 characters and missed
+  // every product; cropped, 698 characters and a perfect reading.
+  const crop = up.cropToContent(wide.buf);
+  assert(crop && crop.buffer?.length, 'a strip on a dark field should be croppable');
+  assert(crop.area < 80, 'the crop should save real area, got ' + crop.area + '%');
+  const cd = up.imageSize(crop.buffer);
+  assert(cd.width < 900 && cd.height < 600, `the crop should be smaller than the frame, got ${cd.width}x${cd.height}`);
+
+  // …and it must decline when there is nothing to gain, rather than nibbling every photo.
+  const full = make(600, 900, 600, 900);
+  assert(up.cropToContent(full.buf) === null, 'an image that already fills the frame must not be cropped');
+  fs.rmSync(full.dir, { recursive: true, force: true });
+
+  for (const f of [tall, wide]) fs.rmSync(f.dir, { recursive: true, force: true });
+  return 'imageSize · greyRaster · rotate in place · meta records the angle · 0° no-op · crop-to-document · declines when pointless';
+});
+
+await hard('llm: schema-constrained output', async () => {
+  // The fix for "the model did not return usable JSON": llama.cpp compiles a JSON Schema
+  // to a GBNF grammar and masks any token that would break it. Verified against a real
+  // llama-server on this box (an enum in the schema came back as exactly that enum), but
+  // what an offline suite can pin is the WIRING — that a schema reaches the provider in
+  // the right field, since a silently-dropped response_format looks identical to success
+  // until a scan fails weeks later.
+  const { spawnSync } = await import('node:child_process');
+  const script = `
+import http from 'node:http';
+const seen = [];
+const srv = http.createServer((req, res) => {
+  let b = ''; req.on('data', c => b += c);
+  req.on('end', () => {
+    seen.push(JSON.parse(b));
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: ' + JSON.stringify({ choices: [{ delta: { content: '{"ok":true}' } }] }) + '\\n\\n');
+    res.write('data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }) + '\\n\\n');
+    res.write('data: [DONE]\\n\\n'); res.end();
+  });
+});
+await new Promise(r => srv.listen(0, '127.0.0.1', r));
+const port = srv.address().port;
+const fs = await import('node:fs'); const path = await import('node:path');
+fs.writeFileSync(path.join(process.env.AIOS_DATA, 'config.json'), JSON.stringify({
+  providers: { custom: [{ id: 'm', name: 'Mock', baseUrl: 'http://127.0.0.1:' + port + '/v1' }] },
+}));
+const { streamChat } = await import(${JSON.stringify(path.join(ROOT, 'server', 'llm.js'))});
+const SCHEMA = { name: 'thing', schema: { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } } };
+const withSchema = await streamChat({ modelRef: 'custom_m:x', messages: [{ role: 'user', text: 'hi' }], schema: SCHEMA, maxTokens: 64 });
+await streamChat({ modelRef: 'custom_m:x', messages: [{ role: 'user', text: 'hi' }], maxTokens: 64 });
+srv.close();
+console.log('RESULT ' + JSON.stringify({
+  text: withSchema.text,
+  rf: seen[0].response_format,
+  plainHasRf: Object.prototype.hasOwnProperty.call(seen[1], 'response_format'),
+}));`;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    encoding: 'utf8', timeout: 20_000,
+    env: { ...process.env, AIOS_DATA: fs.mkdtempSync(path.join(os.tmpdir(), 'aios-schema-')) },
+  });
+  const m = r.stdout.match(/RESULT (\{.*\})/);
+  assert(m, 'schema subprocess failed: ' + (r.stderr || r.stdout).slice(0, 300));
+  const o = JSON.parse(m[1]);
+  assert(o.text === '{"ok":true}', 'the constrained reply should stream through as content');
+  assert(o.rf?.type === 'json_schema', 'response_format.type should be json_schema, got ' + JSON.stringify(o.rf));
+  assert(o.rf?.json_schema?.strict === true, 'strict mode must be on or the grammar is advisory');
+  assert(o.rf?.json_schema?.schema?.required?.[0] === 'ok', 'the caller schema should be passed through intact');
+  assert(!o.plainHasRf, 'a call without a schema must not send response_format');
+  return 'schema → response_format · strict · passthrough · absent when unused';
+});
+
+await hard('receipts: the OCR request is budgeted for a thinking model', async () => {
+  // Gemma 4 emits 180-250 reasoning tokens even with enable_thinking/reasoning_effort/
+  // thinking.type all set to off — measured, all three are no-ops for its template. The
+  // old 2400-token cap was therefore spent narrating and the JSON never arrived: 3130
+  // characters of "Here's a thinking process…" stored as a failed scan. These constants
+  // are the fix; if someone trims them back, this fails.
+  const src = fs.readFileSync(path.join(ROOT, 'server', 'receipts.js'), 'utf8');
+  assert(/schema:\s*RECEIPT_SCHEMA/.test(src), 'the scan must send the schema');
+  const caps = [...src.matchAll(/attempt\((\d+)\)/g)].map(x => Number(x[1]));
+  assert(caps.length >= 2, 'expected a first pass and a retry');
+  assert(Math.min(...caps) >= 4096, 'the first pass needs room for reasoning + JSON, got ' + Math.min(...caps));
+  assert(Math.max(...caps) > Math.min(...caps), 'the retry should raise the cap, got ' + JSON.stringify(caps));
+  assert(/maxItems:\s*\d+/.test(src), 'the items array must be bounded — an unbounded one ran away for 6876 tokens');
+  assert(/stopReason === 'length'/.test(src), 'truncation must be detected, not reported as bad JSON');
+  return 'schema sent · 4096 first pass · larger retry · bounded array · truncation detected';
 });
 
 await hard('llmctl: profiles + launcher config', async () => {

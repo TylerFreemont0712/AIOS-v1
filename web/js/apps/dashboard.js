@@ -311,9 +311,10 @@ export default {
             card('daily', 'Planner', 'Calendar, tasks, and your day at a glance', 'planner'),
             card('vault', 'Second Brain', cfg.vault?.path ? 'Browse, ask, and grow your Obsidian vault' : 'Connect your Obsidian vault', 'vault'),
             card('learn', 'Learning', 'Roadmaps and AI-tutored lessons, web-grounded', 'learn'),
-            card('graph', 'Bench', 'Measure which model is best at which task', 'bench'),
+            // No Bench or Files card: Bench opens from the Models header (it is something
+            // you do TO a model) and Files from the row of the project you want. Both are
+            // still in the command palette for anyone who goes looking.
             card('cpu', 'Models', 'Local model garage, auto-routing, one-click serving', 'models'),
-            card('files', 'Files', 'Explore and edit project files', 'files'),
             card('terminal', 'Terminal', 'A real shell, right in your hub', 'terminal'),
             card('projects', 'Projects', 'Register, create, and manage workspaces', 'projects'),
             card('github', 'GitHub', 'Repos, PRs, and publishing — no browser needed', 'github'),

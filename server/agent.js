@@ -6,7 +6,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { DATA, loadConfig, contextBudget } from './config.js';
 import { streamChat } from './llm.js';
-import { toolSchemas, toolGroups, toolDirectory, runTool, isWriteTool, isWikiScopedCall, diffPreview } from './tools.js';
+import { toolSchemas, toolGroups, toolDirectory, runTool, isWriteTool, isWikiScopedCall, diffPreview, META_LOAD, activateGroups } from './tools.js';
 import { checkFile, checkFiles, runProjectTests } from './checks.js';
 import { skillsPrompt } from './skills.js';
 import { id as genId, now, readJSON, writeJSON, estTokens, safePath, clampMiddle, jsonDirIndex } from './util.js';
@@ -135,27 +135,13 @@ function leanEnabled(s) {
 const activeGroupsFor = (s) => [...new Set([...CORE_GROUPS, ...(s.toolGroups || [])])]
   .filter(g => toolGroups().includes(g));
 
-const META_LOAD = {
-  name: 'load_tools',
-  description: 'Activate additional tool GROUPS from the directory in your system prompt (e.g. web, vault, learning). Their full tools become callable on your next turn and stay active for this session. Load a group the moment the task needs it — not speculatively.',
-  parameters: { type: 'object', properties: { groups: { type: 'array', items: { type: 'string' }, description: 'Group names from the directory' } }, required: ['groups'] },
-};
 const META_REMEMBER = {
   name: 'remember',
   description: 'Pin a short note (≤300 chars) to your system prompt for the rest of this session. Pins survive context compaction, so use this for anything that must never be lost on a long task: key decisions, IDs, ports, tricky paths, the user\'s exact requirements.',
   parameters: { type: 'object', properties: { note: { type: 'string' } }, required: ['note'] },
 };
 
-function doLoadTools(s, args) {
-  const known = toolGroups();
-  const want = (Array.isArray(args?.groups) ? args.groups : []).map(g => String(g).toLowerCase().trim());
-  const good = want.filter(g => known.includes(g));
-  const bad = want.filter(g => !known.includes(g));
-  s.toolGroups = [...new Set([...(s.toolGroups || []), ...good])];
-  if (!good.length) return `No valid groups in ${JSON.stringify(want)}. Available: ${known.join(', ')}.`;
-  return `Activated: ${good.join(', ')}. Their tools are callable from your next turn onward.`
-    + (bad.length ? ` (Unknown: ${bad.join(', ')} — available groups: ${known.join(', ')}.)` : '');
-}
+const doLoadTools = (s, args) => activateGroups(s, args?.groups);
 
 function doRemember(s, args) {
   const note = String(args?.note || '').trim().slice(0, 300);
@@ -175,18 +161,58 @@ function doRemember(s, args) {
 const sizeOf = (msgs) => msgs.reduce((n, m) => n + JSON.stringify(m).length, 0);
 const clip = (t, n) => { t = String(t || ''); return t.length > n ? t.slice(0, n) + '…' : t; };
 
-/** Keep the last few messages verbatim; never split an assistant/tool-results pair. */
-function checkpointCut(msgs) {
-  let cut = Math.max(0, msgs.length - 6);
-  if (msgs[cut]?.role === 'tools') cut -= 1;   // keep the calling assistant with its results
-  return Math.max(0, cut);
+// How much of the window a checkpoint is allowed to leave behind. The tail is what the
+// model still sees verbatim; everything older becomes the summary. Keeping the tail
+// small is what makes the model call worth making — the run then has the remaining ~55%
+// of the window to grow into before another checkpoint is due.
+const TAIL_SHARE = 0.35;
+const MIN_HEAD_SHARE = 0.25;    // reclaiming less than this is not worth a model call
+const MIN_TAIL_MSGS = 2;
+const MAX_TAIL_MSGS = 8;
+// The working set: trailing messages whose tool output is never shortened, because the
+// model is actively reasoning from them. Bounded by size as well as count — protecting
+// six messages means nothing when three of them would fill the window on their own.
+const KEEP_VERBATIM = 6;
+const VERBATIM_SHARE = 0.5;
+
+/**
+ * Index where the trailing window starts: walk back from the newest message, keeping
+ * messages until that window would outgrow `maxChars` or `maxMsgs`. Always keeps
+ * MIN_TAIL_MSGS, so the model never loses the step it is halfway through.
+ *
+ * Both the checkpoint cut and the never-squashed working set are this same shape, and
+ * both used to be flat counts — last-6 however big those six were. On a small local
+ * context that made checkpoints self-perpetuating: six messages carrying a couple of
+ * file reads already filled most of an 18k window, so the very next tool call put the
+ * run back over the line and it produced a checkpoint per step — 15-20 for one task,
+ * each costing a model call and each summarising barely a step of work.
+ */
+function tailStart(msgs, maxChars, maxMsgs) {
+  let start = msgs.length, size = 0;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    size += JSON.stringify(msgs[i]).length;
+    const kept = msgs.length - i;
+    if (kept > MIN_TAIL_MSGS && (size > maxChars || kept > maxMsgs)) break;
+    start = i;
+  }
+  return start;
 }
 
-async function compactTranscript(s, st) {
+/** Where a checkpoint cuts. Never splits an assistant from its tool results.
+ *  Exported for the audit: checkpoint frequency is a silent regression otherwise. */
+export function checkpointCut(msgs, tailBudget) {
+  const cut = tailStart(msgs, tailBudget, MAX_TAIL_MSGS);
+  return Math.max(0, msgs[cut]?.role === 'tools' ? cut - 1 : cut);
+}
+
+async function compactTranscript(s, st, budget) {
   const msgs = s.transcript;
-  const cut = checkpointCut(msgs);
+  const cut = checkpointCut(msgs, budget * TAIL_SHARE);
   const head = msgs.slice(0, cut);
-  if (head.length < 4) return false;   // too little to be worth a model call
+  // Worth a model call? Both tests matter. Too few messages and there is nothing to
+  // summarise; too few BYTES and the checkpoint buys back no room, so the next tool
+  // call lands straight back here and the cycle repeats.
+  if (head.length < 4 || sizeOf(head) < budget * MIN_HEAD_SHARE) return false;
 
   const lines = head.map(m => {
     if (m.role === 'user') return `USER${m.kind === 'checkpoint' ? ' (previous checkpoint)' : ''}: ${clip(m.text, 700)}`;
@@ -208,7 +234,8 @@ DONE: completed steps — files changed (paths!), commands run and their outcome
 FACTS: hard-won knowledge the next instance must not re-derive — paths, names, versions, decisions, gotchas, error messages already solved
 NEXT: what remains, in order, starting with the immediate next action
 
-Max ~350 words. Include EVERY pinned or user-stated requirement.
+Max ~450 words. This covers a long stretch of work, so favour completeness over brevity.
+Include EVERY pinned or user-stated requirement.
 
 History:
 ${clampMiddle(lines, 24000)}`,
@@ -287,21 +314,31 @@ export async function userMessage(sid, text, attachments) {
       const system = systemPrompt(s, { lean, activeGroups });
       const historyBudget = Math.max(4000, inputChars - system.length - JSON.stringify(tools).length);
 
-      // Checkpoint before the window overflows: compact old context into a structured
-      // handoff instead of silently dropping it. trimmed() stays as the safety net for
-      // when compaction is disabled, fails, or can't shrink enough.
-      if (cfg.agent.checkpoints !== false && sizeOf(s.transcript) > historyBudget * 0.9) {
+      // Checkpoint when trimming can no longer keep the history honest — when it has to
+      // drop whole exchanges or hard-truncate the working set, rather than merely
+      // shorten stale tool output. Compaction turns that loss into a structured handoff;
+      // fitHistory stays the safety net for when it is disabled, fails, or can't shrink
+      // enough.
+      //
+      // The trigger used to be "the RAW transcript passed 90% of the budget", which
+      // counted bytes the model is never sent: trimming squashes stale tool results at
+      // send time, so a long run sat permanently over the line on paper and compacted
+      // almost every turn — the 15-20 checkpoints a single long task produced, each one
+      // an extra model call summarising barely a step of work.
+      let fitted = fitHistory(s, historyBudget);
+      if (cfg.agent.checkpoints !== false && fitted.lossy) {
         emit(sid, { type: 'status', state: 'compacting' });
         const before = estTokens(JSON.stringify(s.transcript));
         try {
-          if (await compactTranscript(s, st)) {
+          if (await compactTranscript(s, st, historyBudget)) {
             save(s);
             const after = estTokens(JSON.stringify(s.transcript));
             emit(sid, { type: 'checkpoint', n: s.checkpoints, tokensBefore: before, tokensAfter: after });
+            fitted = fitHistory(s, historyBudget);      // the model gets the compacted view
           }
         } catch { /* fall through to the crude trim */ }
       }
-      const messages = trimmed(s, historyBudget);
+      const messages = fitted.messages;
       const res = await streamChat({
         modelRef: s.modelRef, system, messages, tools,
         signal: st.abort.signal, maxTokens,
@@ -628,32 +665,51 @@ function projectContext(s) {
   return out;
 }
 
-/** Trim transcript to a char budget by dropping oldest exchanges (user → next user). */
-function trimmed(s, budget) {
+/**
+ * Fit the transcript into a char budget, cheapest sacrifice first, and report whether
+ * anything beyond routine shortening had to go.
+ *
+ * `lossy` is what drives checkpointing. Squashing stale tool output is the ordinary cost
+ * of a long run and nothing is really lost — the model has moved on from those results.
+ * Dropping whole exchanges or hard-truncating the working set destroys context the run
+ * still needs, and that is the moment to spend a model call on a structured handoff
+ * instead of letting it vanish.
+ */
+export function fitHistory(s, budget) {
   const msgs = s.transcript.map(m => ({ ...m }));
   const size = () => msgs.reduce((n, m) => n + JSON.stringify(m).length, 0);
+  let lossy = false;
 
-  // pass 1: squash old bulky tool results (keep last 2 exchanges intact)
-  if (size() > budget) {
-    const lastUserIdx = msgs.map((m, i) => m.role === 'user' ? i : -1).filter(i => i >= 0);
-    const protectedFrom = lastUserIdx.length >= 2 ? lastUserIdx[lastUserIdx.length - 2] : 0;
-    for (let i = 0; i < protectedFrom && size() > budget; i++) {
+  /** Shorten tool output in [from, to), oldest first, stopping the moment it fits. */
+  const squash = (limit, from, to) => {
+    for (let i = from; i < to && size() > budget; i++) {
       const m = msgs[i];
-      if (m.role === 'tools') m.results = m.results.map(r => ({ ...r, content: r.content?.length > 400 ? r.content.slice(0, 400) + '\n[trimmed]' : r.content }));
+      if (m.role !== 'tools' || !Array.isArray(m.results)) continue;
+      m.results = m.results.map(r => ({ ...r, content: r.content?.length > limit ? r.content.slice(0, limit) + '\n[trimmed]' : r.content }));
     }
-  }
+  };
+
+  // pass 1: squash stale tool output, leaving the working set verbatim.
+  //
+  // The protected region used to be "everything from the second-newest user message
+  // onward", which silently disabled this pass on the case that needs it most: a
+  // long-horizon run has exactly ONE user message, so the protected region was the whole
+  // transcript and nothing was ever squashed. That left no cheap way to shed bytes, so
+  // the run leaned on checkpoints — a model call — for work a slice() does for free.
+  if (size() > budget) squash(400, 0, tailStart(msgs, budget * VERBATIM_SHARE, KEEP_VERBATIM));
+
   // pass 2: drop whole oldest exchanges
   while (size() > budget) {
     const userIdxs = msgs.map((m, i) => m.role === 'user' ? i : -1).filter(i => i >= 0);
     if (userIdxs.length <= 1) break;
     msgs.splice(0, userIdxs[1]); // drop first exchange
+    lossy = true;
   }
-  // pass 3: last resort — even the newest exchange overflows; hard-truncate its bulk
+  // pass 3: last resort — even the working set overflows; hard-truncate its bulk
   // so a single huge tool result or message can never blow the context window.
   if (size() > budget) {
-    for (const m of msgs) {
-      if (m.role === 'tools') m.results = m.results.map(r => ({ ...r, content: r.content?.length > 800 ? r.content.slice(0, 800) + '\n[trimmed]' : r.content }));
-    }
+    lossy = true;
+    squash(800, 0, msgs.length);
     for (let i = 0; i < msgs.length - 1 && size() > budget; i++) {
       const m = msgs[i];
       if (typeof m.text === 'string' && m.text.length > 600) m.text = m.text.slice(0, 600) + '\n[trimmed]';
@@ -667,7 +723,9 @@ function trimmed(s, budget) {
       }
     }
   }
-  return msgs;
+  return { messages: msgs, lossy };
 }
+
+const trimmed = (s, budget) => fitHistory(s, budget).messages;
 
 export const estimateContext = (s) => estTokens(JSON.stringify(s.transcript));

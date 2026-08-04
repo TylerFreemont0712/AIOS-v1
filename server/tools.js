@@ -11,6 +11,7 @@ import { listSkills, getSkill } from './skills.js';
 import { search as vaultSearch, index as vaultIndex, readNote as vaultReadNote, writeNote as vaultWriteNote, dailyCapture, generateWiki } from './vault.js';
 import * as wiki from './wiki.js';
 import * as forge from './toolforge.js';
+import * as mcp from './mcp.js';
 import * as planner from './planner.js';
 import * as git from './git.js';
 import * as geo from './geo.js';
@@ -21,7 +22,7 @@ import * as bench from './bench.js';
 import { gpuStats } from './gpu.js';
 import { llmStatus as llmctlStatus } from './llmctl.js';
 import { probeServices } from './services.js';
-import { fetchRecent as mailRecent, searchMail, readMessage as mailRead } from './mail.js';
+import { fetchRecent as mailRecent, searchMail, readMessage as mailRead, requireMail } from './mail.js';
 
 export const TOOL_DEFS = [
   {
@@ -900,6 +901,22 @@ const customDefs = () => forge.listCustomTools()
   .filter(t => !BUILTIN_NAMES.has(t.name))
   .map(t => ({ name: t.name, description: t.description, parameters: t.parameters, write: t.access === 'write', group: 'custom', custom: true }));
 
+/**
+ * Tools published by connected MCP servers, in the same def shape.
+ *
+ * Read from mcp.js's cache, never over the wire — this runs on every agent turn. A
+ * server that is down contributes nothing and costs nothing.
+ *
+ * `write: !t.readOnly` is deliberately pessimistic. MCP's readOnlyHint is optional and
+ * advisory, so an unlabelled tool goes through the approval gate: the alternative is
+ * letting someone else's process edit a project unattended because it forgot an
+ * annotation. A name collision with a built-in loses — ours wins, theirs is dropped,
+ * because silently shadowing `bash` would be the worst possible surprise.
+ */
+const mcpDefs = () => mcp.listMcpTools()
+  .filter(t => !BUILTIN_NAMES.has(t.name))
+  .map(t => ({ name: t.name, description: t.description, parameters: t.parameters, write: !t.readOnly, group: t.group, mcp: true }));
+
 export const enabledTools = () => {
   const cfg = loadConfig();
   const disabled = new Set(cfg.tools?.disabled || []);
@@ -907,16 +924,23 @@ export const enabledTools = () => {
   const hasMail = !!(cfg.mail?.host && cfg.mail?.user && cfg.mail?.password);
   // vault/mail tools only make sense once those integrations are connected;
   // git tools only when the git binary exists on this machine
-  return [...TOOL_DEFS, ...customDefs()].filter(t =>
+  return [...TOOL_DEFS, ...customDefs(), ...mcpDefs()].filter(t =>
     !disabled.has(t.name) && (t.group !== 'vault' || hasVault) && (t.group !== 'mail' || hasMail)
     && (t.group !== 'git' || git.hasGit()));
 };
 
-/** Write classification across built-ins AND custom tools — the approval gate keys off this. */
+/** Write classification across built-in, forged AND MCP tools — the approval gate keys
+ *  off this, so an unknown name must fall on the side of asking. */
 export function isWriteTool(name) {
   if (WRITE_TOOLS.has(name)) return true;
   if (BUILTIN_NAMES.has(name)) return false;
-  return forge.getCustomTool(name)?.access === 'write';
+  const custom = forge.getCustomTool(name);
+  if (custom) return custom.access === 'write';
+  const remote = mcp.resolveTool(name);
+  if (remote) return !remote.def.readOnly;
+  // In an MCP namespace but not currently resolvable (server down mid-run): assume it
+  // writes. The gate's job is to ask when it does not know.
+  return !!mcp.ownerOf(name);
 }
 
 /** Additive upkeep calls (wiki folder, daily note, generated maps, planner items) —
@@ -950,18 +974,40 @@ export const toolGroups = () => [...new Set(enabledTools().map(t => t.group))];
 // (web search/read, the vault, mail, the planner, the learning corner). Files/git/system
 // and every write tool are deliberately excluded; use the Agent for those.
 const CHAT_TOOL_ALLOW = new Set([
-  'web_search', 'fetch_url', 'crawl_site', 'wikipedia',
+  'web_search', 'fetch_url', 'wikipedia',
   'directions', 'find_places', 'weather',
   'translate', 'calculate', 'convert', 'datetime',
-  'vault_search', 'vault_list', 'vault_read', 'wiki_recall', 'note_template',
+  'vault_search', 'vault_list', 'vault_read', 'wiki_recall',
   'mail_recent', 'mail_search', 'mail_read',
   'agenda_view',
   'finance_summary', 'finance_search', 'finance_insights', 'price_check',
-  'learn_subjects', 'learn_subject', 'learn_lesson_read', 'learn_weak_topics',
+  'learn_subjects', 'learn_subject', 'learn_weak_topics',
   // additive writes Chat is allowed to make (see CHAT_SAFE_WRITES) — jotting notes,
   // logging the day, adding planner items on request
   'quick_note', 'vault_append', 'daily_log', 'task_add', 'event_add', 'finance_log',
 ]);
+// Deliberately NOT in chat, though they are read-only and would fit:
+//   crawl_site       — walks a whole site over many fetches; that is what the Research
+//                      app is for, and in a chat turn it just stalls the reply.
+//   note_template    — vault scaffolding, used while writing notes in the Vault app.
+//   learn_lesson_read— dumps a full lesson into the window; read lessons in Learning.
+// Each was costing schema budget on every turn to serve a case the right app handles
+// better. Removing them is not a loss of capability, it is a relocation of it.
+
+/**
+ * Chat's always-loaded core: the tools an assistant reaches for regardless of topic.
+ *
+ * Everything else in the allow-list sits behind load_tools. The split is by observed
+ * frequency, not tidiness — "what's on today", "note this down", "search that", and
+ * arithmetic/dates are the things a general chat does constantly, so making any of them
+ * cost an extra round-trip would be a bad trade. Finance, mail, maps and learning are
+ * topical: when they come up they are the subject of the message, and the model has an
+ * obvious reason to load them.
+ */
+const CHAT_CORE = new Set([
+  'web_search', 'fetch_url', 'datetime', 'calculate', 'agenda_view', 'vault_search', 'quick_note',
+]);
+export const chatCoreNames = () => CHAT_CORE;
 // Chat has no approval gate, so writes are normally Agent-only. These few are the
 // exception: additive and non-destructive (create-or-append a note, log the day, add
 // a task/event), so an errant call can't clobber anything. Everything else that
@@ -974,21 +1020,65 @@ export const isChatSafeWrite = (name) => CHAT_SAFE_WRITES.has(name);
 export const chatTools = () => enabledTools().filter(t => CHAT_TOOL_ALLOW.has(t.name) && (!isWriteTool(t.name) || CHAT_SAFE_WRITES.has(t.name)));
 export const chatToolSchemas = () => chatTools().map(({ name, description, parameters }) => ({ name, description, parameters }));
 
-/** Compact per-group directory for the lean loadout's system prompt: one line per
- *  group, tool names with a clause of description each. ~2KB instead of ~29KB. */
-export function toolDirectory(excludeGroups = []) {
+/** Compact per-group directory: one line per group, tool names with a clause of
+ *  description each. ~2KB instead of ~29KB — the whole point of the lean loadout. */
+export function directoryFor(tools) {
   const short = (d) => {
     const s = String(d || '').split(/(?<=[.!?])\s/)[0];
     return (s.length > 70 ? s.slice(0, 67) + '…' : s).replace(/\.$/, '');
   };
   const byGroup = {};
-  for (const t of enabledTools()) {
-    if (excludeGroups.includes(t.group)) continue;
-    (byGroup[t.group] ||= []).push(`${t.name} (${short(t.description)})`);
-  }
+  for (const t of tools) (byGroup[t.group] ||= []).push(`${t.name} (${short(t.description)})`);
   return Object.entries(byGroup)
-    .map(([g, tools]) => `- ${g} [${tools.length}]: ${tools.join('; ')}`)
+    .map(([g, list]) => `- ${g} [${list.length}]: ${list.join('; ')}`)
     .join('\n');
+}
+
+export const toolDirectory = (excludeGroups = []) =>
+  directoryFor(enabledTools().filter(t => !excludeGroups.includes(t.group)));
+
+/** The meta-tool that turns a directory entry into a callable schema. Shared, because
+ *  chat and the agent must describe the same mechanism the same way. */
+export const META_LOAD = {
+  name: 'load_tools',
+  description: 'Activate additional tool GROUPS from the directory in your system prompt (e.g. web, vault, learning). Their full tools become callable on your next turn and stay active for this conversation. Load a group the moment the task needs it — not speculatively.',
+  parameters: { type: 'object', properties: { groups: { type: 'array', items: { type: 'string' }, description: 'Group names from the directory' } }, required: ['groups'] },
+};
+
+/**
+ * Split a surface's tool pool into "fully loaded now" and "one call away".
+ *
+ * `pool` is everything the surface may ever use, `coreNames` the tools worth their
+ * schema on every single turn, `activeGroups` whatever the model has since activated.
+ * Returns the schemas to send, the directory text for the prompt, and the group names
+ * that are still dormant.
+ *
+ * Core is by NAME rather than by group on purpose: the handful of tools a surface
+ * reaches for constantly rarely line up with a group boundary. Chat wants web_search and
+ * agenda_view every turn but not the other six things in their groups.
+ */
+export function leanLoadout({ pool, coreNames = new Set(), activeGroups = [] }) {
+  const isLoaded = (t) => coreNames.has(t.name) || activeGroups.includes(t.group);
+  const loaded = pool.filter(isLoaded);
+  const dormant = pool.filter(t => !isLoaded(t));
+  return {
+    tools: loaded.map(({ name, description, parameters }) => ({ name, description, parameters })),
+    directory: directoryFor(dormant),
+    dormantGroups: [...new Set(dormant.map(t => t.group))],
+  };
+}
+
+/** Add groups to a conversation's active set, ignoring names that mean nothing.
+ *  Returns the message the model sees, so it learns from a typo instead of retrying it. */
+export function activateGroups(state, wanted, { pool = enabledTools() } = {}) {
+  const known = [...new Set(pool.map(t => t.group))];
+  const want = (Array.isArray(wanted) ? wanted : []).map(g => String(g).toLowerCase().trim());
+  const good = want.filter(g => known.includes(g));
+  const bad = want.filter(g => !known.includes(g));
+  state.toolGroups = [...new Set([...(state.toolGroups || []), ...good])];
+  if (!good.length) return `No valid groups in ${JSON.stringify(want)}. Available: ${known.join(', ')}.`;
+  return `Activated: ${good.join(', ')}. Their tools are callable from your next turn onward.`
+    + (bad.length ? ` (Unknown: ${bad.join(', ')} — available groups: ${known.join(', ')}.)` : '');
 }
 
 /** For the settings UI: every tool with its metadata and current state. */
@@ -1001,7 +1091,11 @@ export function toolCatalog() {
     name: t.name, description: t.description, write: t.access === 'write', group: 'custom', core: false,
     enabled: !disabled.has(t.name), custom: true, runs: t.runs || 0, lastError: t.lastError || '',
   }));
-  return [...base, ...custom];
+  const remote = mcp.listMcpTools().filter(t => !BUILTIN_NAMES.has(t.name)).map(t => ({
+    name: t.name, description: t.description, write: !t.readOnly, group: t.group, core: false,
+    enabled: !disabled.has(t.name), mcp: true, server: t.serverId, remoteName: t.remoteName,
+  }));
+  return [...base, ...custom, ...remote];
 }
 
 /** Is the bundled/configured SearXNG instance answering? */
@@ -1025,10 +1119,21 @@ export async function runTool(name, args, ctx) {
   const impl = impls[name];
   try {
     if (!impl) {
+      // Built-in impls first, then the agent's own forged tools, then MCP. A remote
+      // server can never take over a name that already means something here.
       const def = forge.getCustomTool(name);
-      if (!def) return { content: `Unknown tool: ${name}`, isError: true };
-      const out = await forge.runCustomTool(def, args || {}, { caps: customCaps(ctx), modelRef: ctx?.modelRef, signal: ctx?.signal });
-      return { content: truncate(out, loadConfig().agent.maxOutputChars), isError: false };
+      if (def) {
+        const out = await forge.runCustomTool(def, args || {}, { caps: customCaps(ctx), modelRef: ctx?.modelRef, signal: ctx?.signal });
+        return { content: truncate(out, loadConfig().agent.maxOutputChars), isError: false };
+      }
+      // owns(), not resolveTool(): a name in a configured server's namespace is MCP's to
+      // answer for even when that server is down, so the model is told the server is
+      // disconnected rather than that the tool does not exist.
+      if (mcp.owns(name)) {
+        const out = await mcp.callTool(name, args || {}, { signal: ctx?.signal });
+        return { content: truncate(out, loadConfig().agent.maxOutputChars), isError: false };
+      }
+      return { content: `Unknown tool: ${name}`, isError: true };
     }
     const out = await impl(args || {}, ctx);
     return { content: truncate(out, loadConfig().agent.maxOutputChars), isError: false };
@@ -1733,8 +1838,8 @@ const impls = {
   },
 
   async mail_recent({ limit = 15, days = 3 }) {
-    const cfg = loadConfig();
-    const msgs = await mailRecent({ ...cfg.mail, lookbackDays: Math.max(1, Math.min(days || 3, 14)), maxMessages: Math.max(1, Math.min(limit || 15, 30)) });
+    const mc = requireMail();      // same "not configured" answer as mail_search/mail_read
+    const msgs = await mailRecent({ ...mc, lookbackDays: Math.max(1, Math.min(days || 3, 14)), maxMessages: Math.max(1, Math.min(limit || 15, 30)) });
     if (!msgs.length) return `No messages in the last ${days} day(s).`;
     return msgs.map(m => `[${m.uid}] ${m.seen ? '' : '(unread) '}${m.from} — ${m.subject}\n   ${m.date}${m.snippet ? `\n   ${m.snippet.slice(0, 160)}` : ''}`).join('\n');
   },

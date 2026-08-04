@@ -28,6 +28,8 @@ const MONTH_RX = /^\d{4}-\d{2}$/;
 
 export const KINDS = ['income', 'expense'];
 export const PAY_UNITS = ['flat', 'hour', 'minute'];
+// What a transaction's `units` counts. '' when the money has no work attached to it.
+export const UNIT_KINDS = ['hour', 'minute', 'item', 'day', 'word'];
 export const CADENCES = ['monthly', 'weekly', 'yearly'];
 export const SOURCES = ['manual', 'preset', 'recurring', 'ocr', 'import', 'ai'];
 
@@ -266,6 +268,11 @@ function sanitizeTxn(input, prev = {}) {
     preset_id: str(e.presetId, prev.preset_id, 32),
     recurring_id: str(e.recurringId, prev.recurring_id, 32),
     receipt_id: str(e.receiptId, prev.receipt_id, 32),
+    // How much WORK the money represents, when that is knowable: 3.5 hours, 12 pieces.
+    // Freelance income is meaningless without it — "¥40,000 this week" only becomes a
+    // decision once you know whether it took four hours or forty.
+    units: Math.max(0, Number(e.units ?? prev.units ?? 0) || 0),
+    unit: UNIT_KINDS.includes(e.unit) ? e.unit : (prev.unit || ''),
     created_at: prev.created_at || now(),
     updated_at: now(),
   };
@@ -276,24 +283,27 @@ const outTxn = (r) => r && ({
   amountBase: r.amount_base, fxRate: r.fx_rate, category: r.category,
   merchant: r.merchant, note: r.note, isMainJob: !!r.is_main_job, source: r.source,
   presetId: r.preset_id, recurringId: r.recurring_id, receiptId: r.receipt_id,
+  units: r.units || 0, unit: r.unit || '',
   createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
 const INSERT_TXN = `
 INSERT INTO finance_txn (id, date, kind, amount, currency, amount_base, fx_rate, category,
-  merchant, note, is_main_job, source, preset_id, recurring_id, receipt_id, created_at, updated_at, deleted)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
+  merchant, note, is_main_job, source, preset_id, recurring_id, receipt_id, units, unit,
+  created_at, updated_at, deleted)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
 ON CONFLICT(id) DO UPDATE SET
   date=excluded.date, kind=excluded.kind, amount=excluded.amount, currency=excluded.currency,
   amount_base=excluded.amount_base, fx_rate=excluded.fx_rate, category=excluded.category,
   merchant=excluded.merchant, note=excluded.note, is_main_job=excluded.is_main_job,
   source=excluded.source, preset_id=excluded.preset_id, recurring_id=excluded.recurring_id,
-  receipt_id=excluded.receipt_id, updated_at=excluded.updated_at, deleted=0`;
+  receipt_id=excluded.receipt_id, units=excluded.units, unit=excluded.unit,
+  updated_at=excluded.updated_at, deleted=0`;
 
 function writeTxn(t) {
   run(INSERT_TXN, t.id, t.date, t.kind, t.amount, t.currency, t.amount_base, t.fx_rate,
     t.category, t.merchant, t.note, t.is_main_job, t.source, t.preset_id,
-    t.recurring_id, t.receipt_id, t.created_at, t.updated_at);
+    t.recurring_id, t.receipt_id, t.units, t.unit, t.created_at, t.updated_at);
   return outTxn(t);
 }
 
@@ -459,16 +469,18 @@ export function topMerchants(q = {}) {
 
 /** Merchant/category autocomplete, ranked by how often and how recently a value
  *  has been used — the "times seen" heuristic from the old expenses panel. */
-export function suggest({ field = 'merchant', q = '', limit = 8 } = {}) {
+export function suggest({ field = 'merchant', q = '', limit = 8, kind = '' } = {}) {
   const col = field === 'category' ? 'category' : 'merchant';
   const like = `%${String(q || '').slice(0, 60)}%`;
   const n = Math.min(Math.max(Number(limit) || 8, 1), 50);
+  // Without the kind filter, "who has paid me?" answers with the corner shop.
+  const kindSql = KINDS.includes(kind) ? ` AND kind = '${kind}'` : '';
   const rows = all(`
     SELECT ${col} AS value, COUNT(*) AS seen, MAX(date) AS last_seen,
            AVG(amount) AS avg_amount, MAX(currency) AS currency,
            MAX(category) AS category
     FROM finance_txn
-    WHERE deleted = 0 AND ${col} <> '' AND ${col} LIKE ? COLLATE NOCASE
+    WHERE deleted = 0 AND ${col} <> '' AND ${col} LIKE ? COLLATE NOCASE${kindSql}
     GROUP BY ${col} COLLATE NOCASE
     ORDER BY seen DESC, last_seen DESC LIMIT ?`, like, n);
   return rows.map(r => ({
@@ -558,6 +570,7 @@ export function logPreset(id, { count = 1, units = 1, date, note } = {}) {
         date: on, kind: p.kind, amount: p.amount * u, currency: p.currency,
         category: p.category, merchant: p.name, isMainJob: !!p.is_main_job,
         note: note || label, source: 'preset', presetId: p.id,
+        units: u, unit,
       }));
     } else {
       const n = Math.min(Math.max(Math.trunc(Number(count) || 1), 1), 100);
@@ -566,6 +579,7 @@ export function logPreset(id, { count = 1, units = 1, date, note } = {}) {
           date: on, kind: p.kind, amount: p.amount, currency: p.currency,
           category: p.category, merchant: p.name, isMainJob: !!p.is_main_job,
           note: note || '', source: 'preset', presetId: p.id,
+          units: 1, unit: 'item',
         }));
       }
     }
@@ -973,9 +987,138 @@ export function calendar(q = {}) {
     FROM finance_txn WHERE deleted = 0 AND date >= ? AND date <= ?
     GROUP BY date ORDER BY date`, start, end);
   const max = rows.reduce((m, r) => Math.max(m, r.spent), 0);
+  // maxNet is the largest ABSOLUTE swing either way, so a heat scale built on it treats a
+  // +8,000 day and a -8,000 day as equally intense — which is what "daily net" means.
+  const maxNet = rows.reduce((m, r) => Math.max(m, Math.abs(r.earned - r.spent)), 0);
   return {
-    range: { start, end }, currency: settings().baseCurrency, max: round2(max),
-    days: rows.map(r => ({ date: r.date, spent: round2(r.spent), earned: round2(r.earned), count: r.count })),
+    range: { start, end }, currency: settings().baseCurrency,
+    max: round2(max), maxNet: round2(maxNet),
+    days: rows.map(r => ({
+      date: r.date, spent: round2(r.spent), earned: round2(r.earned),
+      net: round2(r.earned - r.spent), count: r.count,
+    })),
+  };
+}
+
+// ---------- income ----------
+//
+// Freelance income is a different question from spending, and it was only ever visible
+// here as a number in the hero. What it actually needs: what came in today, from which
+// client, doing what kind of work — and whether the year so far is ahead or behind.
+
+/**
+ * Year to date, Jan 1 → today (or → the end of a past year, so old years stay whole).
+ * The number a freelancer needs before a tax return exists, and the one that makes a
+ * good month legible as either "ahead" or "just less bad".
+ */
+export function yearToDate(year) {
+  const now_ = new Date();
+  const y = String(year || now_.getFullYear()).slice(0, 4);
+  if (!/^\d{4}$/.test(y)) throw bad('year must be YYYY');
+  const start = `${y}-01-01`;
+  const isCurrent = Number(y) === now_.getFullYear();
+  const end = isCurrent ? today() : `${y}-12-31`;
+
+  const r = one(`
+    SELECT
+      COALESCE(SUM(CASE WHEN kind='income'  THEN amount_base END),0) AS earned,
+      COALESCE(SUM(CASE WHEN kind='expense' THEN amount_base END),0) AS spent,
+      COALESCE(SUM(CASE WHEN kind='income' AND is_main_job=0 THEN amount_base END),0) AS side_earned,
+      COALESCE(SUM(CASE WHEN kind='income' AND unit='hour' THEN units END),0) AS hours,
+      COUNT(*) AS count
+    FROM finance_txn WHERE deleted = 0 AND date >= ? AND date <= ?`, start, end);
+
+  const earned = round2(r.earned), spent = round2(r.spent);
+  // Elapsed days, not calendar days: a run-rate that assumes December has happened
+  // in March is worse than no run-rate.
+  const days = Math.max(1, Math.round((Date.parse(end) - Date.parse(start)) / 86400000) + 1);
+  const daysInYear = (Number(y) % 4 === 0 && Number(y) % 100 !== 0) || Number(y) % 400 === 0 ? 366 : 365;
+
+  return {
+    year: y, range: { start, end }, currency: settings().baseCurrency, isCurrent,
+    earned, spent, net: round2(earned - spent), sideEarned: round2(r.side_earned),
+    hours: round2(r.hours), count: r.count, days,
+    perDay: round2((earned - spent) / days),
+    // What the year lands at if the rest of it looks like the part that has happened.
+    projectedEarned: isCurrent ? round2(earned / days * daysInYear) : earned,
+    projectedNet: isCurrent ? round2((earned - spent) / days * daysInYear) : round2(earned - spent),
+    effectiveRate: r.hours > 0 ? round2(earned / r.hours) : null,
+  };
+}
+
+/** Income grouped by who paid it — the client list, effectively. */
+export function incomeBySource(q = {}) {
+  const { start, end } = resolveRange(q);
+  // `payer`, not `source` — finance_txn already HAS a `source` column (manual/preset/ocr),
+  // so an alias by that name silently groups by the wrong thing: every client collapsed
+  // into one row labelled 'manual'. Group by the expression, not the alias, either way.
+  const rows = all(`
+    SELECT COALESCE(NULLIF(merchant,''), category) AS payer,
+           SUM(amount_base) AS total, COUNT(*) AS count,
+           COALESCE(SUM(CASE WHEN unit='hour' THEN units END),0) AS hours,
+           MAX(date) AS last_date
+    FROM finance_txn
+    WHERE deleted = 0 AND kind = 'income' AND date >= ? AND date <= ?
+    GROUP BY COALESCE(NULLIF(merchant,''), category)
+    ORDER BY total DESC`, start, end);
+  const total = round2(rows.reduce((s, r) => s + r.total, 0));
+  return {
+    range: { start, end }, currency: settings().baseCurrency, total,
+    items: rows.map(r => ({
+      source: r.payer, total: round2(r.total), count: r.count,
+      hours: round2(r.hours), lastDate: r.last_date,
+      share: total > 0 ? Math.round(r.total / total * 100) : 0,
+      rate: r.hours > 0 ? round2(r.total / r.hours) : null,
+    })),
+  };
+}
+
+/** The daily log: what came in each day, and the entries behind it. */
+export function incomeLog(q = {}) {
+  const { start, end } = resolveRange(q);
+  const rows = all(`
+    SELECT * FROM finance_txn
+    WHERE deleted = 0 AND kind = 'income' AND date >= ? AND date <= ?
+    ORDER BY date DESC, created_at DESC LIMIT 500`, start, end);
+
+  const byDay = new Map();
+  for (const r of rows) {
+    if (!byDay.has(r.date)) byDay.set(r.date, { date: r.date, total: 0, hours: 0, entries: [] });
+    const d = byDay.get(r.date);
+    d.total = round2(d.total + r.amount_base);
+    if (r.unit === 'hour') d.hours = round2(d.hours + (r.units || 0));
+    d.entries.push(outTxn(r));
+  }
+  return {
+    range: { start, end }, currency: settings().baseCurrency,
+    days: [...byDay.values()],
+  };
+}
+
+/** Everything the Income tab needs in one round trip. */
+export function incomeOverview(q = {}) {
+  const { start, end } = resolveRange(q);
+  const month = monthOf(start);
+  const s = summary({ from: start, to: end });
+  const hours = one(`
+    SELECT COALESCE(SUM(CASE WHEN unit='hour' THEN units END),0) AS hours
+    FROM finance_txn WHERE deleted = 0 AND kind='income' AND date >= ? AND date <= ?`, start, end);
+
+  return {
+    settings: currencies(),
+    summary: { ...s, hours: round2(hours.hours), effectiveRate: hours.hours > 0 ? round2(s.earned / hours.hours) : null },
+    ytd: yearToDate(month.slice(0, 4)),
+    bySource: incomeBySource({ from: start, to: end }),
+    byCategory: byCategory({ from: start, to: end, kind: 'income' }),
+    log: incomeLog({ from: start, to: end }),
+    monthly: monthlySeries({ months: 12, end: month }),
+    goal: getGoal(month),
+    // Income presets and recurring income only — the Plan tab owns the expense side.
+    presets: listPresets().filter(p => p.kind === 'income'),
+    recurring: listRecurring().filter(r => r.kind === 'income'),
+    categories: settings().incomeCategories,
+    // Past payers, so logging the same client again is a pick rather than a retype.
+    sources: suggest({ field: 'merchant', q: '', limit: 12, kind: 'income' }),
   };
 }
 
@@ -986,6 +1129,9 @@ export function overview(q = {}) {
   return {
     settings: currencies(),
     summary: summary({ from: start, to: end }),
+    // Year to date travels with the dashboard: a month on its own cannot say whether the
+    // year is working, and this is the figure a tax return starts from.
+    ytd: yearToDate(month.slice(0, 4)),
     categories: byCategory({ from: start, to: end, kind: 'expense' }),
     income: byCategory({ from: start, to: end, kind: 'income' }),
     monthly: monthlySeries({ months: 12, end: month }),

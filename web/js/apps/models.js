@@ -6,6 +6,7 @@
 
 import { el, icon, toast, modal, timeAgo } from '../ui.js';
 import { get, post, put } from '../api.js';
+import { openApp } from '../wm.js';
 
 const pctCls = (v) => v >= 0.8 ? 'good' : v >= 0.5 ? 'mid' : 'bad';
 const fmt = (v) => v === undefined || v === null ? '—' : Math.round(v * 100) + '%';
@@ -27,6 +28,9 @@ export default {
       ui.chip = el('span', { class: 'chip' }, '…'),
       ui.gpu = el('span', { class: 'models-gpu', title: 'GPU VRAM' }),
       el('span', { class: 'grow' }),
+      // Bench is a sub-section of this screen, not a peer of it: you benchmark the
+      // models listed below, and the standings come back as the "bench" tag on each card.
+      el('button', { class: 'btn sm ghost', title: 'Measure these models against the scored suite — quality, speed, and the per-skill breakdown', onclick: () => openApp('bench') }, icon('graph'), 'Bench'),
       ui.auto = el('button', { class: 'btn sm', title: 'Have an LLM tag + configure every model that has no preset yet (reads filenames, sizes this machine, pairs vision projectors)', onclick: () => autoSetup() }, icon('sparkle'), 'Auto-setup'),
       ui.logBtn = el('button', { class: 'btn sm ghost', title: 'llama-server log', onclick: toggleLog }, icon('file'), 'Log'),
       el('button', { class: 'btn sm ghost', title: 'Refresh', onclick: () => refresh() }, icon('refresh')),

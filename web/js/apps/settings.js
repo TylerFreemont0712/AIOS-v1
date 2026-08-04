@@ -58,6 +58,197 @@ export default {
 
     const switchBtn = (on, fn) => el('button', { class: 'switch' + (on ? ' on' : ''), role: 'switch', 'aria-checked': String(on), onclick: () => fn(!on) });
 
+    /**
+     * MCP servers.
+     *
+     * An MCP server is somebody else's process publishing tools over a standard protocol.
+     * Adding one never starts it — Connect does, because spawning a program is a thing the
+     * user should ask for explicitly. Each server's tools then appear in the belt below
+     * under their own group, and the agent activates that group with load_tools when a
+     * task needs it, so they cost nothing on turns that don't.
+     */
+    async function renderMcp() {
+      ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '18px' } }, 'MCP SERVERS'));
+      let data = null;
+      try { data = await get('/mcp'); } catch (e) { toast(e.message, 'err'); }
+      if (!data) return;
+
+      const DOT = { up: 'up', starting: 'warn', down: 'err', stopped: 'warn', idle: '', off: '' };
+      const act = async (fn, okMsg) => {
+        try { await fn(); if (okMsg) toast(okMsg, 'ok'); }
+        catch (e) { toast(e.message, 'err'); }
+        renderPanel();
+      };
+
+      for (const s of data.servers) {
+        const ctl = el('div', { class: 'row' });
+        if (s.status === 'up') {
+          ctl.append(el('span', { class: 'chip', title: s.tools.map(t => `${t.name}${t.readOnly ? '' : ' (write)'}`).join('\n') || 'none' },
+            `${s.tools.length} tool${s.tools.length === 1 ? '' : 's'}`));
+          ctl.append(el('button', { class: 'btn sm ghost', title: 'Call a tool by hand to check it really works', onclick: () => tryTool(s) }, icon('play'), 'Try'));
+          ctl.append(el('button', { class: 'btn sm ghost', onclick: () => act(() => post(`/mcp/servers/${s.id}/disconnect`, {})) }, 'Disconnect'));
+        } else {
+          ctl.append(el('button', {
+            class: 'btn sm' + (s.enabled ? ' primary' : ''), disabled: !s.enabled,
+            onclick: () => act(() => post(`/mcp/servers/${s.id}/connect`, {}), `${s.name} connected`),
+          }, s.status === 'starting' ? 'Connecting…' : 'Connect'));
+        }
+        ctl.append(el('button', { class: 'btn sm ghost', title: 'Edit', onclick: () => editServer(s, data.presets) }, icon('edit')));
+        ctl.append(el('button', {
+          class: 'btn sm ghost danger', title: 'Remove this server',
+          onclick: async () => {
+            if (!await confirmBox(`Remove ${s.name}?`, 'Its tools leave the agent\'s belt. The program itself is not touched.', 'Remove')) return;
+            act(() => del(`/mcp/servers/${s.id}`), 'removed');
+          },
+        }, icon('trash')));
+        ctl.append(switchBtn(s.enabled, (next) => act(() => post('/mcp/servers', { id: s.id, enabled: next }),
+          `${s.name} ${next ? 'enabled — hit Connect' : 'disabled'}`)));
+
+        const what = s.transport === 'http' ? s.url : [s.command, ...(s.args || [])].join(' ');
+        const sub = s.status === 'up'
+          ? `${s.serverInfo?.name || s.transport}${s.serverInfo?.version ? ` ${s.serverInfo.version}` : ''} · tools are called ${s.id}_… and live in the “${s.group}” group`
+          : s.error || what;
+        ui.panel.append(row(
+          el('span', { class: 'row', style: { gap: '7px' } },
+            el('span', { class: 'pdot ' + (DOT[s.status] ?? '') }),
+            el('span', { style: s.enabled ? {} : { opacity: .5 } }, s.name),
+            s.status === 'down' ? el('span', { class: 'chip', style: { color: 'var(--err)' } }, 'failed') : null),
+          sub, ctl));
+
+        // the server's own stderr — where a broken command actually explains itself
+        if (s.status === 'down' && s.log) {
+          ui.panel.append(el('pre', {
+            class: 'mono',
+            style: { fontSize: '11px', whiteSpace: 'pre-wrap', maxHeight: '120px', overflowY: 'auto', margin: '0 0 8px', padding: '8px 10px', background: 'var(--code-bg)', borderRadius: '8px', color: 'var(--muted)' },
+          }, s.log.slice(-1200)));
+        }
+      }
+
+      if (!data.servers.length) {
+        ui.panel.append(el('div', { class: 'desc', style: { marginTop: '-2px' } },
+          'None yet. An MCP server is a small program that publishes tools — driving Godot, a browser, a database. Add one and its tools join the agent’s belt beside the built-ins.'));
+      }
+      ui.panel.append(row('Add a server', 'From a preset, or configure the command yourself',
+        el('button', { class: 'btn sm primary', onclick: () => editServer(null, data.presets) }, icon('plus'), 'Add MCP server')));
+    }
+
+    /** Call one tool by hand — connecting proves the handshake, this proves it works. */
+    async function tryTool(s) {
+      if (!s.tools.length) return toast('this server published no tools', 'err');
+      const pick = el('select', { class: 'input select' }, ...s.tools.map(t => el('option', { value: t.remoteName }, `${t.remoteName}${t.readOnly ? '' : '  (write)'}`)));
+      const argsIn = el('textarea', { class: 'input mono', rows: 4, placeholder: '{ }' }, '{}');
+      const out = el('pre', {
+        class: 'mono',
+        style: { fontSize: '11.5px', whiteSpace: 'pre-wrap', maxHeight: '38vh', overflowY: 'auto', background: 'var(--code-bg)', padding: '10px', borderRadius: '8px', margin: 0 },
+      }, 'pick a tool, give it arguments, and run it');
+      modal({
+        title: `Try ${s.name}`, sub: 'Runs against the real server, exactly as the agent would.', wide: true,
+        body: el('div', { class: 'col', style: { gap: '8px', marginTop: '6px' } },
+          pick, el('div', { class: 'lbl' }, 'ARGUMENTS (JSON)'), argsIn, out),
+        actions: [
+          {
+            label: 'Run', kind: 'primary', onpick: async () => {
+              let args;
+              try { args = JSON.parse(argsIn.value.trim() || '{}'); }
+              catch (e) { out.textContent = `those arguments are not valid JSON — ${e.message}`; return false; }
+              out.textContent = 'running…';
+              try {
+                const r = await post(`/mcp/servers/${s.id}/call`, { tool: `${s.id}_${pick.value}`, args });
+                out.textContent = r.output || '(nothing returned)';
+              } catch (e) { out.textContent = 'failed: ' + e.message; }
+              return false;                       // keep the dialog open for another go
+            },
+          },
+          { label: 'Close', value: null },
+        ],
+      });
+    }
+
+    /** Create or edit one server. Presets fill the fields; nothing about them is special. */
+    async function editServer(existing, presets = []) {
+      const f = {
+        id: el('input', { class: 'input mono', value: existing?.id || '', placeholder: 'godot', disabled: !!existing, style: { width: '150px' } }),
+        name: el('input', { class: 'input', value: existing?.name || '', placeholder: 'Godot', style: { width: '190px' } }),
+        command: el('input', { class: 'input mono', value: existing?.command || '', placeholder: 'node', style: { width: '100%' } }),
+        args: el('textarea', { class: 'input mono', rows: 3, placeholder: 'one argument per line\n/path/to/godot-mcp/build/index.js' }),
+        cwd: el('input', { class: 'input mono', value: existing?.cwd || '', placeholder: 'optional working directory', style: { width: '100%' } }),
+        env: el('textarea', { class: 'input mono', rows: 3, placeholder: 'KEY=value, one per line' }),
+        url: el('input', { class: 'input mono', value: existing?.url || '', placeholder: 'https://example.com/mcp', style: { width: '100%' } }),
+      };
+      f.args.value = (existing?.args || []).join('\n');
+      // Values were never sent to the browser — show the names so they can be kept or
+      // replaced, and leave a blank value meaning "keep whatever is stored".
+      f.env.value = (existing?.envKeys || []).map(k => `${k}=`).join('\n');
+
+      let transport = existing?.transport || 'stdio';
+      const stdioBox = el('div', { class: 'col', style: { gap: '8px' } });
+      const httpBox = el('div', { class: 'col', style: { gap: '8px' } });
+      const lbl = (t) => el('div', { class: 'lbl' }, t);
+      stdioBox.append(lbl('COMMAND'), f.command, lbl('ARGUMENTS'), f.args, lbl('WORKING DIRECTORY'), f.cwd, lbl('ENVIRONMENT'), f.env);
+      httpBox.append(lbl('URL'), f.url);
+      const syncTransport = () => {
+        stdioBox.style.display = transport === 'stdio' ? '' : 'none';
+        httpBox.style.display = transport === 'http' ? '' : 'none';
+      };
+      const seg = el('div', { class: 'seg' }, ...[['stdio', 'Local program'], ['http', 'Remote URL']].map(([v, l]) => el('button', {
+        class: 'seg-btn' + (transport === v ? ' on' : ''),
+        onclick: (e) => {
+          transport = v; syncTransport();
+          for (const b of seg.querySelectorAll('.seg-btn')) b.classList.remove('on');
+          e.currentTarget.classList.add('on');
+        },
+      }, l)));
+      syncTransport();
+
+      const presetSel = el('select', { class: 'input select' },
+        el('option', { value: '' }, 'Start from a preset…'),
+        ...presets.map((p, i) => el('option', { value: String(i) }, p.name)));
+      const presetHint = el('div', { class: 'desc', style: { marginTop: '-2px' } }, '');
+      presetSel.addEventListener('change', () => {
+        const p = presets[Number(presetSel.value)];
+        if (!p) return;
+        f.id.value = p.id; f.name.value = p.name;
+        f.command.value = p.command || ''; f.args.value = (p.args || []).join('\n');
+        f.url.value = p.url || '';
+        f.env.value = Object.entries(p.env || {}).map(([k, v]) => `${k}=${v}`).join('\n');
+        transport = p.transport || 'stdio'; syncTransport();
+        for (const b of seg.querySelectorAll('.seg-btn')) b.classList.toggle('on', b.textContent === (transport === 'http' ? 'Remote URL' : 'Local program'));
+        presetHint.textContent = p.hint || '';
+      });
+
+      const ok = await modal({
+        title: existing ? `Edit ${existing.name}` : 'Add an MCP server',
+        sub: 'Its tools are named <id>_<tool> and grouped as mcp:<id>, so two servers can both publish a “search” without colliding.',
+        wide: true,
+        body: el('div', { class: 'col', style: { gap: '9px', marginTop: '6px' } },
+          existing ? null : presetSel, existing ? null : presetHint,
+          el('div', { class: 'row', style: { gap: '10px' } },
+            el('label', { class: 'col', style: { gap: '3px' } }, el('span', { class: 'lbl' }, 'ID'), f.id),
+            el('label', { class: 'col', style: { gap: '3px' } }, el('span', { class: 'lbl' }, 'NAME'), f.name)),
+          seg, stdioBox, httpBox),
+        actions: [{ label: 'Cancel', value: null }, { label: existing ? 'Save' : 'Add', kind: 'primary', value: true }],
+      });
+      if (!ok) return;
+
+      const lines = (t) => String(t.value || '').split('\n').map(s => s.trim()).filter(Boolean);
+      const env = {};
+      for (const line of lines(f.env)) {
+        const i = line.indexOf('=');
+        if (i > 0) env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+      }
+      try {
+        await post('/mcp/servers', {
+          id: (existing?.id || f.id.value).trim().toLowerCase(),
+          name: f.name.value.trim(), transport,
+          command: f.command.value.trim(), args: lines(f.args), cwd: f.cwd.value.trim(),
+          url: f.url.value.trim(), env,
+          enabled: existing ? existing.enabled : true,
+        });
+        toast(existing ? 'saved — reconnect to pick it up' : 'added — hit Connect to start it', 'ok');
+        renderPanel();
+      } catch (e) { toast(e.message, 'err'); }
+    }
+
     async function renderPanel() {
       const c = state.config;
       ui.panel.innerHTML = '';
@@ -318,8 +509,13 @@ export default {
         }, 'Clear'));
         ui.panel.append(row('Google Directions key', 'Optional. Adds train/bus (transit) directions and exact walking/cycling times; driving works without it.', gkCtl));
 
-        // the tool belt
-        const groups = [['files', 'FILES'], ['git', 'GIT'], ['system', 'SYSTEM'], ['web', 'WEB'], ['maps', 'MAPS & LOCAL'], ['utility', 'EVERYDAY UTILITIES'], ['vault', 'KNOWLEDGE BASE'], ['apps', 'AIOS APPS'], ['mail', 'MAIL'], ['custom', 'AI-FORGED TOOLS']];
+        await renderMcp();
+
+        // the tool belt — plus one section per connected MCP server, discovered from the
+        // catalogue rather than hard-coded, so a newly added server appears by itself
+        const mcpGroups = [...new Set(info.tools.filter(t => t.mcp).map(t => t.group))]
+          .sort().map(g => [g, `MCP · ${g.slice(4).toUpperCase()}`]);
+        const groups = [['files', 'FILES'], ['git', 'GIT'], ['system', 'SYSTEM'], ['web', 'WEB'], ['maps', 'MAPS & LOCAL'], ['utility', 'EVERYDAY UTILITIES'], ['vault', 'KNOWLEDGE BASE'], ['apps', 'AIOS APPS'], ['mail', 'MAIL'], ['custom', 'AI-FORGED TOOLS'], ...mcpGroups];
         for (const [gid, glabel] of groups) {
           const list = info.tools.filter(t => t.group === gid);
           if (!list.length) continue;
@@ -349,6 +545,7 @@ export default {
           }
         }
       }
+
 
       if (S.tab === 'vault') {
         ui.panel.append(el('h2', {}, 'Obsidian Vault'), el('div', { class: 'desc' }, 'AIOS works directly on your vault folder — the same files Obsidian opens.'));
@@ -581,6 +778,35 @@ export default {
             recBox.append(el('div', { class: 'set-sub' }, `could not check models: ${e.message}`));
           }
         })();
+
+        // --- how hard the scanner tries ---
+        //
+        // All three are trades of GPU seconds against how often a scan needs correcting by
+        // hand, and the right point on that curve depends on the machine and the receipts,
+        // so it is a setting rather than a constant. Defaults are the measured ones.
+        ui.panel.append(el('h2', { style: { marginTop: '22px' } }, 'Reading receipts'),
+          el('div', { class: 'desc' },
+            'Each scan scores itself out of 100 — the arithmetic, the fields that are printed on every receipt, and how much of the basket it recognises. These decide what happens when that score is low.'));
+
+        const numRow = (key, label, sub, { min, max, step = 1, suffix = '' }) => {
+          const inp = el('input', {
+            class: 'input sm', type: 'number', min, max, step,
+            value: fin[key] ?? '', style: { width: '80px' },
+          });
+          const commit = async () => {
+            const v = Number(inp.value);
+            if (!Number.isFinite(v) || v < min || v > max) { inp.value = fin[key] ?? ''; return toast(`${label} must be between ${min} and ${max}`, 'err'); }
+            if (await save({ finance: { [key]: v } })) fin[key] = v;
+          };
+          inp.addEventListener('change', commit);
+          return row(label, sub, el('div', { class: 'row', style: { gap: '8px', alignItems: 'center' } },
+            inp, suffix ? el('span', { class: 'set-sub' }, suffix) : null));
+        };
+
+        ui.panel.append(
+          numRow('ocrMinConfidence', 'Read it again below', 'A photo the model could not make anything of is turned and tried again until it scores at least this. A reading it clearly managed is never re-read — the same picture at the same settings gives the same answer, so a second look would only cost you the wait.', { min: 0, max: 100, step: 5, suffix: '/ 100' }),
+          numRow('ocrMaxAttempts', 'Most passes per photo', 'The ceiling on that. Each pass is roughly fifteen seconds of GPU.', { min: 1, max: 3, suffix: 'passes' }),
+          numRow('ocrTiles', 'Bands for a long receipt', 'A till receipt several times taller than it is wide gets downscaled before the model reads it, and the product names are the first thing to go. Above 1, a long one is read in this many overlapping horizontal bands and stitched back together, so the small print is read at its own size. Costs one pass per band; set 1 to read every photo whole.', { min: 0, max: 4, suffix: 'bands' }));
 
         // --- currency ---
         ui.panel.append(el('h2', { style: { marginTop: '22px' } }, 'Currency'),
