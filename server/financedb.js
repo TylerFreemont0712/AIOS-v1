@@ -1,6 +1,6 @@
 // Storage for the Finances app: one ledger for income and expenses, plus the
 // small satellite tables the UI needs (quick-log presets, monthly goals,
-// per-category budgets, recurring rules, OCR'd receipts).
+// per-category budgets, recurring rules, OCR'd receipts, expected income).
 //
 // SQLite rather than the usual JSON-per-domain because every question this app
 // asks is relational and range-scoped — "spend by category for a date window",
@@ -64,6 +64,47 @@ CREATE TABLE IF NOT EXISTS finance_preset (
   updated_at  TEXT NOT NULL,
   deleted     INTEGER NOT NULL DEFAULT 0
 );
+
+-- ---------------------------------------------------- expected income (想定)
+-- Freelance money is known twice: once when the work is done and you can only
+-- estimate what it was worth, and again a fortnight later when the payout lands.
+-- Both numbers matter, but only ONE of them is real money.
+--
+-- So estimates live here rather than in finance_txn with a flag. A flag would have
+-- to be excluded by every one of the fifteen aggregate queries in finance.js, and
+-- the day one of them is missed, imagined money is silently added to a total the
+-- user trusts — the same class of bug as summing yen and dollars, which this file
+-- was built to make impossible. A separate table cannot make that mistake.
+--
+-- Settling a batch of estimates writes ONE ordinary finance_txn for the amount that
+-- actually arrived, and allocates it back across the rows it covered (pro rata by
+-- estimate) into actual_base. That allocation is what makes "were my guesses any
+-- good, and for which client" answerable per row instead of only per payout.
+CREATE TABLE IF NOT EXISTS finance_pending (
+  id             TEXT PRIMARY KEY,
+  date           TEXT NOT NULL,                   -- the day the work was done
+  due_date       TEXT NOT NULL DEFAULT '',        -- when the money is expected, if known
+  amount         REAL NOT NULL,                   -- the estimate, as entered
+  currency       TEXT NOT NULL DEFAULT 'JPY',
+  amount_base    REAL NOT NULL,
+  fx_rate        REAL NOT NULL DEFAULT 1,
+  category       TEXT NOT NULL DEFAULT 'Freelance',
+  merchant       TEXT NOT NULL DEFAULT '',        -- who owes it
+  note           TEXT NOT NULL DEFAULT '',
+  is_main_job    INTEGER NOT NULL DEFAULT 0,
+  units          REAL NOT NULL DEFAULT 0,
+  unit           TEXT NOT NULL DEFAULT '',
+  preset_id      TEXT NOT NULL DEFAULT '',
+  status         TEXT NOT NULL DEFAULT 'open',    -- open | settled | void
+  actual_base    REAL NOT NULL DEFAULT 0,         -- this row's share of what actually arrived
+  settled_txn_id TEXT NOT NULL DEFAULT '',        -- the real income row the payout created
+  settled_at     TEXT NOT NULL DEFAULT '',        -- YYYY-MM-DD the money landed
+  created_at     TEXT NOT NULL,
+  updated_at     TEXT NOT NULL,
+  deleted        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_pending_open    ON finance_pending(deleted, status, date);
+CREATE INDEX IF NOT EXISTS idx_pending_settled ON finance_pending(deleted, status, settled_at);
 
 CREATE TABLE IF NOT EXISTS finance_goal (
   month      TEXT PRIMARY KEY,                    -- YYYY-MM
@@ -262,6 +303,15 @@ export function getDb() {
   } catch (e) { console.error('[finance] receipt fingerprint index:', e.message); }
   // Work behind the money: 3.5 hours, 12 pieces. Lets the Income tab answer "what am I
   // actually earning per hour", which is the question freelance income exists to answer.
+  // A preset started life as "one tap logs exactly this much". The columns below turn
+  // it into a TEMPLATE as well: everything about a recurring income stream that is
+  // always the same (who pays, what type it is, the standing note), so logging one is
+  // typing the amount and nothing else. An amount of 0 is the marker for that — it
+  // means "ask me", and is why sanitizePreset stopped rejecting a zero amount.
+  ensureColumn('finance_preset', 'merchant', `TEXT NOT NULL DEFAULT ''`);
+  ensureColumn('finance_preset', 'note', `TEXT NOT NULL DEFAULT ''`);
+  // Streams that are guessed on the day and paid later default to the expected ledger.
+  ensureColumn('finance_preset', 'is_estimate', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('finance_txn', 'units', 'REAL NOT NULL DEFAULT 0');
   ensureColumn('finance_txn', 'unit', `TEXT NOT NULL DEFAULT ''`);
   backupOnBoot();

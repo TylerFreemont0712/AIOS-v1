@@ -291,11 +291,16 @@ export function visionModels() {
  * Declared by the `ocr` tag on the model's preset, so adding a new one is configuration.
  */
 export function refIsTranscriber(ref) {
+  return !!refPreset(ref)?.tags.includes('ocr');
+}
+
+/** The preset behind a model ref, or null when the ref does not resolve to a local gguf
+ *  (a cloud model, or one since deleted). The tag/prompt/style lookups all start here. */
+export function refPreset(ref) {
   const s = String(ref || '').trim();
   const alias = s.includes(':') ? s.slice(s.indexOf(':') + 1) : s;
   const m = findByAlias(alias);
-  if (!m) return false;
-  return presetFor(m.file, m.sizeGB).tags.includes('ocr');
+  return m ? presetFor(m.file, m.sizeGB) : null;
 }
 
 /**
@@ -363,6 +368,14 @@ export function presetFor(file, sizeGB) {
     jinja: saved.jinja !== false,
     extra: String(saved.extra || ''),               // raw escape hatch for anything else
     tags: Array.isArray(saved.tags) ? saved.tags : [],
+    // How a reader tagged `ocr` wants to be asked, and what shape it answers in.
+    // Dedicated OCR models are prompt-sensitive to the point of uselessness when asked
+    // wrongly — dots.ocr returns two tokens for "OCR" and a full layout parse for its own
+    // instruction — and each new one arrives with its own. Empty means "use the built-in
+    // default for this model name" (see ocrPromptFor in receipts.js), so adding a reader
+    // is a preset edit rather than a code change.
+    ocrPrompt: String(saved.ocrPrompt || ''),
+    ocrStyle: saved.ocrStyle === 'layout-json' || saved.ocrStyle === 'lines' ? saved.ocrStyle : '',
     configured: !!cfg.presets?.[file],              // false = running on size defaults
   };
 }

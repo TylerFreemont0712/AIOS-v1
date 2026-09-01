@@ -31,7 +31,9 @@ export const PAY_UNITS = ['flat', 'hour', 'minute'];
 // What a transaction's `units` counts. '' when the money has no work attached to it.
 export const UNIT_KINDS = ['hour', 'minute', 'item', 'day', 'word'];
 export const CADENCES = ['monthly', 'weekly', 'yearly'];
-export const SOURCES = ['manual', 'preset', 'recurring', 'ocr', 'import', 'ai'];
+// 'settle' marks an income row created by settling expected income — the one
+// transaction that stands for a batch of estimates. See settlePending.
+export const SOURCES = ['manual', 'preset', 'recurring', 'ocr', 'import', 'ai', 'settle'];
 
 export const INCOME_CATEGORIES = ['Main Job', 'Side Job', 'Freelance', 'Investment', 'Gift', 'Refund', 'Other Income'];
 export const EXPENSE_CATEGORIES = [
@@ -491,13 +493,25 @@ export function suggest({ field = 'merchant', q = '', limit = 8, kind = '' } = {
 
 // ---------- presets ----------
 
+/**
+ * A preset is both a one-tap entry and a template, and the amount is what says which.
+ *
+ * A zero amount used to be rejected. It is now the marker for "ask me": everything
+ * about the stream that never changes — payer, category, currency, main-job flag, the
+ * standing note — is stored, and the one thing that differs each time is typed. That is
+ * the whole point for a stream like a micro-task platform, where the categorisation is
+ * always identical and only the figure moves.
+ */
 function sanitizePreset(input, prev = {}) {
   const cfg = settings();
   const e = input || {};
   const name = str(e.name, prev.name, 80);
   if (!name) throw bad('preset name is required');
-  const amount = Math.abs(num(e.amount ?? prev.amount, 'amount'));
-  if (!amount) throw bad('preset amount must not be zero');
+  // '' and null both mean "leave the amount open"; only a non-numeric string is an error.
+  const rawAmount = e.amount === undefined ? prev.amount : e.amount;
+  const amount = rawAmount === '' || rawAmount === null || rawAmount === undefined
+    ? 0 : Math.abs(num(rawAmount, 'amount'));
+  if (amount > 1e12) throw bad('amount is implausibly large');
   const currency = str(e.currency, prev.currency || cfg.baseCurrency, 3).toUpperCase();
   rateFor(currency, cfg);                                  // validate early
   const kind = KINDS.includes(e.kind) ? e.kind : (prev.kind || 'income');
@@ -506,6 +520,12 @@ function sanitizePreset(input, prev = {}) {
     id: prev.id || genId(8), name, amount, currency, kind, category,
     pay_unit: PAY_UNITS.includes(e.payUnit) ? e.payUnit : (prev.pay_unit || 'flat'),
     is_main_job: (e.isMainJob ?? prev.is_main_job ?? (category === 'Main Job' ? 1 : 0)) ? 1 : 0,
+    // Blank falls back to the preset's own name at log time, so the common case
+    // ("the chip is called Micro1 and Micro1 is who pays") needs nothing typed.
+    merchant: str(e.merchant, prev.merchant, 120),
+    note: str(e.note, prev.note, 500),
+    // Expense presets can never be estimates: only income is guessed before it arrives.
+    is_estimate: kind === 'income' && ((e.isEstimate ?? prev.is_estimate ?? 0) ? 1 : 0) ? 1 : 0,
     uses: prev.uses || 0,
     last_used: prev.last_used || '',
     created_at: prev.created_at || now(),
@@ -516,6 +536,10 @@ function sanitizePreset(input, prev = {}) {
 const outPreset = (r) => r && ({
   id: r.id, name: r.name, amount: r.amount, currency: r.currency, kind: r.kind,
   category: r.category, payUnit: r.pay_unit, isMainJob: !!r.is_main_job,
+  merchant: r.merchant || '', note: r.note || '', isEstimate: !!r.is_estimate,
+  // What the UI branches on: a template opens a one-field prompt, a fixed preset logs
+  // on the tap. Derived here so the rule lives in one place.
+  asksAmount: !(r.amount > 0),
   uses: r.uses, lastUsed: r.last_used, updatedAt: r.updated_at,
 });
 
@@ -527,14 +551,15 @@ export function listPresets() {
 
 function writePreset(p) {
   run(`INSERT INTO finance_preset (id, name, amount, currency, kind, category, pay_unit,
-        is_main_job, uses, last_used, created_at, updated_at, deleted)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)
+        is_main_job, merchant, note, is_estimate, uses, last_used, created_at, updated_at, deleted)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
        ON CONFLICT(id) DO UPDATE SET name=excluded.name, amount=excluded.amount,
         currency=excluded.currency, kind=excluded.kind, category=excluded.category,
         pay_unit=excluded.pay_unit, is_main_job=excluded.is_main_job,
+        merchant=excluded.merchant, note=excluded.note, is_estimate=excluded.is_estimate,
         updated_at=excluded.updated_at, deleted=0`,
     p.id, p.name, p.amount, p.currency, p.kind, p.category, p.pay_unit,
-    p.is_main_job, p.uses, p.last_used, p.created_at, p.updated_at);
+    p.is_main_job, p.merchant, p.note, p.is_estimate, p.uses, p.last_used, p.created_at, p.updated_at);
   return outPreset(p);
 }
 
@@ -551,42 +576,427 @@ export function deletePreset(id) {
   if (!r.changes) throw missing('preset not found');
 }
 
-/** Log a preset as one or more transactions.
- *  flat  → `count` separate rows of the preset amount (so three coffees read as
- *          three rows, matching the old behaviour the user relies on)
- *  hour/minute → a single row of amount x units */
-export function logPreset(id, { count = 1, units = 1, date, note } = {}) {
+/**
+ * Log a preset.
+ *
+ * Three shapes, chosen by what the preset already knows:
+ *   fixed flat        → `count` separate rows of the preset amount (so three coffees
+ *                       read as three rows, matching the old behaviour)
+ *   fixed hour/minute → a single row of rate x units
+ *   template (amount 0) → the caller supplies `amount`; everything else comes from
+ *                       the preset. This is the fast path for a stream whose
+ *                       categorisation never changes and whose figure always does.
+ *
+ * `estimate` routes the row to the expected ledger instead of the real one — defaulted
+ * from the preset so a stream that is always guessed first stays a one-click log.
+ * Estimates are income-only and never split into `count` rows: a guess at a day's work
+ * is one number, not N copies of it.
+ */
+export function logPreset(id, { count = 1, units = 1, amount, date, note, estimate, merchant } = {}) {
   const p = one('SELECT * FROM finance_preset WHERE id = ? AND deleted = 0', String(id || ''));
   if (!p) throw missing('preset not found');
   const on = date ? reqDate(date) : today();
   const unit = p.pay_unit;
-  const rows = [];
+  const given = amount === undefined || amount === null || amount === '' ? null : Math.abs(num(amount, 'amount'));
+  if (!(p.amount > 0) && !(given > 0)) throw bad(`"${p.name}" has no fixed amount — pass the amount to log`);
+  const asEstimate = p.kind === 'income'
+    && (estimate === undefined ? !!p.is_estimate : !!estimate);
+  // The payer is the preset's merchant, its name as a fallback (a chip called "Micro1"
+  // is logged against Micro1 without anyone having typed it twice), or a per-log override.
+  const payer = str(merchant, p.merchant || p.name, 120);
+  const common = {
+    date: on, currency: p.currency, category: p.category, merchant: payer,
+    isMainJob: !!p.is_main_job, presetId: p.id,
+  };
+  const rows = [], pending = [];
   return tx(() => {
     if (unit === 'hour' || unit === 'minute') {
       const u = num(units, 'units');
       if (u <= 0) throw bad('units must be greater than zero');
-      const label = unit === 'hour' ? `${u}h @ ${p.amount}/hr` : `${u}m @ ${p.amount}/min`;
-      rows.push(addTxn({
-        date: on, kind: p.kind, amount: p.amount * u, currency: p.currency,
-        category: p.category, merchant: p.name, isMainJob: !!p.is_main_job,
-        note: note || label, source: 'preset', presetId: p.id,
-        units: u, unit,
-      }));
+      // With a rate on the preset the amount is derived; with an open amount the typed
+      // figure is the truth and the units are only there to make it comparable later.
+      const total = given !== null ? given : p.amount * u;
+      const label = p.amount > 0
+        ? (unit === 'hour' ? `${u}h @ ${p.amount}/hr` : `${u}m @ ${p.amount}/min`)
+        : `${u}${unit === 'hour' ? 'h' : 'm'}`;
+      const body = { ...common, amount: total, note: note || p.note || label, units: u, unit };
+      if (asEstimate) pending.push(addPending(body));
+      else rows.push(addTxn({ ...body, kind: p.kind, source: 'preset' }));
+    } else if (asEstimate) {
+      pending.push(addPending({ ...common, amount: given ?? p.amount, note: note || p.note || '', units: 1, unit: 'item' }));
     } else {
       const n = Math.min(Math.max(Math.trunc(Number(count) || 1), 1), 100);
       for (let i = 0; i < n; i++) {
         rows.push(addTxn({
-          date: on, kind: p.kind, amount: p.amount, currency: p.currency,
-          category: p.category, merchant: p.name, isMainJob: !!p.is_main_job,
-          note: note || '', source: 'preset', presetId: p.id,
-          units: 1, unit: 'item',
+          ...common, kind: p.kind, amount: given ?? p.amount,
+          note: note || p.note || '', source: 'preset', units: 1, unit: 'item',
         }));
       }
     }
+    const n = rows.length + pending.length;
     run('UPDATE finance_preset SET uses = uses + ?, last_used = ?, updated_at = ? WHERE id = ?',
-      rows.length, on, now(), p.id);
-    return { preset: outPreset(p), created: rows };
+      n, on, now(), p.id);
+    return { preset: outPreset(p), created: rows, pending, estimate: asEstimate };
   });
+}
+
+// ---------- expected income (想定) ----------
+//
+// Freelance work is worth a guess on the day and a fact on payday, and the gap between
+// them is information: if a month of estimates lands 8% under what actually arrived,
+// the next month's intuition can be trusted 8% higher. The estimates therefore have to
+// be recorded, and just as firmly they must never be counted as money — nothing here
+// touches finance_txn until a payout is entered, so every total elsewhere in this file
+// stays a total of money that exists.
+//
+// Settling is deliberately many-to-one: paid twice a month against a fortnight of daily
+// guesses, the honest record is one income row for the amount received, with the
+// estimates it covers marked off against it.
+
+export const PENDING_STATUS = ['open', 'settled', 'void'];
+
+function sanitizePending(input, prev = {}) {
+  const cfg = settings();
+  const e = input || {};
+  const rawAmount = e.amount ?? prev.amount;
+  if (rawAmount === undefined || rawAmount === null || rawAmount === '') throw bad('amount is required');
+  const amount = Math.abs(num(rawAmount, 'amount'));
+  if (amount === 0) throw bad('amount must not be zero');
+  if (amount > 1e12) throw bad('amount is implausibly large');
+  const currency = str(e.currency, prev.currency || cfg.baseCurrency, 3).toUpperCase();
+  const fx = rateFor(currency, cfg);
+  const category = str(e.category, prev.category || 'Freelance', 60) || 'Freelance';
+  const status = PENDING_STATUS.includes(e.status) ? e.status : (prev.status || 'open');
+  return {
+    id: prev.id || genId(8),
+    date: e.date === undefined && prev.date ? prev.date : reqDate(e.date || prev.date || today()),
+    // Optional: some platforms tell you the payout date up front, most do not.
+    due_date: e.dueDate === undefined
+      ? (prev.due_date || '')
+      : (e.dueDate ? reqDate(e.dueDate, 'dueDate') : ''),
+    amount, currency,
+    amount_base: Math.round(amount * fx * 100) / 100,
+    fx_rate: fx,
+    category,
+    merchant: str(e.merchant, prev.merchant, 120),
+    note: str(e.note, prev.note, 500),
+    is_main_job: (e.isMainJob ?? prev.is_main_job ?? (category === 'Main Job' ? 1 : 0)) ? 1 : 0,
+    units: Math.max(0, Number(e.units ?? prev.units ?? 0) || 0),
+    unit: UNIT_KINDS.includes(e.unit) ? e.unit : (prev.unit || ''),
+    preset_id: str(e.presetId, prev.preset_id, 32),
+    status,
+    // Settlement figures are written by settlePending alone — an edit must never be
+    // able to claim money arrived.
+    actual_base: prev.actual_base || 0,
+    settled_txn_id: prev.settled_txn_id || '',
+    settled_at: prev.settled_at || '',
+    created_at: prev.created_at || now(),
+    updated_at: now(),
+  };
+}
+
+const outPending = (r) => r && ({
+  id: r.id, date: r.date, dueDate: r.due_date || '', amount: r.amount, currency: r.currency,
+  amountBase: r.amount_base, fxRate: r.fx_rate, category: r.category,
+  merchant: r.merchant, note: r.note, isMainJob: !!r.is_main_job,
+  units: r.units || 0, unit: r.unit || '', presetId: r.preset_id, status: r.status,
+  actualBase: r.actual_base || 0,
+  // Only meaningful once the money has landed; null keeps "no answer yet" out of the
+  // averages instead of it reading as a perfect guess.
+  variance: r.status === 'settled' ? round2(r.actual_base - r.amount_base) : null,
+  settledTxnId: r.settled_txn_id || '', settledAt: r.settled_at || '',
+  createdAt: r.created_at, updatedAt: r.updated_at,
+});
+
+const INSERT_PENDING = `
+INSERT INTO finance_pending (id, date, due_date, amount, currency, amount_base, fx_rate,
+  category, merchant, note, is_main_job, units, unit, preset_id, status, actual_base,
+  settled_txn_id, settled_at, created_at, updated_at, deleted)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
+ON CONFLICT(id) DO UPDATE SET
+  date=excluded.date, due_date=excluded.due_date, amount=excluded.amount,
+  currency=excluded.currency, amount_base=excluded.amount_base, fx_rate=excluded.fx_rate,
+  category=excluded.category, merchant=excluded.merchant, note=excluded.note,
+  is_main_job=excluded.is_main_job, units=excluded.units, unit=excluded.unit,
+  preset_id=excluded.preset_id, status=excluded.status,
+  updated_at=excluded.updated_at, deleted=0`;
+
+function writePending(p) {
+  run(INSERT_PENDING, p.id, p.date, p.due_date, p.amount, p.currency, p.amount_base,
+    p.fx_rate, p.category, p.merchant, p.note, p.is_main_job, p.units, p.unit,
+    p.preset_id, p.status, p.actual_base, p.settled_txn_id, p.settled_at,
+    p.created_at, p.updated_at);
+  return outPending(p);
+}
+
+export function addPending(input) { return writePending(sanitizePending(input)); }
+
+export function getPending(id) {
+  const r = one('SELECT * FROM finance_pending WHERE id = ? AND deleted = 0', String(id || ''));
+  if (!r) throw missing('expected entry not found');
+  return outPending(r);
+}
+
+export function updatePending(id, patch) {
+  const prev = one('SELECT * FROM finance_pending WHERE id = ? AND deleted = 0', String(id || ''));
+  if (!prev) throw missing('expected entry not found');
+  // Editing a settled estimate would rewrite the expected side of a comparison whose
+  // actual side is already fixed, quietly changing a variance that was reported months
+  // ago. Reopen it (which unwinds the payout) if the guess really needs correcting.
+  if (prev.status === 'settled') throw bad('this estimate is already settled — reopen it first');
+  return writePending(sanitizePending(patch || {}, prev));
+}
+
+export function deletePending(id) {
+  const r = run('UPDATE finance_pending SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0',
+    now(), String(id || ''));
+  if (!r.changes) throw missing('expected entry not found');
+}
+
+/** Give up on an estimate that is never going to be paid, without deleting the record
+ *  of having expected it. Void rows are excluded from every total and from calibration. */
+export function voidPending(ids) {
+  const list = (Array.isArray(ids) ? ids : [ids]).map(String).filter(Boolean);
+  if (!list.length) throw bad('ids must be a non-empty array');
+  return tx(() => {
+    let n = 0;
+    for (const id of list) {
+      n += run(`UPDATE finance_pending SET status = 'void', updated_at = ?
+                WHERE id = ? AND deleted = 0 AND status = 'open'`, now(), id).changes;
+    }
+    return { voided: n };
+  });
+}
+
+/** Filtered list of estimates. Defaults to everything still open, at any age —
+ *  an unpaid estimate from two months ago is exactly the one worth seeing. */
+export function listPending(q = {}) {
+  const status = String(q.status || 'open');
+  const where = ['deleted = 0'];
+  const args = [];
+  if (status !== 'all') {
+    if (!PENDING_STATUS.includes(status)) throw bad(`status must be one of ${PENDING_STATUS.join(', ')} or 'all'`);
+    where.push('status = ?'); args.push(status);
+  }
+  if (q.merchant) { where.push('merchant = ?'); args.push(String(q.merchant)); }
+  if (q.presetId) { where.push('preset_id = ?'); args.push(String(q.presetId)); }
+  // A range is applied only when one is actually asked for, and to different clocks:
+  // open estimates are scoped by the day the work was done, settled ones by the day
+  // the money landed. "Still owed for August" and "paid in August" are two questions.
+  let range = null;
+  if (q.month || q.from || q.to || q.start || q.end || q.range) {
+    range = resolveRange(q);
+    const col = status === 'settled' ? 'settled_at' : 'date';
+    where.push(`${col} >= ? AND ${col} <= ?`);
+    args.push(range.start, range.end);
+  }
+  const limit = Math.min(Math.max(Number(q.limit) || 500, 1), 2000);
+  const rows = all(`SELECT * FROM finance_pending WHERE ${where.join(' AND ')}
+                    ORDER BY date DESC, created_at DESC LIMIT ?`, ...args, limit);
+  return {
+    range, currency: settings().baseCurrency,
+    total: round2(rows.reduce((n, r) => n + r.amount_base, 0)),
+    items: rows.map(outPending),
+  };
+}
+
+/**
+ * Record the money that actually arrived for a batch of estimates.
+ *
+ * Writes ONE real income transaction for the amount received and marks every estimate
+ * it covers as settled. The received amount is then allocated back across those
+ * estimates in proportion to what each one claimed — rounded per row with the remainder
+ * on the last, so the parts always add back to exactly the whole. That allocation is
+ * what lets calibration be answered per client ("Micro1 guesses run 6% low") rather
+ * than only per payout.
+ */
+export function settlePending({ ids, amount, currency, date, note, merchant, category, isMainJob } = {}) {
+  const list = [...new Set((Array.isArray(ids) ? ids : []).map(String).filter(Boolean))];
+  if (!list.length) throw bad('ids must be a non-empty array');
+  if (amount === undefined || amount === null || amount === '') throw bad('amount is required');
+  const paid = Math.abs(num(amount, 'amount'));
+  if (paid === 0) throw bad('amount must not be zero — write the estimates off instead');
+  const cfg = settings();
+
+  return tx(() => {
+    const rows = list.map(id => {
+      const r = one('SELECT * FROM finance_pending WHERE id = ? AND deleted = 0', id);
+      if (!r) throw missing(`expected entry ${id} not found`);
+      if (r.status !== 'open') throw bad(`the estimate for ${r.date} is already ${r.status}`);
+      return r;
+    }).sort((a, b) => a.date.localeCompare(b.date));
+
+    const expectedBase = round2(rows.reduce((n, r) => n + r.amount_base, 0));
+    const cur = str(currency, rows[0].currency || cfg.baseCurrency, 3).toUpperCase();
+    const fx = rateFor(cur, cfg);
+    const paidBase = round2(paid * fx);
+    const on = date ? reqDate(date) : today();
+    const span = rows[0].date === rows[rows.length - 1].date
+      ? rows[0].date : `${rows[0].date} → ${rows[rows.length - 1].date}`;
+
+    // Work carries over onto the payout only when every estimate measured it the same
+    // way; summing hours and articles into one number would be worse than no number.
+    const sameUnit = rows[0].unit && rows.every(r => r.unit === rows[0].unit);
+
+    const txn = addTxn({
+      date: on, kind: 'income', amount: paid, currency: cur,
+      category: str(category, rows[0].category, 60),
+      merchant: str(merchant, rows[0].merchant, 120),
+      note: str(note, '', 500) || `Payout for ${rows.length} estimate${rows.length === 1 ? '' : 's'} · ${span}`,
+      isMainJob: isMainJob ?? !!rows[0].is_main_job,
+      source: 'settle',
+      units: sameUnit ? round2(rows.reduce((n, r) => n + (r.units || 0), 0)) : 0,
+      unit: sameUnit ? rows[0].unit : '',
+    });
+
+    let left = paidBase;
+    const stamp = now();
+    rows.forEach((r, i) => {
+      const share = i === rows.length - 1
+        ? round2(left)
+        : round2(expectedBase > 0 ? paidBase * (r.amount_base / expectedBase) : paidBase / rows.length);
+      left = round2(left - share);
+      run(`UPDATE finance_pending SET status = 'settled', actual_base = ?, settled_txn_id = ?,
+             settled_at = ?, updated_at = ? WHERE id = ?`, share, txn.id, on, stamp, r.id);
+    });
+
+    return {
+      txn, count: rows.length, currency: cfg.baseCurrency,
+      expected: expectedBase, actual: paidBase,
+      variance: round2(paidBase - expectedBase),
+      biasPct: expectedBase > 0 ? Math.round((paidBase - expectedBase) / expectedBase * 100) : null,
+    };
+  });
+}
+
+/** Undo a settlement: delete the income row it created and put its estimates back
+ *  in the open pile. The way to correct a payout entered wrong. */
+export function unsettlePending(txnId) {
+  const id = String(txnId || '');
+  const rows = all(`SELECT id FROM finance_pending WHERE deleted = 0 AND settled_txn_id = ?`, id);
+  if (!rows.length) throw missing('no settled estimates found for that transaction');
+  return tx(() => {
+    const stamp = now();
+    for (const r of rows) {
+      run(`UPDATE finance_pending SET status = 'open', actual_base = 0, settled_txn_id = '',
+             settled_at = '', updated_at = ? WHERE id = ?`, stamp, r.id);
+    }
+    // The payout row may already be gone if it was deleted from the Ledger; reopening
+    // the estimates is the part that matters, so a missing transaction is not an error.
+    try { deleteTxn(id); } catch { /* already deleted */ }
+    return { reopened: rows.length, txnId: id };
+  });
+}
+
+const shiftDays = (date, n) => {
+  const d = new Date(`${date}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+
+/**
+ * The whole expected-income picture for a period: what is still owed, how the last
+ * lot of guesses compared with what arrived, and — per client — which way the
+ * intuition leans.
+ *
+ * Open estimates are NOT scoped to the period. A guess from six weeks ago that is
+ * still unpaid is the single most important row on this screen, and scoping it away
+ * because the month selector moved would hide exactly the money at risk.
+ */
+export function pendingOverview(q = {}) {
+  const { start, end } = resolveRange(q);
+  const cfg = settings();
+
+  const open = all(`SELECT * FROM finance_pending
+                    WHERE deleted = 0 AND status = 'open'
+                    ORDER BY date ASC, created_at ASC LIMIT 400`);
+  const openTotal = round2(open.reduce((n, r) => n + r.amount_base, 0));
+  const inPeriod = open.filter(r => r.date >= start && r.date <= end);
+
+  // Grouped by who owes it, because that is the unit a payout arrives in: one client
+  // pays for a fortnight of days at once, and settling is a per-client action.
+  const groups = [];
+  for (const r of open) {
+    const payer = r.merchant || r.category;
+    let g = groups.find(x => x.payer === payer);
+    if (!g) {
+      g = { payer, category: r.category, currency: r.currency, count: 0, total: 0, ids: [], from: r.date, to: r.date, oldestDays: 0 };
+      groups.push(g);
+    }
+    g.count++;
+    g.total = round2(g.total + r.amount_base);
+    g.ids.push(r.id);
+    if (r.date < g.from) g.from = r.date;
+    if (r.date > g.to) g.to = r.date;
+  }
+  const t = today();
+  for (const g of groups) g.oldestDays = Math.max(0, Math.round((Date.parse(t) - Date.parse(g.from)) / 86400000));
+  groups.sort((a, b) => b.total - a.total);
+
+  const settled = all(`SELECT * FROM finance_pending
+                       WHERE deleted = 0 AND status = 'settled' AND settled_at >= ? AND settled_at <= ?
+                       ORDER BY settled_at DESC LIMIT 400`, start, end);
+  const expected = round2(settled.reduce((n, r) => n + r.amount_base, 0));
+  const actual = round2(settled.reduce((n, r) => n + r.actual_base, 0));
+
+  // One line per payout rather than per estimate: "the 15th paid ¥42,000 against
+  // ¥39,500 guessed" is the sentence, and it needs the batch, not its parts.
+  const payouts = [];
+  for (const r of settled) {
+    let p = payouts.find(x => x.txnId === r.settled_txn_id);
+    if (!p) {
+      p = { txnId: r.settled_txn_id, date: r.settled_at, payer: r.merchant || r.category, count: 0, expected: 0, actual: 0 };
+      payouts.push(p);
+    }
+    p.count++;
+    p.expected = round2(p.expected + r.amount_base);
+    p.actual = round2(p.actual + r.actual_base);
+  }
+  for (const p of payouts) {
+    p.variance = round2(p.actual - p.expected);
+    p.biasPct = p.expected > 0 ? Math.round(p.variance / p.expected * 100) : null;
+  }
+  payouts.sort((a, b) => b.date.localeCompare(a.date));
+
+  // Calibration needs more evidence than one month holds, so it looks back six months
+  // from the end of the period regardless of what the period is.
+  const since = shiftDays(end, -180);
+  const byPayer = all(`
+    SELECT COALESCE(NULLIF(merchant,''), category) AS payer,
+           COUNT(*) AS count,
+           COUNT(DISTINCT settled_txn_id) AS payouts,
+           SUM(amount_base) AS expected,
+           SUM(actual_base) AS actual,
+           MAX(settled_at) AS last_settled
+    FROM finance_pending
+    WHERE deleted = 0 AND status = 'settled' AND settled_at >= ? AND settled_at <= ?
+    GROUP BY COALESCE(NULLIF(merchant,''), category)
+    ORDER BY actual DESC`, since, end).map(r => ({
+      payer: r.payer, count: r.count, payouts: r.payouts,
+      expected: round2(r.expected), actual: round2(r.actual),
+      variance: round2(r.actual - r.expected),
+      biasPct: r.expected > 0 ? Math.round((r.actual - r.expected) / r.expected * 100) : null,
+      lastSettled: r.last_settled,
+    }));
+
+  return {
+    range: { start, end }, currency: cfg.baseCurrency, since,
+    open: {
+      total: openTotal, count: open.length,
+      inPeriodTotal: round2(inPeriod.reduce((n, r) => n + r.amount_base, 0)),
+      inPeriodCount: inPeriod.length,
+      oldest: open.length ? open[0].date : null,
+      items: open.map(outPending),
+      groups,
+    },
+    settled: {
+      count: settled.length, payouts: payouts.length,
+      expected, actual, variance: round2(actual - expected),
+      biasPct: expected > 0 ? Math.round((actual - expected) / expected * 100) : null,
+      items: payouts,
+    },
+    byPayer,
+  };
 }
 
 // ---------- goals ----------
@@ -744,7 +1154,16 @@ export function runRecurring({ upTo, dryRun = false } = {}) {
     }
   }
   if (dryRun) {
-    return { dryRun: true, pending: planned.map(p => ({ id: p.rule.id, name: p.rule.name, date: p.date, amount: p.rule.amount })) };
+    // kind/currency travel with the preview because monthStatus uses this to answer
+    // "what is still coming out before the month ends" — which needs the expense
+    // rows only, in the base currency.
+    return {
+      dryRun: true,
+      pending: planned.map(p => ({
+        id: p.rule.id, name: p.rule.name, date: p.date, amount: p.rule.amount,
+        kind: p.rule.kind, currency: p.rule.currency, category: p.rule.category,
+      })),
+    };
   }
   return tx(() => {
     const created = [];
@@ -1113,12 +1532,120 @@ export function incomeOverview(q = {}) {
     log: incomeLog({ from: start, to: end }),
     monthly: monthlySeries({ months: 12, end: month }),
     goal: getGoal(month),
+    // Money guessed but not yet received, and how the last guesses turned out.
+    pending: pendingOverview({ from: start, to: end }),
     // Income presets and recurring income only — the Plan tab owns the expense side.
     presets: listPresets().filter(p => p.kind === 'income'),
     recurring: listRecurring().filter(r => r.kind === 'income'),
     categories: settings().incomeCategories,
     // Past payers, so logging the same client again is a pick rather than a retype.
     sources: suggest({ field: 'merchant', q: '', limit: 12, kind: 'income' }),
+  };
+}
+
+/**
+ * "Where do I stand this month" — the two questions the dashboard leads with.
+ *
+ * 1. Is the income goal met, and if not, by how much?
+ * 2. How much is left to spend, and does the pace get me to the end of the month?
+ *
+ * The second one needs a ceiling, and there are three honest answers depending on
+ * what has been set up, reported as `basis` so the UI can say which one it used:
+ *
+ *   'budget'  the category budgets, summed. The user's own plan — always preferred.
+ *   'income'  no budgets: what came in this month. "Of the money that arrived,
+ *             this much is unspent" is still a real answer, just a different one.
+ *   'none'    neither, so there is nothing to be left OF. Says so rather than
+ *             inventing a number.
+ *
+ * `committed` is separate on purpose. Rent that has not posted yet is not spare
+ * money, and a "left to spend" figure that quietly includes it is the single most
+ * misleading thing this screen could show. It is subtracted into `available`, and
+ * both are returned so the card can show the difference.
+ */
+export function monthStatus(q = {}) {
+  const { start } = resolveRange(q);
+  const month = monthOf(start);
+  const { start: mStart, end: mEnd } = monthBounds(month);
+  const cfg = settings();
+  const s = summary({ from: mStart, to: mEnd });
+  const goal = getGoal(month);
+  const budgets = listBudgets(month);
+
+  const t = today(), thisMonth = monthOf(t);
+  const daysTotal = Number(mEnd.slice(8, 10));
+  const isCurrent = month === thisMonth;
+  const daysElapsed = isCurrent ? Number(t.slice(8, 10)) : (month < thisMonth ? daysTotal : 0);
+  const daysLeft = Math.max(0, daysTotal - daysElapsed);
+
+  // Recurring expenses that have not posted yet but will before the month is out.
+  const upcoming = [];
+  if (daysLeft > 0) {
+    try {
+      for (const p of runRecurring({ upTo: mEnd, dryRun: true }).pending) {
+        if (p.kind !== 'expense' || p.date < t) continue;
+        let base = p.amount;
+        try { base = p.amount * rateFor(p.currency, cfg); } catch { /* unrated: count it at face value */ }
+        upcoming.push({ name: p.name, date: p.date, category: p.category, amount: round2(base) });
+      }
+    } catch { /* a broken recurring rule must not take the dashboard down */ }
+  }
+
+  const budgetTotal = round2(budgets.items.reduce((n, b) => n + b.amount, 0));
+  const basis = budgetTotal > 0 ? 'budget' : (s.earned > 0 ? 'income' : 'none');
+  const limit = basis === 'budget' ? budgetTotal : basis === 'income' ? s.earned : 0;
+
+  // Budgets only cover the categories they name, so measure spend against the same
+  // scope — comparing all spending to a partial budget reads as "over" every month.
+  const budgeted = new Set(budgets.items.map(b => b.category));
+  const inScope = (cat) => basis !== 'budget' || budgeted.has(cat);
+  const spentInScope = basis === 'budget'
+    ? round2(budgets.items.reduce((n, b) => n + b.spent, 0))
+    : s.spent;
+
+  // Same scope rule for what is still coming: subtracting rent from a grocery
+  // budget is not a smaller number, it is a wrong one.
+  const committedItems = upcoming.filter(u => inScope(u.category));
+  const committed = round2(committedItems.reduce((n, u) => n + u.amount, 0));
+
+  // With no ceiling there is nothing to be left OF, so these stay null rather than
+  // becoming "minus everything you spent", which reads as a catastrophic overrun.
+  const capped = basis !== 'none';
+  const remaining = capped ? round2(limit - spentInScope) : null;
+  const available = capped ? round2(remaining - committed) : null;
+  const perDaySoFar = daysElapsed > 0 ? round2(spentInScope / daysElapsed) : 0;
+  const projected = daysElapsed > 0 ? round2(perDaySoFar * daysTotal) : spentInScope;
+  // Where the spend "should" be by today if the month were spread evenly. The
+  // comparison against it is what turns a number into "you are fine" or "slow down".
+  const pace = limit > 0 && daysTotal > 0 ? round2(limit * (daysElapsed / daysTotal)) : null;
+
+  const target = goal.minGoal || goal.majorGoal || 0;
+  const goalMet = target > 0 && goal.progress >= target;
+
+  return {
+    month, currency: cfg.baseCurrency, isCurrent,
+    days: { total: daysTotal, elapsed: daysElapsed, left: daysLeft },
+    goal: {
+      ...goal, target, met: goalMet,
+      toGo: target > 0 ? round2(Math.max(0, target - goal.progress)) : null,
+      pct: target > 0 ? Math.min(999, Math.round(goal.progress / target * 100)) : null,
+      // With a stretch target set, "met" is only half the story.
+      stretchMet: goal.majorGoal > 0 && goal.progress >= goal.majorGoal,
+      perDayNeeded: target > 0 && daysLeft > 0 ? round2(Math.max(0, target - goal.progress) / daysLeft) : null,
+    },
+    spend: {
+      basis, limit, spent: spentInScope, remaining, committed, available,
+      committedItems: committedItems.sort((a, b) => a.date.localeCompare(b.date)).slice(0, 6),
+      categoriesCovered: budgeted.size,
+      pct: capped && limit > 0 ? Math.round(spentInScope / limit * 100) : null,
+      pace, perDaySoFar, projected,
+      // Non-null only while the month is live: an allowance for zero days left is
+      // a division by zero dressed up as advice.
+      perDayLeft: capped && limit > 0 && daysLeft > 0 ? round2(Math.max(0, available) / daysLeft) : null,
+      over: capped && limit > 0 && spentInScope > limit,
+      onTrack: capped && limit > 0 ? projected <= limit : null,
+    },
+    summary: s,
   };
 }
 
@@ -1138,7 +1665,35 @@ export function overview(q = {}) {
     daily: dailySeries({ from: start, to: end }),
     budgets: listBudgets(month),
     goal: getGoal(month),
+    // The headline band: goal met vs what is left to spend. Only when the period IS
+    // one calendar month — goals and budgets are monthly, so "left to spend" against
+    // a year-to-date or 30-day window would be an answer to a question nobody asked.
+    // Never fatal either: the rest of the dashboard is still worth drawing if a
+    // recurring rule is malformed.
+    status: (() => {
+      const b = monthBounds(month);
+      if (start !== b.start || end !== b.end) return null;
+      try { return monthStatus({ month }); } catch { return null; }
+    })(),
     presets: listPresets(),
+    // The dashboard only needs the headline of the expected ledger — how much work is
+    // done but unpaid, and whether the guesses behind it have been landing. The full
+    // list, with the settle action, lives on the Income tab. Never fatal.
+    pending: (() => {
+      try {
+        const p = pendingOverview({ from: start, to: end });
+        if (!p.open.count && !p.settled.count) return null;
+        return {
+          currency: p.currency,
+          open: { total: p.open.total, count: p.open.count, oldest: p.open.oldest },
+          settled: p.settled.count ? {
+            expected: p.settled.expected, actual: p.settled.actual,
+            variance: p.settled.variance, biasPct: p.settled.biasPct, payouts: p.settled.payouts,
+          } : null,
+          groups: p.open.groups.slice(0, 3).map(g => ({ payer: g.payer, total: g.total, count: g.count, oldestDays: g.oldestDays })),
+        };
+      } catch { return null; }
+    })(),
     recent: listTxns({ from: start, to: end, limit: 12 }).items,
   };
 }

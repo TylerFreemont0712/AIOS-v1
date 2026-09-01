@@ -336,14 +336,31 @@ export function pricePoints(points, { width = 620, height = 200, merchants = [],
 /** A meter with an optional second "stretch" marker — budgets and goals. */
 /** `bare` drops the value/target caption — for callers that already show the numbers
  *  above the bar, where repeating them is noise rather than information. */
-export function meter(value, target, { stretch = 0, format = fmtNum, danger = false, bare = false } = {}) {
-  const pct = target > 0 ? Math.min(100, (value / target) * 100) : 0;
+/**
+ * A progress bar against a target, with an optional stretch target marked on it.
+ *
+ * Two things here are not obvious:
+ *
+ * `stretch` rescales the whole track. The bar used to fill against `target` while
+ * the stretch mark was positioned as a fraction of `stretch`, so a goal at 100% sat
+ * at the far right *and* the mark for it sat at 55% — two contradictory readings of
+ * the same pixels. When a stretch target is given the track spans it, the mark shows
+ * where the base target falls, and the caption still reads value/target.
+ *
+ * `good` says which direction is which. Passing a budget, the bar going over is bad
+ * and turns red. Passing an income goal, going over is the entire point — so `good`
+ * paints the overshoot green instead of alarming about a month that went well.
+ */
+export function meter(value, target, { stretch = 0, format = fmtNum, danger = false, bare = false, good = false } = {}) {
+  const scale = stretch > target && target > 0 ? stretch : target;
+  const pct = scale > 0 ? Math.min(100, (value / scale) * 100) : 0;
   const over = target > 0 && value > target;
-  return el('div', { class: 'fin-meter' + (over || danger ? ' is-over' : '') },
+  const tone = over && good ? ' is-met' : (over || danger) && !good ? ' is-over' : '';
+  return el('div', { class: 'fin-meter' + tone },
     el('div', { class: 'fin-meter-track' },
       el('div', { class: 'fin-meter-fill', style: { width: pct + '%' } }),
-      stretch > 0 && target > 0 && stretch !== target
-        ? el('span', { class: 'fin-meter-mark', style: { left: Math.min(100, target / stretch * 100) + '%' } })
+      scale > target
+        ? el('span', { class: 'fin-meter-mark', style: { left: (target / scale * 100) + '%' } })
         : null),
     bare ? null : el('div', { class: 'fin-meter-caption' },
       el('span', {}, format(value)),

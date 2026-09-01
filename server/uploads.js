@@ -283,6 +283,149 @@ export function greyRaster(buf, n = 256) {
 }
 
 /**
+ * A greyscale raster with the picture's own proportions kept.
+ *
+ * greyRaster() forces a square, which is right for the checks that only care about
+ * relative structure — but fatal for anything measuring an ANGLE. Squashing a 1200×1600
+ * photo into 256×256 stretches the vertical by 1.33×, and a text line printed at 4°
+ * arrives at the detector reading 5.3°. Deskew would then confidently over-rotate every
+ * portrait photo it was given.
+ */
+export function greyFit(buf, maxDim = 320) {
+  const bin = ffmpegBin();
+  if (!bin) return null;
+  const dim = imageSize(buf);
+  if (!dim?.width || !dim?.height) return null;
+  const scale = Math.min(1, maxDim / Math.max(dim.width, dim.height));
+  // Even dimensions: rawvideo gray is 1 byte per pixel so odd sizes are legal, but
+  // ffmpeg's scaler is happier and the arithmetic below stays exact.
+  const w = Math.max(16, Math.round(dim.width * scale / 2) * 2);
+  const h = Math.max(16, Math.round(dim.height * scale / 2) * 2);
+  let dir;
+  try { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aios-greyfit-')); } catch { return null; }
+  const src = path.join(dir, 'in.bin');
+  try {
+    fs.writeFileSync(src, buf);
+    const r = spawnSync(bin, ['-hide_banner', '-loglevel', 'error', '-i', src,
+      '-vf', `scale=${w}:${h},format=gray`, '-f', 'rawvideo', '-'],
+      { maxBuffer: 1 << 26, timeout: 20_000 });
+    return r.status === 0 && r.stdout?.length === w * h ? { w, h, data: r.stdout } : null;
+  } catch { return null; }
+  finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { } }
+}
+
+/**
+ * How far the printing on this photo is tilted, in degrees. Positive = the text runs
+ * downhill to the right, which is what a right-handed person holding a receipt produces.
+ *
+ * Projection profiling, the classical method and the one that needs no training: rotate
+ * the ink mask through a range of candidate angles and, for each, add up the ink in every
+ * horizontal row. When the rows line up with the printing, the profile is a comb — dense
+ * bands of text separated by empty paper — and when they do not, the ink smears evenly
+ * across every row. The score is the summed squared difference between neighbouring rows,
+ * which is largest exactly when that comb is sharpest.
+ *
+ * Bounded to ±`maxDeg` on purpose. A hand-held photo is tilted a few degrees; anything
+ * claiming 30° is the detector locking onto a table edge or a shadow, and a confident
+ * 30° rotation of a straight receipt is far worse than leaving a 4° one alone. Whole
+ * quarter-turns are somebody else's job (see planAngle in receipts.js).
+ */
+export function detectSkew(buf, { maxDeg = 12, step = 0.5, maxDim = 320 } = {}) {
+  const g = greyFit(buf, maxDim);
+  if (!g) return null;
+  const { w, h, data } = g;
+
+  // Ink mask, thresholded the same way cropToContent does it: midway between the dark and
+  // bright deciles, so a dim photo and a blown-out one both separate.
+  const hist = new Array(256).fill(0);
+  for (const v of data) hist[v]++;
+  let acc = 0, lo = 0, hi = 255;
+  const tenth = data.length * 0.1;
+  for (let i = 0; i < 256; i++) { acc += hist[i]; if (acc >= tenth) { lo = i; break; } }
+  acc = 0;
+  for (let i = 255; i >= 0; i--) { acc += hist[i]; if (acc >= tenth) { hi = i; break; } }
+  if (hi - lo < 30) return null;                       // flat image: no printing to align
+  const th = (lo + hi) / 2;
+
+  const cx = w / 2, cy = h / 2;
+  const score = (deg) => {
+    const rad = deg * Math.PI / 180;
+    const sin = Math.sin(rad), cos = Math.cos(rad);
+    const rows = new Float64Array(h);
+    for (let y = 0; y < h; y++) {
+      const dy = y - cy;
+      for (let x = 0; x < w; x++) {
+        if (data[y * w + x] >= th) continue;            // paper, not ink
+        const dx = x - cx;
+        // Where this ink lands once the picture is turned by -deg. Only the row matters.
+        const ry = Math.round(cy + (-dx * sin + dy * cos));
+        if (ry >= 0 && ry < h) rows[ry]++;
+      }
+    }
+    let s = 0;
+    for (let y = 1; y < h; y++) { const d = rows[y] - rows[y - 1]; s += d * d; }
+    return s;
+  };
+
+  let best = 0, bestScore = -1;
+  for (let deg = -maxDeg; deg <= maxDeg + 1e-9; deg += step) {
+    const s = score(deg);
+    if (s > bestScore) { bestScore = s; best = deg; }
+  }
+  const flat = score(0);
+  return {
+    // Round to the search grid: reporting 3.9999999999 invites callers to treat a
+    // floating-point artefact as a meaningful difference from 4.
+    degrees: Math.round(best / step) * step,
+    // How much better the winning angle is than leaving it alone. Below a few percent the
+    // "tilt" is noise, and the caller should decline rather than re-encode for nothing.
+    gain: flat > 0 ? (bestScore - flat) / flat : 0,
+  };
+}
+
+/**
+ * Straighten the printing on a photo. Returns JPEG bytes and what it did, or null when
+ * there is nothing worth straightening.
+ *
+ * Rotation only — NOT four-corner perspective correction, though ffmpeg has the filter and
+ * the temptation is obvious. Keystoning needs the four corners of the paper found
+ * reliably, and on a white receipt lying on a pale table the corner search fails quietly
+ * and often; a wrong perspective transform does not gently under-correct, it shears the
+ * text into something no model can read. A bounded rotation cannot fail that way: the
+ * worst case is a slightly tilted receipt, which is where it started.
+ *
+ * The canvas grows to hold the turned image and the new corners are filled white, because
+ * this runs before cropToContent — black corners would read as background and drag the
+ * crop box out to the full frame, undoing the one preprocessing step already known to
+ * matter more than any other.
+ */
+export function deskew(buf, { minDeg = 0.75, minGain = 0.04, ...opts } = {}) {
+  const found = detectSkew(buf, opts);
+  if (!found) return null;
+  const { degrees, gain } = found;
+  // Two independent guards. A tiny angle is not worth a re-encode (JPEG is lossy, and
+  // this runs before the model sees anything); a weak gain means the detector never found
+  // a comb and is reporting the best of a set of equally bad options.
+  if (Math.abs(degrees) < minDeg || gain < minGain) return null;
+
+  const bin = ffmpegBin();
+  if (!bin) return null;
+  let dir;
+  try { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aios-deskew-')); } catch { return null; }
+  const src = path.join(dir, 'in.bin'), dst = path.join(dir, 'out.jpg');
+  try {
+    fs.writeFileSync(src, buf);
+    const rad = (-degrees * Math.PI / 180).toFixed(6);       // undo the tilt
+    const r = spawnSync(bin, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-i', src,
+      '-vf', `rotate=${rad}:ow=rotw(${rad}):oh=roth(${rad}):fillcolor=white`,
+      '-q:v', '2', dst], { timeout: 60_000 });
+    if (r.status !== 0 || !fs.existsSync(dst)) return null;
+    return { buffer: fs.readFileSync(dst), degrees, gain: Math.round(gain * 100) / 100 };
+  } catch { return null; }
+  finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { } }
+}
+
+/**
  * Trim a photo down to the bright document sitting in it. Returns JPEG bytes, or null
  * when there is nothing worth cropping.
  *

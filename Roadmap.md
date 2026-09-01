@@ -11,7 +11,16 @@ cool if…" get captured so they aren't lost.
 **Item IDs are stable and section-scoped** (`B9`, `D11`). They are never renumbered — a shipped
 item's line is deleted and its ID retires with it, so cross-references in this file, in commit
 messages, and in `comfyui-plan.md` keep pointing at the right thing. New items take the next
-free number in their section. **59 open items** — 7 cuts, 18 backend, 12 UI, 19 features, 3 money.
+free number in their section. **75 open items** — 7 cuts, 15 backend, 25 UI, 17 features, 3 money,
+8 desktop control.
+
+**Last verified against this machine on 2026-08-30.** The whole suite runs green — `npm run
+check`, `audit` (**66 checks**), `e2e` (18 suites), `toolcheck` (78 pass · 5 env · 0 failed) —
+and that pass was a *read* of the working tree rather than a re-run: it re-tested the file-level
+✅ claims behind **B2 / B9 / C1 / C2 / C3 / A5** (none had drifted), recounted the line and item
+totals above, and found the three bugs in the 2026-08-30 entry below. Claims elsewhere in the
+buckets still carry the date they were last checked; **2026-08-18** was the last full re-test of
+every one of them.
 
 Every forward-looking item carries a **code hook** (the file/function to start from) so it is
 actionable. Claims marked **✅ verified <date>** were checked against this machine, not
@@ -26,38 +35,46 @@ recalled — trust them; everything else is a hypothesis.
 The decision list. If you only do ten things, do these — ordered by (value ÷ effort), with the
 reason each one earns its slot.
 
+> ⚠️ **Before anything else: the last six weeks are still not in git.** Re-measured
+> 2026-08-30 and it has grown, not shrunk: `server/voice.js`, `server/interview.js`,
+> `server/actions.js`, the five browser modules that go with them, `scripts/voice/`, three
+> benches and **four e2e suites** are all *untracked* — **6,413 lines**, plus **4,603 lines**
+> of uncommitted edits across **24** tracked files. Nothing is ignored by `.gitignore`; they
+> have simply never been added. The entire voice stack this file celebrates as shipped exists
+> in exactly one place, on one laptop, with no history. A stray `git clean -fd` — which every
+> "reset my working tree" instinct reaches for — deletes all of it. This is not a feature and
+> it does not have an ID; it is a five-minute job that should happen before the next one starts.
+>
+> While you are there: `aios.pid` is now in `.gitignore` (added 2026-08-30) but is **still
+> tracked**, so it keeps dirtying the tree on every restart until one command retires it —
+> `git rm --cached aios.pid`. It has caused 7 commits of its own so far.
+
 | # | Item | Effort | Why it's top-10 |
 |---|---|---|---|
-| 1 | **B1** — fix the `sendFile`/`h()` race | S | ✅ **Confirmed live bug** at `server/index.js:171`. Corrupts every Files-app download. One line. |
-| 2 | **B3** — finish rolling out `json_schema` | S | ✅ Transport + the two finance callers shipped 2026-07-27. `mail`, `learn`, `vault`, `router`, `comfy` still hand-parse. |
-| 3 | **D2** — MCP client | M | ✅ ~9,650 registry servers become AIOS tools for one adapter. The biggest capability-per-line win available. |
-| 4 | **B2** — SQLite-aware backups | S | Four WAL databases now hold hand-entered money and learning data. This box has hard-crashed under load. Overdue. |
-| 5 | **B4** — SSRF guard on `fetch_url` | S | ✅ No protection today; a fetched web page can steer the agent at `127.0.0.1:8188` or the LAN router. |
-| 6 | **C3** — global Ctrl+K search | M | ✅ FTS5 + trigram verified available in `node:sqlite` — much cheaper than when first filed. |
-| 7 | **C1** — notification center | M | Every long-running seam already emits events; nothing surfaces them. Highest felt-quality-per-hour in the UI. |
-| 8 | **B6** — tests for the money stack | S | ✅ Receipts + txn/price integrity covered 2026-07-27; FX, budgets and recurring expansion still write money untested. |
-| 9 | **D1** — reranker for the vault | M | Turns keyword-grep into real retrieval, and the reranker half needs no vector store at all. |
-| 10 | **C2** — wire up `density` | S | ✅ Config key exists, is never read by anything. Genuinely an evening, immediately visible. |
+| 1 | **H1** — open an app by name, and show it | M | The next thing wanted, and ✅ every piece was proven on this box 2026-08-18: 121 apps discovered from `.desktop` files, `wmctrl` resolves the window, a frame costs **68ms / 44KB**. |
+| 2 | **B2** — SQLite-aware backups | S | ✅ `scripts/backup.mjs` still does not exist. `finance.db` is 344KB of **hand-entered money** and the only copies are 7 same-disk `.bak-` files. ⚠️ must exclude the **14GB** in `data/llm/`. |
+| 3 | **B5** — mark untrusted content | M | Promoted now that **B4** has shipped. The network half of the injection story is closed — the agent can no longer be *pointed* at this host — but a fetched page's text still arrives in the same context as tool access, unmarked. That is the half that is left. |
+| 4 | **B3** — finish rolling out `json_schema` | S | ✅ Down from 22 sites to **10**, across 5 modules (`learn` ×5, `vault` ×2, `comfy`, `financeai`, `mail`). The finish line is close enough to be worth crossing. |
+| 5 | **C1** — notification center | M | ✅ `server/notify.js` is still **34 lines**. Every long-running seam already emits events; nothing surfaces them. Highest felt-quality-per-hour in the UI, and **H1** wants it too. |
+| 6 | **B9** — harden the auth token | S | ✅ Re-confirmed 2026-08-30, `server/index.js:81`: still a plain `token === c.auth.token`, no attempt limiting, no log, and not a constant-time compare. An evening, and **H4** raises the stakes: synthetic input behind a brute-forcible token is a different risk class. |
+| 7 | **C2** — wire up `density` | S | ✅ Re-confirmed 2026-08-30: still defined in `config.js` and read by **nothing**. Genuinely an evening, immediately visible on a laptop screen. |
+| 8 | **C14** — nothing on screen says something is running | S | Research, agent turns and bench sweeps all run for minutes with no global sign of life. Cheap, and every long-running seam already emits the events it would need. |
+| 9 | **C3** — global Ctrl+K search | M | ✅ `server/search.js` still absent; FTS5 + trigram verified available in `node:sqlite`. The palette finds apps, not the chat from Tuesday. |
+| 10 | **A5** — one SQLite helper, not four | S | Turns **B2** from a four-file change into one, and **§F**'s `jobs.db` would be the fifth copy of the same 60 lines. |
 
-Two of these are near-free and unblock the rest: **A5** (one SQLite helper) turns **B2** from a
-four-file change into one, and **B3** lands before **D18** and **§F** need it.
-
-**Filed 2026-07-27, not yet ranked into the ten above** — both follow directly from the receipt
-work that shipped that day, and both are S: **D19** closes the one known blind spot in the new
-duplicate guard (it matches the *reading*, so a second scan that misreads one character slips
-through — a perceptual hash of the *photo* catches it), and **B18** calibrates the confidence
-weights against the 8-receipt bench, since the 75 re-read floor is currently an unfitted
-constant deciding how much GPU every scan spends.
-
----
+**Retired from this list because they shipped:** **B4** and **B7** (both 2026-08-30 — the SSRF
+guard, and the `engines` pin with its boot guard; see below), **B1** (the `sendFile`/`h()` race —
+fixed and pinned by an audit check 2026-08-18) and **D2** (the MCP client — `server/mcp.js` has
+been complete since 2026-07-29, with a Settings tab, presets and an audit check; it sat at #3 of
+this table for three weeks after it was done).
 
 ## What AIOS already is (don't re-suggest these)
 
 A zero-build, local-first **personal AI operating hub** served on the LAN (port 7777, token
 auth, PWA-installable): a web desktop of attached page-views with a dock, Ctrl+K palette, and
-9 themes. ~15.8k lines of server ESM + ~10k lines of browser ESM, three runtime dependencies.
-On a provider abstraction (Anthropic + Ollama + any OpenAI-compatible endpoint, addressed as
-`provider:model`) it runs:
+9 themes. **22.3k lines of server ESM + 15.1k lines of browser ESM** (✅ recounted 2026-08-30),
+three runtime dependencies, **88 tools**, 17 registered apps. On a provider abstraction
+(Anthropic + Ollama + any OpenAI-compatible endpoint, addressed as `provider:model`) it runs:
 
 - **Chat** — streaming, per-chat system prompts, chain-of-thought panels, image/PDF/file input,
   a bounded **read-only tool belt** (+ a curated additive-write allowance), folders, an
@@ -91,15 +108,364 @@ On a provider abstraction (Anthropic + Ollama + any OpenAI-compatible endpoint, 
   (read-only IMAP triage with sender ratings, mini-Gmail viewer, Discord pings), Weather, an
   **everyday toolbelt** (directions, places, translate, convert, calculate, datetime, wikipedia),
   and a Home dashboard that folds all of it into one glance.
+- **Voice** — speech in and out, entirely local: faster-whisper (CPU int8) for listening,
+  Kokoro-82M ONNX for speaking, in one on-demand Python worker that is dropped again after
+  `voice.idleMinutes`. Dictation in the Chat composer, a hands-free **Voice mode** overlay with
+  a live orb, read-aloud on any reply, and ja/zh routed through **misaki** so kanji are read
+  rather than described. 54 voices, blendable, with a pinnable spoken language.
+- **Interview mode** — the hands-free screen as a practice room: the model interviews you out
+  loud and probes the weakest part of each answer, or answers as a strong candidate would. A
+  session is an ordinary chat with a composed prompt, so it scrolls, survives a reload and
+  shows up in Chat; any turn can be kept to a flashcard **answer bank**.
+- **Confirm before writing** — every write the assistant proposes comes back as an editable
+  card (`server/actions.js`, 8 actions) and nothing touches the ledger, calendar or vault until
+  it is confirmed. By voice the card is read aloud and a spoken "yes"/はい settles it
+  **server-side**, so a bare yes never reaches the model and cannot be acted on twice.
+- **MCP client** — external MCP servers join the tool belt as a first-class group
+  (`mcp:<server>`): stdio transport, paginated discovery, namespaced tool names, the existing
+  approval gate, isolated failures, presets and a Settings tab.
 - **Phone view** at `/m` — a separate document for one-handed receipt capture, sharing only
   `theme.css`, `api.js` and `imageprep.js` with the desktop shell.
 - **Files** (tree + CodeMirror), **Terminal** (node-pty/xterm), **Projects** (git badges),
   **GitHub** (profile, heatmap, repos, PRs, issues, publish/clone).
 - **Plumbing** — SearXNG (bundled), PDF ingestion, ffmpeg-backed image intake, sampling
   controls, shifting context window, service probes, desktop launcher, and
-  `npm run check | audit | e2e` (14 e2e suites + 58 audit checks, mock-provider driven).
+  `npm run check | audit | e2e | toolcheck` — **18 e2e suites, 59 audit checks, 88 tool
+  checks**, mock-provider driven, ✅ all green 2026-08-18.
 
 ### Recently shipped
+
+**2026-08-30 (later) — the words now appear while you are still saying them**
+
+"Why does my old iPhone dictate instantly and this doesn't?" turned out to have a
+measurable answer that was not about hardware.
+
+- **Whisper is the wrong shape of model for dictation, and here is the number.** It is a
+  seq2seq model over a fixed 30-second window, so it decodes the padding too. On `small`:
+  **0.83s of audio costs 1786ms, 9.71s costs 2163ms — 11.7x the audio for 1.21x the time.**
+  Saying "Log it." costs the same as a ten-second sentence. The old partials re-ran that over
+  the whole utterance once a second, which is quadratic work for a result that keeps changing.
+- ✨ **A streaming Zipformer transducer (sherpa-onnx) now drives the live text.** It carries
+  decode state between 200ms chunks and emits tokens as they are recognised — **RTF ≈0.065**
+  on four CPU threads, so a chunk costs ~14ms. Measured end to end through the HTTP route:
+  first words at **0.6–0.8s**, then growing word by word. The model is the multilingual build
+  (ar/en/id/ja/ru/th/vi/zh), picked over the better English-only ones because half of what gets
+  dictated here is Japanese — it reads 五万円 correctly, which `normalizeTranscript` then turns
+  into 50,000円 exactly as it does for whisper.
+- **It is feedback, not the answer, and that split is the design.** On the same clips it
+  produced "THREE THOUSAND **JANET** LAWSON" for "three thousand yen at Lawson" and read 今日は
+  as 気に, and it emits no punctuation and upper-case English. Whisper still does the single
+  accurate pass that reaches the model and the ledger. **Feel from one, accuracy from the
+  other** — replacing whisper outright would have traded away the thing that was already good.
+- ⚠️ **Its endpointer is NOT wired to end a turn, and that is the interesting part.** It was, at
+  first: the transducer says when it thinks a sentence finished, which sounds strictly better
+  than a loudness timer. The browser e2e refused it immediately — `voice-convo`'s "a mid-sentence
+  pause must NOT end the turn" case went red, because at `rule2=0.8` it fires ~1.0s after speech
+  stops and this loop is tuned to 1100ms (2400ms in an interview) for a *measured* reason: a
+  0.9s thinking pause used to cut the turn and return a confident reading of half a sentence,
+  62% WER against 38%. A second opinion that only ever ends turns EARLIER can only reintroduce
+  that. The signal is plumbed through and left unwired, with the reason written at the call site.
+  → **C25** is the version worth having: use it to *extend* a turn, not shorten one.
+- **The browser had to change too.** An `AudioWorkletProcessor` (`web/js/voice-worklet.js`) taps
+  every sample — an AnalyserNode could not, because it only ever returns a *snapshot* and the
+  audio between animation frames is simply not in it. Blocks are averaged down to 16k rather
+  than decimated (plain decimation aliases consonants back into the speech band), converted to
+  Int16 and shipped on the existing `/api/voice/partial` route. **MediaRecorder still runs in
+  parallel** for the final pass, so the accurate path is untouched.
+- **Cold start had to be dealt with.** The model is ~300MB of ONNX and takes **3.7s** to load,
+  and the worker answers one request at a time — so opening the mic before it is ready queued
+  the first chunks behind the load and the entire first utterance went by with no live text,
+  which is the one turn where someone is deciding whether the feature works. Voice mode now
+  waits for the warm (capped, and it says so on screen) before opening the mic. Found by the
+  browser e2e, not by reasoning: the probe showed the tap working, PCM shipping, and the server
+  returning empty text.
+- **Chat dictation gets live text as well**, which is the case the question was actually about —
+  typing into a box with your voice. The provisional text is anchored to whatever was already
+  in the composer and replaced wholesale by the accurate reading, so nothing typed beforehand is
+  lost and no guessed word survives.
+- **Old clients still work.** The route branches on content type: PCM goes to the transducer,
+  a container goes down the original whisper path. The phone PWA caches its bundle hard, so a
+  stale client degrades to the old feel rather than to no feedback. Covered by a test.
+- `npm run voice` installs it (`--no-streaming` skips the 259MB model); `--check` reports it;
+  9 new e2e assertions cover that the hypothesis *grows*, that the endpointer fires after the
+  speech and not during it, and that the fallback still answers. **111 voice checks pass.**
+- ⚠️ **Still on the table:** `voice.stt.device` is `cpu` while the GPU sits idle. Whisper `small`
+  measured **2045ms on CPU vs 180ms on cuda/fp16 — 11.4x**. The driver mismatch that justified
+  CPU has been resolved (see above). That is a one-setting change and the single biggest
+  remaining latency win.
+
+**2026-09-01 — the live recogniser, measured for the first time: 39.7% WER → 20.3%**
+
+The transducer shipped on 2026-08-30 with no bench of its own — `voice-bench` scored
+whisper and nothing scored the thing writing words on screen. It does now
+(`npm run voice-bench -- --stream`, 36 clips, fed 200ms at a time exactly as the
+browser feeds it), and it found three defects that reading the code would not have.
+
+| | WER | |
+|---|---|---|
+| as shipped | **39.7%** | |
+| + flush the stream on close | 28.7% | −11.0 |
+| + stop resampling in JS | 25.2% | −3.2 (at 48kHz) |
+| + `modified_beam_search` | **20.3%** | −3.3, and the first word 130ms sooner |
+
+- 🐛 **The last word or two of every utterance was never emitted.** A zipformer decodes
+  in fixed chunks and the samples in the final partial chunk never form one. The live
+  line read `…AT LAWSON ON LUN` and stayed there for the two seconds whisper takes.
+  `stream.end` pads with silence and flushes — and `endPartial` now **awaits and
+  returns** that text, where it was fire-and-forget, so the flush existed but nobody
+  ever saw its result. The browser ships its last buffered 200ms before closing too;
+  that block was being dropped on the floor.
+- 🐛 **The endpointer wiped what it had already heard.** sherpa resets the decoder on
+  an endpoint — correct, or the next sentence inherits this one's state — but the
+  decoded text went with it, and a 1.2s thinking pause trips it mid-turn routinely.
+  The line went from the whole first sentence to only what came after the pause. This
+  is the same failure the recorder's 1500ms silence window exists to prevent (see
+  **C25**), one layer down. Segments are committed before the reset now.
+- 🐛 **The browser was resampling with a box filter.** 48k → 16k by averaging blocks:
+  barely a low-pass, aliasing the high frequencies that separate consonants, **3.2
+  points**. There is no resampler in the browser any more — the `AudioContext` is
+  asked for 16kHz (the browser does it natively, properly) and whatever rate it
+  settles on travels with the bytes for sherpa to resample in C++. Roughly 40 lines
+  of hand-rolled DSP deleted rather than fixed.
+- ✨ **Beam search is the default decoder.** RTF 0.086 → 0.111 against a 200ms budget
+  is not a number anyone can feel; 23.6% → 20.3% and 130ms to the first word are.
+- ⚖️ **Contextual biasing is built and left OFF, because it was measured.**
+  `stt.streamHotwords` feeds the transducer the same merchant list whisper gets as a
+  prompt. On *this* ledger — Outlier, Mercor, Prolific, Micro1, all ordinary English
+  words the model already reads — it went 25.0% → **26.4%**, and above `hotwordScore`
+  3 it starts pulling neighbouring words toward a merchant (`for lunch` → `for nge`).
+  It works where it should: "FAMILY MARCH" → "FAMILY MART", and 22.3% → 20.9% on
+  clips full of Japanese shop names. One flag, documented with both numbers.
+  Getting there needed sherpa's `bpe.vocab`, which the official recipe builds with the
+  `sentencepiece` package — a C++ wheel added to the voice venv to read two fields out
+  of a protobuf. `_sp_pieces()` reads them directly instead and caches the result
+  beside the model; no new dependency.
+- ✨ **The live line writes numbers as figures.** The transducer spells them out and
+  whisper does not, so the provisional and the settled reading disagreed on screen at
+  the moment the eye compares them. `foldSpokenNumbers` is applied to the transducer's
+  output ONLY: running it over the reading that reaches the ledger would turn "one of
+  the receipts" into "1 of the receipts". A single number word folds only when a
+  counter settles it — "TWELVE MAN" must become "12 man" or `normalizeTranscript`'s
+  counter rules, which all require a digit, never fire and 120,000 yen goes missing.
+- **Coverage: 117 voice checks (was 111), and both new ones were verified with teeth.**
+  The first attempt at the endpoint test *passed with the bug reintroduced* — it
+  asserted on a variable the test loop had kept rather than on what the server
+  returned, and an empty response passes by never overwriting anything. It takes two
+  utterances either side of a pause to catch it. The tail test had the same problem
+  from the other end: the existing case appends 2s of silence, which trips the
+  endpoint, commits the sentence and hides the truncation entirely — it needs a stream
+  that ends the instant the speech does, which is what stopping the recorder as you
+  finish a word actually does.
+- ⚠️ **The running server was 46 hours old and predated the entire feature.** Its
+  `/api/voice/status` had no `streaming` field at all, so every client read
+  `streaming: false` and silently used the old whisper-rerun partials. The transducer
+  had never once run in a browser. Same shape as the six-day stale instance already on
+  record: **the pidfile was accurate and the code was correct, and neither tells you
+  what is actually serving port 7777.**
+
+**2026-08-30 — a read-through pass: three bugs, and the agent can no longer be aimed at this box**
+
+A full read of the working tree rather than a re-run of the suite, because the suite was already
+green and everything wrong with it was in the gap it did not cover. `audit` is **66
+checks** now (was 59), `e2e` 18 suites, `check` clean.
+
+- 🐛 **B4 shipped — `fetch_url`, `crawl_site` and Research's PDF ingestion were an SSRF hole,
+  and it was reachable by a web page.** The URL comes from the model, or from a search result;
+  the model gets its ideas from the page it just read. All three readers (`fetchReadable`,
+  `fetchRaw`, `fetchPdfText`) called `fetch()` with `redirect: 'follow'` and no address check
+  at all, and this host answers on loopback with ComfyUI (8188), llama-server (8080),
+  SearXNG (8890) and Ollama (11434) — none of which ask for a password — plus AIOS itself.
+  Confirmed live before the fix, not by reading: `fetchReadable('http://127.0.0.1:7777/api/status')`
+  returned the status JSON. Now one `safeFetch()` resolves the name, refuses anything that is not
+  public unicast, and **re-checks every redirect hop** — the hop being the interesting half, since
+  `redirect: 'follow'` hands the destination to whoever wrote the `Location` header, which is the
+  same untrusted party. Proven end to end: `httpbin.org/redirect-to?url=http://127.0.0.1:7777/`
+  is allowed at hop 0 and refused at hop 1.
+- **The classifier is the part worth checking, so it is checked.** 15 private forms refused
+  (v4 private/loopback/CGNAT/link-local/multicast/reserved, v6 loopback/ULA/link-local/multicast,
+  and both spellings of an IPv4-mapped v6 address — `::ffff:127.0.0.1` and `::ffff:7f00:1`),
+  unparseable input fails closed, and `8.8.8.8`, `1.1.1.1`, `172.32.0.1` (just past `172.16/12`)
+  and a public v6 address stay fetchable. **All** addresses a name resolves to are tested, not the
+  first — a name answering with one public and one loopback address is the standard way past this.
+- **There is an escape hatch, off by default:** `tools.allowPrivateFetch`, for someone who
+  genuinely wants the agent reading their own LAN. `everyday.e2e.mjs` crawls a loopback test
+  server, so it now asserts the refusal *first* and then opts in, which is the honest way to
+  keep that test.
+- 🐛 **A live partial could overwrite the finished transcription — the guard against it never
+  ran.** `endPartial()` sets `closed = true` on the stream object *and* deletes the map entry;
+  the in-flight check read `streams.get(id)?.closed`, which is `undefined` once the entry is
+  gone, so it never fired. Reproduced against the real worker: pre-fix an in-flight partial came
+  back `{text, raw, ms, bytes}` after the recording had ended, post-fix `{stale: true}`. The
+  browser had its own `state === 'recording'` guard, which is why nobody saw it — the server
+  half was simply doing a wasted ~0.4s whisper decode and returning a result that should not
+  exist. Both fixes are pinned by audit checks; the SSRF one strips comments before grepping,
+  because the paragraph explaining why `redirect: 'follow'` is wrong otherwise counts as an
+  offence (the same false positive the 2026-08-18 `sendFile` check documents).
+- 🐛 **One bad spawn left voice dead until the server restarted.** `ensureWorker()` assigns
+  `booting = new Promise(...)`, and the failure path calls `killWorker()`, which nulls `booting`.
+  When the failure is *synchronous* — `spawn` throwing rather than emitting `'error'` — that null
+  happens inside the executor, and the assignment then overwrites it with the rejected promise.
+  Every later `ensureWorker()` hit `if (booting) return booting` and replayed the original error
+  forever. Proven in isolation (the retry rejects with the first error, unchanged), then fixed by
+  clearing through the local on both outcomes, with an identity check so a superseded boot cannot
+  clear a newer one. Narrow to trigger and total when it does, which is the worst combination for
+  something you would try to debug from a log.
+- ✅ **B7 shipped — the runtime is pinned.** `engines: node >=22.13.0` plus a boot guard in
+  `server/index.js` that names the reason: four stores are `node:sqlite`, which is not importable
+  unflagged before 22.13 / 23.4, and an older Node otherwise fails deep inside whichever data
+  module loads first with an error about an unknown module.
+- **`vocabularyPrompt()` cached one budget and served it to every caller.** The cache was keyed on
+  time alone, so a caller asking for a smaller `max` got a string built to fill a larger one.
+  Latent today (both callers use the default) and a one-line key change, but it is the kind of
+  thing that is only ever found on purpose.
+- **`aios.pid` is in `.gitignore` at last** — 7 commits of its own so far. ⚠️ Still *tracked*,
+  so it keeps dirtying the tree until `git rm --cached aios.pid`.
+- ⚠️ **The working tree is still not in git, and has grown**: 6,413 untracked lines and 4,603
+  uncommitted across 24 files. See the warning above the Top 10.
+
+**2026-08-29 — receipt OCR: a bench first, then a reader a ninth the size**
+
+The pipeline had no way to answer "is this reading any good", so every model decision was a
+guess against somebody else's leaderboard. It has one now, and the first thing it measured was
+the model that was already installed.
+
+- **`npm run receipt-bench` — the archive was already a labelled test set.** Every receipt
+  pressed *Log* on is one checked against the paper, and `finance_receipt.parsed` holds that
+  settled version; `parsed_ai` holds what the model said before the correction. 23 applied
+  receipts, 18 of them hand-corrected. `--stored` scores the readings already in the database
+  and needs no GPU at all.
+- **Baseline, measured not recalled:** Gemma 4 E4B over the 18 corrected receipts scores
+  **72% on totals, 89% on the shop, 65% of line amounts found, 16 invented lines and 45 missed.**
+  The failure is concentrated exactly where the resolution story predicted: small receipts are
+  perfect, and a 19-item drugstore receipt came back **0/19**.
+- 🔥 **HunyuanOCR (Q8_0, 578 MB) replaces Gemma 4 E4B (4.74 GB) as the reader.** On the same
+  19-item receipt it transcribed every product, every JAN barcode and the exact total ¥4,123.
+  Over the 9 item-rich receipts: **79% of line amounts, totals found 7/9**, mean 52 s on CPU.
+  PaddleOCR-VL 1.6 (935 MB) is also installed and configured — 78% amounts, totals 6/9, and it
+  dropped the ¥305 tax line by unpairing labels from amounts, which is why it is second choice
+  rather than first.
+- **Single-pass extraction was tested and rejected.** HunyuanOCR advertises structured field
+  extraction and would have collapsed both stages into one. Asked for the receipt schema
+  directly it returned `4.123` for ¥4,123 — a JSON number grammar cannot carry a thousands
+  separator — plus an unparsed Japanese date and the branch instead of the chain. Transcribing,
+  it got all three right. **The two-stage split stays**, now for a recorded reason.
+- **Deskew.** `uploads.deskew()` measures the hand-held tilt by projection profiling and undoes
+  it before the crop. Verified ±8° measured within 1° and corrected to ~0, and a straight page
+  is left alone. No new dependency: ffmpeg's `rotate`, and an aspect-preserving raster
+  (`greyFit`) because the square one used elsewhere distorts the very angle being measured.
+- **Runaway readers are cut off.** Greedy decoding at temperature 0 is what makes this pipeline
+  reproducible and also what makes a reader loop: HunyuanOCR read a McDonald's receipt as a
+  Markdown table, got every line right, then emitted `| | | |` to the token cap — 7,987
+  characters. `trimRepetition()` cuts a run of ≥6 identical lines that reaches the end. A
+  repetition *penalty* was rejected: this archive has 国産豚肉 ミンチ printed three times at
+  three prices, and that is the correct reading.
+- **Per-model prompts are configuration now.** `TRANSCRIBE_PROMPTS` matched by substring and
+  knew one model; `presetFor()` carries `ocrPrompt` and `ocrStyle`, so adding a reader is a
+  preset edit. Six readers are installed and tagged.
+- ⚠️ **The full bake-off has not run.** `nvidia-driver-580` was updated to 580.173.02 without a
+  reboot, so the loaded kernel module is still 580.159.03 and `ggml_cuda_init` fails — llama.cpp
+  sees no GPU and everything above was measured on CPU. The matching module is installed for
+  this kernel; a reboot fixes it. Then: `npm run receipt-bench -- --all-ocr`.
+  **✅ Resolved by 2026-08-30** — the loaded module is now 580.173.02 and CTranslate2 reports one
+  CUDA device with fp16 available. The bake-off is still worth running; the blocker is gone.
+
+
+**2026-08-18 — a full audit pass: one silent, total failure found and fixed**
+
+The whole suite was run and every forward-looking ✅ claim in this file re-tested against this
+machine rather than carried forward. The headline is that the test story is genuinely strong —
+**59 audit checks, 18 e2e suites, 88 tool checks, 0 failures** — and that the one confirmed bug
+was in the gap none of them covered.
+
+- 🐛 **B1 shipped — every file download the Files app has ever made was broken.**
+  `/api/fs/raw` was wrapped in `h()`, whose callback returns `undefined`, so the wrapper fired
+  `res.json({ok:true})` while `res.sendFile` was still doing its async stat. Confirmed live, not
+  by reading: `curl /api/fs/raw?…&path=package.json` returned
+  `content-type: application/json` and the eleven bytes `{"ok":true}`. It has been that way since
+  the route was written; the three sibling routes (`/api/uploads/:id`, `/api/comfy/image/:name`,
+  `/m`) were each converted to plain handlers when the bug was understood, and this one was
+  missed every time — which is precisely why it is now checked instead of remembered.
+- **The check has teeth, and getting there was the interesting part.** A naive grep for
+  `sendFile` near `h(` matched every route in the file. Two reasons, both worth recording:
+  `h\(` also matches the tail of `push(` and `imagePath(`, and a naive string-skipper reads the
+  apostrophe in a comment — *"a sample of the user's recent messages"* — as an opening quote and
+  swallows every paren after it. The shipped detector paren-matches from the `h(` and skips
+  comments and string literals; it was validated by running it against the pre-fix source
+  (finds exactly `/api/fs/raw`) and the post-fix source (finds nothing) before being trusted.
+- ⚠️ **D2 had been sitting at #3 of the Top 10 for three weeks after it shipped.**
+  `server/mcp.js` has been a complete MCP client — stdio transport, paginated discovery,
+  namespaced names, the approval gate, presets, a Settings tab and its own audit check — since
+  2026-07-29. A decision list that recommends work already done is worse than no list, so
+  re-verifying the Top 10 is now part of the audit rather than a thing done from memory.
+- ⚠️ **The voice subsystem is not in version control.** See the warning above the Top 10.
+- **Re-confirmed still open** (all ✅ re-tested 2026-08-18, none had drifted): **B4** — no SSRF
+  protection of any kind in `tools.js`; **B7** — no `engines` field, with four `node:sqlite`
+  stores; **B9** — `token === c.auth.token`, no attempt limiting; **C2** — `appearance.density`
+  read by nothing; **C1** — `notify.js` still 34 lines; **C3** / **A5** / **B2** — `search.js`,
+  `db.js` and `backup.mjs` still do not exist. **B3** has genuinely moved: 22 hand-parse sites
+  down to **10**.
+- **Measured, so §H can be planned rather than guessed** (this box, X11/Cinnamon, `DISPLAY=:0`):
+  121 launchable apps parse out of 173 `.desktop` files; Obsidian is the flatpak
+  `md.obsidian.Obsidian` and declares `StartupWMClass=obsidian`, which is the key that resolves
+  its window after launch; `wmctrl -lpx` gives window↔PID↔class; a window frame captured with
+  `xwd | ffmpeg` costs **68ms and 44KB** scaled to 900px, so a 2-4fps live pane is ~5% of one
+  core. `xdotool` is *not* installed (it is one `apt install` away) and is the only missing
+  piece, needed solely for synthetic input (**H4**).
+- **Housekeeping found:** `data/` is **14GB**, of which `data/llm/` is 14GB and everything that
+  matters is ~30MB (⚠️ **B2**); `data/aios.db` is a 0-byte file referenced by nothing;
+  `aios.pid` is **tracked in git** and churns on every restart, which is where the
+  "chore: update aios process PID" commits come from — it belongs in `.gitignore`. Dependency
+  drift is mild: `@anthropic-ai/sdk` 0.112.4 → 0.117.1, `@xterm/xterm` 5.5 → 6.0 (major),
+  `ws`/`marked`/`highlight.js`/`dompurify` one patch behind (**B16**).
+- **No leaks found where they were looked for.** The voice worker (1.3GB RSS) is a plain child
+  whose `readline()` loop breaks on stdin EOF, so it dies with the server rather than orphaning;
+  WS clients, PTYs, MCP children, chat/agent/research abort maps and vault aborts all have
+  matching cleanup, and the WS layer already terminates a client whose backlog passes 8MB.
+
+**2026-08-15 — it listens, it answers, and it asks before it writes**
+
+- ✅ **D8 shipped — voice in and out, all local.** faster-whisper (CTranslate2, CPU int8) for
+  listening and **Kokoro-82M** ONNX for speaking, in one long-lived Python worker
+  (`scripts/voice/worker.py`) that loads on demand and is dropped again after
+  `voice.idleMinutes`. Three surfaces: dictation in the Chat composer, a hands-free
+  **Voice mode** overlay, and read-aloud on any reply. `npm run voice` installs the lot into
+  its own venv under `~/.local/share/aios/voice` — deliberately not the ComfyUI venv.
+  Roadmap note said Piper was archived; Kokoro was the right call, at ~4× realtime on CPU.
+- **Japanese actually works.** espeak-ng does not read kanji, it reads *about* them —
+  今月の食費 phonemizes as "Chinese letter, Chinese letter, Chinese letter", 17.5s of audio for
+  a 20-character sentence. Routing ja/zh through **misaki** instead gives 3.5s and a clean
+  whisper round trip. The voice you pick now sets the language, so this cannot be
+  mismatched by accident.
+- 🐛 **Two bugs the browser E2E caught that no unit test could.** (1) The silence detector
+  calibrated its noise floor on the first 400ms — so answering the moment it started
+  listening, which is exactly what hands-free invites, made your own first syllable the
+  "room noise" and gated out everything you said. It now tracks the floor continuously,
+  fast toward quiet and barely toward loud, and freezes once speech is confirmed.
+  (2) The streaming speaker reported "finished" whenever its queue drained, which during a
+  stream happens *between sentences* — so the loop started listening to the second half of
+  its own answer. Both are covered by `scripts/e2e/voice-convo.e2e.mjs`, which feeds Chromium
+  a WAV as its microphone and drives the whole loop with nobody in it.
+- ✨ **Confirm before writing (new `server/actions.js`).** Chat used to run a handful of
+  additive writes outright. Now every one comes back as an editable card — "Income JPY 50,000
+  from Uber Eats · Freelance · 2026-08-15" with Confirm / Edit / Discard — and nothing is
+  written until you agree. By voice the card is read aloud and a spoken "yes" (or はい) settles
+  it, handled server-side so a bare yes never reaches the model and cannot be acted on twice.
+  Eight actions registered, including two new ones (`finance_budget_set`, `finance_goal_set`).
+  Off switch in Settings → Chat.
+- 🐛 **Uncategorised income was about to default to "Main Job"** — the one category the
+  monthly goal EXCLUDES, so gig income would have silently vanished from the number being
+  watched. Caught while writing the action defaults; it now defaults to Other Income.
+- **Finances Overview leads with the two questions you actually open it for.** A status band
+  across the top: *goal met* vs *what is left to spend*, the latter measured in the same scope
+  as the budget and with recurring bills that have not posted yet subtracted out — because a
+  "left to spend" figure that quietly includes next week's rent is the most misleading number
+  this screen could show. The twelve-month chart moved below it; the old small Goal card is
+  gone (`finance.monthStatus`, `GET /api/finance/status`).
+- 🐛 **`meter()` drew two contradictory readings of the same bar** when a stretch target was
+  set: the fill scaled to the base target while the stretch mark was positioned as a fraction
+  of the stretch, so a met goal sat at 100% *and* its own marker sat at 55%. The track now
+  spans the stretch, and passing an income goal paints green instead of the red it shares
+  with a blown budget.
 
 **2026-08-04 — the small print gets read, and typing a number stops fighting back**
 
@@ -514,14 +880,6 @@ it entirely into §D here. *Hook:* `comfyui-plan.md`.
 
 ## B. Backend & reliability
 
-**B1. 🔥 Fix the `sendFile`/`h()` race — S. ✅ CONFIRMED STILL PRESENT 2026-07-27 at
-`server/index.js:171`.** `/api/fs/raw` is wrapped in `h()`, whose callback returns `undefined`,
-so `h()` fires `res.json({ok:true})` while `sendFile` is still streaming — a corrupted download
-or an `ERR_HTTP_HEADERS_SENT` crash, depending on who wins. `/api/uploads/:id`, `/api/comfy/image`
-and `/m` are already plain handlers with the error callback; this one was missed. Convert it and
-add an audit check that greps for `sendFile` inside `h(`, so it cannot come back.
-*Hook:* `server/index.js:171`.
-
 **B2. 🔥 Make backups SQLite-aware — S.** ⚠️ **Must exclude `*.gguf`.** `data/llm/models/` now
 holds **14GB** of model weights, against a few hundred MB of actual data — a naive `tar data/`
 would produce a 14GB archive of things that are all re-downloadable from Hugging Face. Exclude
@@ -539,9 +897,11 @@ already has the checkpoint pattern.
 
 **B3. 🔥 Structured output via `json_schema` / GBNF — S (was M).** Landed 2026-07-27 for the
 transport (`streamChat({ schema })`, OpenAI-compat + Ollama) and for `receipts.js` /
-`itemsai.js`. What remains is adopting it in the other callers: ✅ 22 call sites across 8 modules
-(`receipts`, `itemsai`, `financeai`, `mail`, `learn`, `vault`, `router`, `comfy`) coax JSON out
-of models by *prompting* for it and then hand-parsing the reply. The defensive machinery this
+`itemsai.js`. What remains is adopting it in the other callers, and this has genuinely moved: ✅ **10**
+`extractJSON()` sites across **5** modules as of 2026-08-18 (`learn` ×5, `vault` ×2, `comfy`,
+`financeai`, `mail`), down from 22 across 8. `receipts`, `itemsai` and `learn`'s roadmap call
+now pass a real schema. The remaining ones still coax JSON out of models by *prompting* for it
+and then hand-parsing the reply. The defensive machinery this
 grew is itself the evidence: `util.jsonBlocks()` walks every balanced brace-block,
 `extractJSON(text, {require})` takes the **last** block carrying a required key because reasoning
 models echo the prompt's template first, and `itemsai.pickResults()` *scores* candidate blocks and
@@ -553,15 +913,6 @@ Anthropic tool-use for cloud, and keep `extractJSON` only as the fallback for pr
 ignore it. Note the documented gotcha: **the schema is not injected into the prompt**, so keep
 describing the shape in the prompt too. *Hook:* `server/llm.js:streamChat` + `openaiStream`;
 first callers `receipts.js:scan`, `itemsai.js:resolveNames`.
-
-**B4. 🔥 SSRF guard for `fetch_url` / `crawl_site` — S.** ✅ No protection today: no loopback,
-private-range, or link-local blocklist anywhere in `tools.js`. On this box that means a model can
-be pointed at `127.0.0.1:8188` (ComfyUI, unauthenticated), `:11434` (Ollama), `:8080`
-(llama-server), `192.168.0.1` (router admin), or `169.254.169.254`. It does not need to be
-malicious to matter — **a fetched web page can ask the agent to do it** (see B5), and Chat's
-tool belt is on by default. Resolve the hostname, reject loopback/private/link-local/multicast
-unless the URL matches an explicit `tools.fetch.allowHosts`, re-check after every redirect, and
-cap response size. *Hook:* `server/tools.js:fetch_url`/`crawl_site`, new `tools.fetch` config.
 
 **B5. 🔥 Prompt-injection hardening for tool-using models — M.** Web pages, PDFs, emails and
 vault notes flow into the same context as tool access, unmarked. The 2026 consensus is that
@@ -585,12 +936,6 @@ units for `items.candidates`/`resolveLocal` alias matching and `priceProbe`'s re
 (it must never write an alias — a plausibility probe that teaches the catalogue would launder a
 hallucination into a fact). *Hook:* new `scripts/e2e/finance.e2e.mjs`, `scripts/audit.mjs`.
 
-**B7. ✨ Pin the Node runtime for `node:sqlite` — S.** ✅ `package.json` still has **no `engines`
-field**. Four stores now depend on the built-in SQLite module. Add `engines` plus a startup guard
-that fails loudly with a clear message on older Node instead of a cryptic import error — the LAN
-"just clone and run" story breaks silently otherwise. *Hook:* `package.json`,
-`server/index.js` boot.
-
 **B8. ✨ Auto-detect a model's context window — S.** `defaults.contextTokens` is hand-set at
 32000 for every model, so a 4k model truncates mysteriously and a 128k one is wasted. Query
 llama.cpp `/props` (`n_ctx`) or Ollama `/api/show` when a model is selected and populate
@@ -598,8 +943,8 @@ llama.cpp `/props` (`n_ctx`) or Ollama `/api/show` when a model is selected and 
 `/props` in the Models app — `llamaBusy()` already reads `/slots` for routing.
 *Hook:* `server/config.js:contextBudget`, `server/llmctl.js`.
 
-**B9. ✨ Harden the auth token — S.** ✅ The token is compared with plain `===` and there is **no
-attempt limiting** anywhere. On a LAN that is mostly fine; on a LAN with guests it is a
+**B9. ✨ Harden the auth token — S.** ✅ **Re-confirmed 2026-08-18** at `server/index.js:71` —
+`token === c.auth.token`, with **no attempt limiting** anywhere. On a LAN that is mostly fine; on a LAN with guests it is a
 brute-forcible 24-char secret with unlimited tries and no log. Use `crypto.timingSafeEqual` on
 equal-length buffers, add a per-IP failure counter with backoff, and log failures.
 *Hook:* `server/index.js:authorized`.
@@ -667,16 +1012,17 @@ a re-read actually improves the score** (if it rarely does, the cap should be 2,
 
 ## C. UI / UX
 
-**C1. 🔥 Unified notification center (topbar bell) — M.** Runs finish while you're in another
-app; research completes silently; birthdays sit in the Planner. Grow `server/notify.js` into an
+**C1. 🔥 Unified notification center (topbar bell) — M.** ✅ `server/notify.js` is still **34
+lines** (re-checked 2026-08-18). Runs finish while you're in another app; research completes silently; birthdays sit in the Planner. Grow `server/notify.js` into an
 in-app event store (`pushEvent`) + `GET /api/notifications` + WS topic `notify`, emitting from
 the seams that already exist (agent `turn.done`, research `done`, mail scan, planner
 overdue/birthday, finished bench run, GitHub review-requested delta, **receipt scanned**).
 Topbar bell with unread count + dropdown; entries deep-link via `openApp(app, opts)`; per-source
 toggles, optional Discord mirroring. *Hook:* `server/notify.js`, `web/js/main.js` topbar.
 
-**C2. 🔥 Wire up the `density` / compact mode — S.** ✅ `appearance.density: 'comfortable'` is
-defined in `server/config.js` and **never read by anything**. Add a `data-density` attribute plus
+**C2. 🔥 Wire up the `density` / compact mode — S.** ✅ **Re-confirmed 2026-08-18:**
+`appearance.density: 'comfortable'` is defined at `config.js:27` and the string `density` appears
+**nowhere else in `web/`** — it is read by nothing. Add a `data-density` attribute plus
 a compact spacing pass and honour it — a quick, high-visibility win on laptop screens.
 *Hook:* `web/js/main.js:applyAppearance`, `web/css/shell.css`.
 
@@ -744,6 +1090,123 @@ photographing that chain's receipts differently). All the data is already record
 *Hook:* `server/receipts.js:learningStats()` (add a per-merchant rollup),
 `web/js/apps/finance.js:learningStrip`.
 
+**C13. 🔥 The dock has outgrown itself — S.** ✅ 17 apps registered, **16 in the dock**
+(`main.js:renderDock`), separated by three `|` dividers that are doing the work a grouping
+mechanism should. Two apps are already deliberately undocked (Bench opens from Models, Files from
+a project row) — that instinct was right and needs to become a rule rather than a one-off. Give
+the dock a **pinned set + overflow**: pinned icons stay, the rest live behind a "More" tile or
+appear automatically as *recents*, and every app remains reachable from Ctrl+K regardless. The
+test for whether an icon has earned its place is the same one that removed Bench: is it a
+destination, or is it something you do *to* something else. *Hook:* `web/js/main.js:renderDock`,
+`web/js/wm.js`.
+
+**C14. 🔥 Nothing on screen says something is running — S.** Research, agent turns, bench sweeps,
+lesson generation, receipt scans and comfy jobs all run for minutes, and the moment you switch
+apps the only evidence is that the tab you left is still spinning. `wm.js` keeps every app
+mounted, so the state is already in memory: put a **dot on the dock icon** of any app with work
+in flight and a count in the topbar, both driven by the same event stream **C1** needs. This is
+the cheap half of the notification center and it removes the main reason to sit and watch a
+progress bar. *Hook:* `web/js/wm.js`, `web/js/main.js` topbar, `server/notify.js`.
+
+**C15. ✨ Home is a second dock; make it a "what changed" screen — M.** ✅ `dashboard.js` renders
+twelve `card(app, title, blurb)` tiles that duplicate the dock immediately below them, plus mail
+and agenda strips. The tiles are the least valuable pixels on the most-opened screen. Replace
+them with **since you last looked**: research that finished, agent sessions awaiting approval,
+receipts queued for review, budgets that crossed, tasks overdue, birthdays this week, a bench run
+that completed, unread mail. Every one of those already exists as a store query; none of them is
+on Home today. Keep exactly one row of launchers for the things with no state to report.
+*Hook:* `web/js/apps/dashboard.js`, `server/context.js:liveBrief` (which already assembles most
+of this for the model — the screen should show what the model is already told).
+
+**C16. ✨ Settings: show me what I changed — S.** ✅ Thirteen sections in one **1,416-line** file
+(**C6** splits it). The missing view is orthogonal to search: a **"differs from default"** filter
+that lists only the keys this install has actually changed, with a one-click revert per key. On a
+config this wide it is the fastest way to answer "what did I do to it?" after something starts
+behaving oddly — and it is the natural home for an export/import of a settings profile.
+`config.js` already knows every default, so the diff is a walk of two objects.
+*Hook:* `server/config.js` defaults, `web/js/apps/settings.js`.
+
+**C17. 🔥 An action ledger — what the assistant wrote, and an undo — M.** `server/actions.js`
+proposes and you confirm, which is the right gate, but once confirmed a write vanishes into
+whichever store owns it. There is no one place that answers *"what has this thing written on my
+behalf this week?"* — and for money that is the question that matters. Persist every settled
+proposal (tool, args, result id, chat it came from, confirmed or discarded) and render it as a
+reverse-chronological list with a filter per action type. `revertReceipt()` already proves the
+pattern for unwinding a write cleanly; the same shape gives **undo** to `finance_log`, `task_add`
+and `event_add`. Pairs with **C1**: a confirmed action is exactly the kind of event the bell
+should carry. *Hook:* new `data/actions.json` or a table, `server/actions.js:execute`,
+`web/js/apps/*` a shared "recent writes" panel.
+
+**C18. ✨ Split `finance.js` — S.** ✅ **2,311 lines** in one browser module, the largest file in
+`web/` by a factor of 1.6, covering seven tabs that share almost nothing but the period selector.
+It is where the two focus-loss bugs of 2026-08-04 lived, and it is the file most likely to be
+edited by a model that cannot hold it all at once. Split per tab (`finance/overview.js`,
+`income.js`, `receipts.js`, `items.js`, …) behind the existing tab switch, with the period
+selector and formatting helpers extracted to a shared module. No behaviour change; purely a
+change in how much has to be understood to touch one tab. *Hook:* `web/js/apps/finance.js`.
+
+**C19. ✨ Empty states that teach — S.** Most screens in a *personal* hub are empty for the first
+week, and an empty screen currently says nothing. Every app should answer, in its empty state,
+"what do I put here and how does it get here": Finance → *scan a receipt, or log your first
+expense* with the buttons inline; Learn → *pick a subject and I'll design the roadmap*; Vault →
+*point me at your Obsidian folder*; Interview → *tell me the role and we'll start*. This is the
+cheapest onboarding that exists and it doubles as documentation for **E1**.
+*Hook:* `web/js/ui.js` — one `emptyState({icon, title, hint, actions})` primitive, then one call
+per app.
+
+**C20. 🔥 Quick capture — one keystroke, anywhere — S.** ✅ Ctrl+K exists and *navigates*; there
+is no way to **record** without first travelling to the right app. Add a second bar (Ctrl+Shift+K,
+or a Ctrl+K mode) that takes one line of natural language, routes it through the same
+`actions.js` proposal path chat uses, and shows the confirm card in place: *"1200 lunch at
+Lawson"*, *"call the clinic tomorrow 10am"*, *"idea: tile the receipt reader"*. The parsing,
+the defaults and the confirmation are all built — this is a text box wired to machinery that
+already exists, and it is the single change most likely to make the ledger actually get used.
+*Hook:* `web/js/main.js:openPalette`, `server/actions.js:propose`, `server/chat.js`.
+
+**C21. ✨ Voice mode should keep its receipts — S.** The overlay shows the running transcript and
+then closes, and while the chat survives, *what the recogniser actually heard* does not. When a
+command is misheard the useful question is always "what did it think I said?" — and today the
+answer is gone. Keep the raw transcript beside the normalised one (`normalizeTranscript()` already
+rewrites 八万円 → 80,000円 and friends), show both on the turn, and offer **"that's not what I
+said"** which re-sends the corrected text and files the pair as vocabulary. The vocabulary prompt
+already exists (`voice.vocabularyPrompt`); this is how it should be fed.
+*Hook:* `web/js/voicemode.js:addTurn`, `server/voice.js:normalizeTranscript`.
+
+**C22. ✨ Push-to-talk, and a wake word — S/M.** Hands-free is all-or-nothing today: either the
+mic re-opens after every reply or you tap. A held key (Space is already the tap key — make
+*hold* mean push-to-talk) covers the common case of one command in a quiet room, and is strictly
+more reliable than silence detection because the boundary is stated rather than inferred. The
+wake word is the harder half and should stay optional: the small partial-transcribe model is
+already loaded and streaming, so matching a phrase against its partials costs nothing extra —
+no second always-on model. *Hook:* `web/js/voicemode.js:tap`/`listen`, `server/voice.js`
+partial stream.
+
+**C23. ✨ A keyboard map, and a `?` that shows it — S.** Ctrl+K, Space in voice mode, Enter in the
+receipt table, Escape in modals — the shortcuts exist and are discoverable only by reading source.
+Register them centrally so each app declares its own, then `?` opens a cheatsheet scoped to the
+app you are in. Doing this centrally is also what makes **C11**'s focus-order work checkable
+rather than aspirational. *Hook:* new `web/js/keys.js`, `web/js/ui.js`.
+
+**C24. ✨ Make failures legible — S.** Errors surface as a toast that disappears in a few seconds
+and is then unrecoverable, which is the wrong lifetime for the ones that matter (a model refusing,
+a provider down, a scan rejected). Keep a small in-memory error log behind the topbar with the
+full message, the request that caused it and a copy button, and have the toast link into it.
+`server/index.js`'s `h()` already returns `{error}` consistently, so the client half is a
+wrapper around `post`/`get` in `api.js`. Feeds **C5**'s health page directly.
+*Hook:* `web/js/api.js`, `web/js/ui.js:toast`.
+
+**C25. 🔥 Let the recogniser EXTEND a turn, not end one — S.** The streaming transducer already
+reports when it thinks a sentence finished (`endpoint` on every `/api/voice/partial` response,
+shipped 2026-08-30) and it is deliberately unwired, because anything that ends a turn earlier
+than the tuned silence window reintroduces the mid-sentence-pause bug — the browser e2e catches
+it within one run. The valuable direction is the opposite one: when the loudness timer is about
+to fire but the transducer's hypothesis looks *unfinished*, wait a little longer. That turns a
+fixed 1100ms window into one that gives you more time exactly when you are mid-thought, which is
+the case the fixed number cannot serve. Needs tuning against real speech rather than TTS, and a
+hard ceiling so a confused recogniser cannot hold the mic open forever. Start by logging, for
+real utterances, where the endpointer would have fired against where the timer actually did.
+*Hook:* `web/js/voice.js:Recorder._meter` (the silence decision), `onEndpoint`, `server/voice.js:streamFeed`.
+
 ## D. New features worth building
 
 **D1. 🔥 Embeddings + reranking for the vault — M.** The single biggest upgrade to `wiki_recall`
@@ -758,20 +1221,6 @@ reranker first** — it is strictly less machinery than an embedding index and i
 existing keyword path immediately. Then add vectors if recall is still the gap.
 *Hook:* `server/vault.js:recall`, `server/wiki.js:recall`, `server/llm.js` (new embed/rerank
 calls), `server/llmctl.js` (a second served model or a swap policy).
-
-**D2. 🔥 MCP client — the agent speaks MCP — M.** ✅ The ecosystem crossed over: the official
-registry listed **9,652 servers** (28,959 versions) in May 2026, GitHub shows ~15.9k
-`mcp-server` repos, and the 2026-07-28 spec adds a stateless core, server-rendered UIs
-("MCP Apps") and long-running Tasks. `comfyui-plan.md` reasoned in 2026-07 that a native
-connector was less machinery than an MCP client *for ComfyUI specifically* — that was right then
-and is the wrong conclusion now, because the adapter is written **once** and every future
-integration is configuration instead of a new `server/*.js`. AIOS's tool registry is already the
-right shape: `{name, description, parameters}` + `runTool()`, group metadata, a disable list, and
-an approval gate — an MCP tool maps onto it directly. Build `server/mcp.js`: stdio + Streamable
-HTTP transports, servers declared in config, `tools/list` folded into `toolCatalog()` under a
-`mcp:<server>` group, `tools/call` behind the existing gate (**B5** matters more once third-party
-tools are in the loop). Settings gets an MCP tab. *Hook:* `server/tools.js:toolCatalog`/`runTool`,
-new `server/mcp.js`, `web/js/apps/settings.js`.
 
 **D3. ✨ MCP server — expose AIOS to Claude Code — M.** The mirror of **D2**, and the cheaper
 half. Publish AIOS's genuinely unique surfaces — vault search/write, planner, the ledger,
@@ -804,15 +1253,6 @@ makes the missing *Reply* conspicuous. A minimal SMTP submit client in the `mail
 (node:tls, implicit-TLS 465, same app password, `In-Reply-To`/`References` from the stored
 Message-ID) → an LLM-drafted, **fully editable, never auto-sent** reply. Send-only, hard-gated.
 *Hook:* `server/mail.js`.
-
-**D8. ✨ Voice in/out — M.** Wire mic→transcribe for Chat and quick-note capture, plus read-aloud
-of replies; highest value on the phone, and it reuses the uploads pipeline for audio blobs.
-Stack notes as of 2026-07: **whisper.cpp** for STT (Whisper already runs on this machine via the
-launcher); for TTS, **Piper was archived in October 2025**, so use **Kokoro-82M** (or Coqui XTTS)
-instead — Kokoro is small enough to sit beside a quantized LLM. Expect 1-2s end-to-end on
-desktop-class hardware; the honest constraint here is the same 8GB card, so treat voice as a
-Studio-mode-style tenant, not a free addition. *Hook:* `server/uploads.js` (audio kind),
-new `server/voice.js`, `web/js/apps/chat.js` composer.
 
 **D9. ✨ Vault housekeeping pass — M.** An agent/scripted sweep that finds orphan notes,
 near-duplicates (offer merge), broken `[[links]]`, and stale facts, with a "wiki coverage" view of
@@ -902,6 +1342,131 @@ unwinds rows *and* their price observations cleanly, so the escape hatch exists.
 calibrated per **B18**. Off by default: this is money, and the whole design so far has been
 "the scan is a draft, never a result".
 *Hook:* `server/receipts.js:scan` tail + `apply()`, `finance.autoPostAbove` config key.
+
+## H. Desktop control — "open Obsidian for me", and show me that you did 🖥️
+
+The ask: say *"can you open Obsidian for me"* and have it happen, and — because a voice
+assistant that acts invisibly is indistinguishable from one that is broken — **see** it happen,
+in a pane inside AIOS rather than only on the desktop behind it.
+
+**It is possible, and every piece was measured on this machine on 2026-08-18** rather than
+assumed. The findings that decide the design:
+
+- The AIOS server is a **child of the desktop session**: `/proc/<pid>/environ` carries
+  `DISPLAY=:0`, `XAUTHORITY`, and `DBUS_SESSION_BUS_ADDRESS`. It can already talk to X and to the
+  session bus; nothing needs to be added for that. (The browser tab cannot and never will — this
+  is server-side work with a browser front end, exactly like every other app here.)
+- **121 launchable applications** parse out of 173 `.desktop` files across the five standard
+  directories. Obsidian is the flatpak `md.obsidian.Obsidian`, and — the part that makes the
+  "show me" half work — it declares **`StartupWMClass=obsidian`**, which is precisely the key
+  needed to find its window after launch.
+- `wmctrl -lpx` (installed) gives window id ↔ PID ↔ WM_CLASS ↔ title; `xprop -root
+  _NET_ACTIVE_WINDOW` gives focus; `xwininfo -id` gives geometry. `gtk-launch` (installed) runs a
+  `.desktop` entry properly, honouring flatpak wrappers and `%U`/`%F` field codes — which naive
+  `Exec=` splitting gets wrong on exactly the flatpak lines this box is full of.
+- A window frame captured as `xwd -id <win> | ffmpeg -f xwd_pipe`, scaled to 900px and JPEG'd,
+  costs **68ms and 44KB**, repeatably. A 2-4fps live pane is therefore ~5% of one core and
+  ~130KB/s over the WebSocket that is already open. No new dependency: `ffmpeg`, `xwd`,
+  `xwininfo`, `wmctrl` and `gtk-launch` are all present.
+- ⚠️ **`xdotool` is not installed** (candidate `1:3.20160805.1-5build1`, one `apt install` away).
+  It is needed *only* for **H4** — synthetic clicks and keystrokes. Everything in **H1-H3** and
+  **H5** works without it.
+- ⚠️ **X11 has no off-screen window store.** A capture of a partially covered window includes
+  whatever is covering it — verified. So the pane shows the window *as it appears on screen*,
+  which is honest and is what you want for "did that work?", but it is not a private render. Say
+  so in the UI rather than letting a screenshot with a terminal across it look like a bug.
+- ⚠️ **This is X11-only** (`XDG_SESSION_TYPE=x11`, Cinnamon). Wayland forbids all of it by design
+  — see **H7**.
+
+**H1. 🔥 Open an app by name, and prove it opened — M.** The whole feature in one tool.
+`server/desktop.js`: parse the five `.desktop` directories into a cached catalogue (name,
+`Exec`, `StartupWMClass`, categories, icon), fuzzy-match a spoken name against it, launch via
+`gtk-launch <id>`, then **wait for the window** — poll `wmctrl -lpx` for up to ~15s for a window
+whose class matches `StartupWMClass` (falling back to the launched PID, then to a new window that
+was not there before). Return what actually happened: *which* app matched, its window id and
+title, or a clean failure. Two rules earn their keep: (a) a fuzzy name match that is not
+confident **asks** — "I found Obsidian and Obsidian Sandbox, which one?" — because launching the
+wrong program is cheap to prevent and annoying to undo; (b) if the app is already running,
+**focus it** (`wmctrl -ia`) rather than starting a second copy, which is what a person means by
+"open Obsidian" when Obsidian is open. *Hook:* new `server/desktop.js`, a `desktop` tool group in
+`server/tools.js`, `server/voice.js` for the spoken confirmation.
+
+**H2. 🔥 The window pane — see what it's doing — S.** The "second screen". A panel that shows the
+window AIOS just acted on, updating a few times a second: `GET /api/desktop/frame?win=<id>`
+for a single JPEG, and a WS topic `desktop.frame` for a live view that only runs while the pane
+is visible and stops the moment it is not. Two surfaces: a **strip inside Voice mode** (the
+overlay is already the hands-free screen, and this is where "show me that it worked" belongs) and
+a full **Desktop app** for driving it deliberately. Cheap wins that make it feel alive: a
+one-frame capture attached to the transcript line for *every* desktop action, so scrolling back
+through a voice session shows a filmstrip of what happened; and a click-to-enlarge. Deliberately
+**not** a remote desktop — no input travels back from the pane in this item (that is **H4**), so
+it is a viewer and cannot do harm. *Hook:* new `server/desktop.js:captureWindow`,
+`server/index.js` route + WS topic, `web/js/voicemode.js`, new `web/js/apps/desktop.js`.
+
+**H3. ✨ Window management by voice — S.** Once **H1** can name a window, the verbs are almost
+free and are the ones actually said out loud: *focus / close / minimise / maximise / move to
+workspace 2 / put it on the left half*. `wmctrl` does all of it (`-a`, `-c`, `-b add,maximized_*`,
+`-t`, `-e` for geometry) with no new dependency, and each is a one-line implementation over the
+window list **H1** already builds. "What's open?" — reading back the window list — is worth
+having on its own. *Hook:* `server/desktop.js`, same tool group.
+
+**H4. 🧪 Synthetic input — click and type — M.** The half that makes it *interact* rather than
+merely launch: `xdotool` to focus a window, send keystrokes (`key ctrl+n`, `type "…"`) and click
+at a coordinate. The honest position is that this is a **different risk class** from everything
+above and should be built last and gated hardest. Launching the wrong app wastes a second;
+sending keystrokes to the wrong window can type into a chat, a terminal or a form. Three
+constraints that should not be negotiable: (a) input is always addressed to an **explicit window
+id**, never "whatever is focused", so a focus change between decision and action cannot redirect
+it; (b) every input action is a **confirmable action** in the `server/actions.js` sense — the
+same propose→confirm gate the ledger uses, with the target window named in the spoken summary;
+(c) a **deny-list of window classes** (password managers, terminals, the browser's own address
+bar) that never receive synthetic input at all, because those are where a misdirected keystroke
+does lasting damage. Bitwarden is installed on this box, which is the concrete version of that
+argument. *Hook:* `server/desktop.js`, `server/actions.js` (new action kinds), `apt install
+xdotool` as a documented prerequisite with a `serviceProbe()` entry.
+
+**H5. ✨ Prefer the app's own front door to a synthetic click — S.** Before reaching for **H4**,
+reach for the interface the app already exposes. Obsidian speaks `obsidian://open?vault=…&file=…`
+— so *"open my notes on kilns in Obsidian"* is a **URI**, not a search box plus typing plus
+Enter, and it is deterministic in a way that clicking never is. Brave takes `--new-tab <url>`;
+`nemo <path>` opens a folder; `xdg-open` handles anything with a registered handler; and AIOS
+*already knows the vault path*, so the file half is a `vault_search` away. Build a small map of
+**app → deep-link recipes** and make the tool try that route first. This is the difference
+between "it clicked around and probably worked" and "it opened the right note". *Hook:*
+`server/desktop.js` recipe table, `server/vault.js` for path resolution.
+
+**H6. 🔥 The safety model, decided before the capability lands — S.** This is the first feature in
+AIOS where a mistake escapes the browser tab, and the project already owns the right pattern:
+propose, confirm, then act. Concretely — an **allow-list** of launchable apps in Settings
+(default: everything discovered, with a switch to flip to explicit-only), **launching is
+low-consequence** and can run on confirmation-by-default like the additive writes, **synthetic
+input is always confirmed** (**H4**), nothing here is ever reachable from Chat's tool belt
+without the gate, and every desktop action is logged with its target so **C17**'s ledger can show
+what was done. One more, specific to this feature: a fetched web page or a vault note can already
+steer the agent (**B5**) — and "the model can now start programs" is exactly the escalation that
+threat model is about. Desktop tools must be **agent-and-voice only**, never in the chat belt
+that a summarised web page flows through. *Hook:* `server/tools.js` gating, `server/config.js`
+new `desktop` section, `server/actions.js`.
+
+**H7. 🧪 See-and-act: let the model read the screen — M.** The pane in **H2** produces a JPEG, and
+this box has a **vision model already wired for receipts** over the same `image_url` path. So
+*"is the export finished?"* becomes: capture the window, ask the vision model, answer out loud.
+That is a genuinely new capability and it needs no new stack — `receipts.js` proves the plumbing
+end to end. The version to resist is the general one: a loop that screenshots, asks the model
+where to click, clicks, and repeats is a computer-use agent, and on an 8GB card with a local
+model it will be slow, wrong, and unattended in front of your real desktop. **Read the screen to
+answer questions; act through H1/H3/H5's named verbs.** *Hook:* `server/desktop.js:captureWindow`
+→ `server/llm.js` vision path, the pattern in `server/receipts.js:scan`.
+
+**H8. 💭 Wayland — know now that this ends — S to find out, L to solve.** Every mechanism above is
+X11 (`xwd`, `wmctrl`, `xdotool`, region grabs). Wayland deliberately forbids one client seeing or
+driving another, and the replacements are the **xdg-desktop-portal** screencast API (PipeWire,
+user grants a permission dialog per session) and `ydotool` via uinput (needs a privileged
+daemon). Cinnamon on X11 is where this box is today and there is no reason to pre-solve it — but
+the abstraction should be one `desktop.js` backend interface with an `x11` implementation, so
+the day the session type changes the answer is a second backend rather than a rewrite. Put the
+session type on the health page (**C5**) so the failure is legible instead of mysterious.
+*Hook:* `server/desktop.js` backend split, `server/checks.js`.
 
 ## E. Monetization / return-on-investment 💰
 

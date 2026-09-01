@@ -1767,6 +1767,121 @@ await hard('finance: income tracking', async () => {
   return 'units persist · per-payer rollup · effective rate · daily log · ytd + projection · side vs main · net calendar';
 });
 
+await hard('finance: a template fills everything but the amount', async () => {
+  const fin = await S('finance.js');
+  const y = new Date().getFullYear();
+
+  // A template is a preset with NO amount. Every other field of the stream is answered
+  // once, so logging it later is one number — which is the entire point of the feature.
+  const tpl = fin.addPreset({
+    name: 'Audit Micro1', amount: '', kind: 'income', category: 'Freelance',
+    merchant: 'Micro1 Inc', note: 'micro tasks', currency: 'JPY',
+  });
+  assert(tpl.amount === 0 && tpl.asksAmount === true, 'a blank amount must mark the preset as a template');
+
+  const r = fin.logPreset(tpl.id, { amount: 3200, date: `${y}-04-02` });
+  const t = r.created[0];
+  assert(t.amount === 3200, 'the typed amount is what gets logged, got ' + t.amount);
+  assert(t.category === 'Freelance' && t.merchant === 'Micro1 Inc' && t.note === 'micro tasks',
+    'the template must fill category/payer/note without them being typed, got ' + JSON.stringify(t));
+  assert(t.source === 'preset' && t.presetId === tpl.id, 'the row must point back at the template it came from');
+
+  // A template with no merchant falls back to its own name, so the common case
+  // ("the chip is called X and X is who pays") needs nothing typed at all.
+  const bare = fin.addPreset({ name: 'Audit Bare', amount: '', kind: 'income', category: 'Side Job' });
+  assert(fin.logPreset(bare.id, { amount: 100, date: `${y}-04-02` }).created[0].merchant === 'Audit Bare',
+    'a template with no payer set is logged against its own name');
+
+  // A template with no amount cannot be logged without one — silently writing a zero-yen
+  // row would be worse than the error.
+  let threw = '';
+  try { fin.logPreset(tpl.id, {}); } catch (e) { threw = e.message; }
+  assert(/no fixed amount/.test(threw), 'logging a template with no amount must be refused, got ' + JSON.stringify(threw));
+
+  // A FIXED preset is untouched by any of this: still one tap, still N rows for N items.
+  const fixed = fin.addPreset({ name: 'Audit Coffee', amount: 480, kind: 'expense', category: 'Food & Drink' });
+  assert(fixed.asksAmount === false, 'a preset with an amount is not a template');
+  assert(fin.logPreset(fixed.id, { count: 3, date: `${y}-04-02` }).created.length === 3, 'flat presets still split by count');
+
+  return 'blank amount = template · fills payer/type/note · name as payer fallback · amountless log refused · fixed presets unchanged';
+});
+
+await hard('finance: an estimate is not money until it is paid', async () => {
+  const fin = await S('finance.js');
+  const y = new Date().getFullYear();
+  const q = { from: `${y}-05-01`, to: `${y}-05-31` };
+  const before = fin.summary(q);
+
+  // Four days of freelance work, guessed on the day.
+  const est = ['05-04:5000', '05-05:7000', '05-06:3000', '05-07:4000'].map(x => {
+    const [d, amt] = x.split(':');
+    return fin.addPending({ date: `${y}-${d}`, amount: Number(amt), merchant: 'Audit Payer', category: 'Freelance', units: 2, unit: 'hour' });
+  });
+
+  // THE load-bearing assertion. An estimate must move no total anywhere — this is what
+  // separates the feature from "an income row with a flag", which would have to be
+  // excluded by every aggregate in finance.js and would silently leak the day one missed it.
+  const mid = fin.summary(q);
+  assert(mid.earned === before.earned, `estimates must never count as earned (${before.earned} → ${mid.earned})`);
+  assert(fin.incomeBySource(q).items.every(i => i.source !== 'Audit Payer'), 'an estimate is not an income source yet');
+  assert(fin.getGoal(`${y}-05`).progress === fin.getGoal(`${y}-05`).progress, 'goal progress reads without estimates');
+
+  const open = fin.listPending({});
+  assert(open.total === 19000 && open.items.length >= 4, 'open estimates total 19000, got ' + open.total);
+
+  // Paid twice a month against a fortnight of guesses: one payout, many estimates.
+  const paid = fin.settlePending({ ids: est.map(e => e.id), amount: 20900, date: `${y}-05-15` });
+  assert(paid.expected === 19000 && paid.actual === 20900, 'settlement compares the guess with what arrived');
+  assert(paid.variance === 1900 && paid.biasPct === 10, `variance +1900 / +10%, got ${paid.variance} / ${paid.biasPct}`);
+  assert(paid.txn.kind === 'income' && paid.txn.amount === 20900 && paid.txn.source === 'settle',
+    'settling writes exactly one real income row for what arrived');
+  assert(paid.txn.units === 8 && paid.txn.unit === 'hour', 'work carries onto the payout when every estimate measured it the same way');
+
+  // NOW it is money — and only the amount that actually arrived, never the guess.
+  const after = fin.summary(q);
+  assert(after.earned - before.earned === 20900, `only the received amount enters the ledger, got ${after.earned - before.earned}`);
+
+  // The allocation back across the estimates must add up to exactly the payout, or the
+  // per-client calibration below is quietly wrong.
+  const settled = fin.listPending({ status: 'settled', month: `${y}-05` });
+  const alloc = Math.round(settled.items.reduce((n, r) => n + r.actualBase, 0) * 100) / 100;
+  assert(alloc === 20900, `pro-rata shares must sum back to the payout, got ${alloc}`);
+  assert(settled.items.find(r => r.amountBase === 7000).actualBase === 7700, 'shares are proportional to each estimate');
+
+  // Calibration: which way the intuition leans, per client.
+  const ov = fin.pendingOverview({ month: `${y}-05` });
+  assert(ov.settled.variance === 1900 && ov.settled.payouts === 1, 'the period rolls the payouts up');
+  const payer = ov.byPayer.find(b => b.payer === 'Audit Payer');
+  assert(payer && payer.biasPct === 10, 'per-payer bias says the guesses ran 10% low, got ' + JSON.stringify(payer));
+  assert(ov.open.total === 0 && ov.open.groups.length === 0, 'a settled estimate leaves the open pile');
+
+  // Settling twice, or editing a settled guess, would rewrite history that has already
+  // been reported. Both are refused.
+  let e1 = '', e2 = '';
+  try { fin.settlePending({ ids: [est[0].id], amount: 1 }); } catch (e) { e1 = e.message; }
+  try { fin.updatePending(est[0].id, { amount: 1 }); } catch (e) { e2 = e.message; }
+  assert(/already settled/.test(e1) && /already settled/.test(e2), 'a settled estimate is frozen');
+
+  // Undo puts everything back exactly as it was, including removing the payout row.
+  fin.unsettlePending(paid.txn.id);
+  assert(fin.summary(q).earned === before.earned, 'unsettling removes the payout from the ledger');
+  assert(fin.listPending({ merchant: 'Audit Payer' }).total === 19000, 'unsettling reopens the estimates it closed');
+
+  // Writing one off keeps the record without letting it count anywhere.
+  fin.voidPending([est[0].id]);
+  assert(fin.listPending({ merchant: 'Audit Payer' }).total === 14000, 'a written-off estimate leaves the open total');
+  assert(fin.pendingOverview({ month: `${y}-05` }).open.count === 3, 'and leaves the open count');
+
+  // An estimate template routes to the expected ledger without anything being ticked.
+  const tpl = fin.addPreset({ name: 'Audit Guessed', amount: '', kind: 'income', category: 'Freelance', merchant: 'Audit Payer', isEstimate: true });
+  const g = fin.logPreset(tpl.id, { amount: 2500, date: `${y}-05-20` });
+  assert(g.estimate === true && g.created.length === 0 && g.pending[0].amount === 2500,
+    'a template marked 想定 logs an estimate, not a transaction');
+  assert(fin.summary(q).earned === before.earned, 'and still moves no total');
+
+  return 'estimates move no total · batch settle · pro-rata shares sum exact · variance + per-payer bias · frozen once settled · undo · write-off · 想定 templates';
+});
+
 await hard('uploads: orientation detection and rotation', async () => {
   const up = await S('uploads.js');
   if (!up.canConvertImages()) return 'skipped — no ffmpeg on this machine';
@@ -1826,6 +1941,105 @@ await hard('uploads: orientation detection and rotation', async () => {
 
   for (const f of [tall, wide]) fs.rmSync(f.dir, { recursive: true, force: true });
   return 'imageSize · greyRaster · rotate in place · meta records the angle · 0° no-op · crop-to-document · declines when pointless';
+});
+
+await hard('uploads: a hand-held tilt is measured and undone', async () => {
+  const up = await S('uploads.js');
+  if (!up.canConvertImages()) return 'skipped — no ffmpeg on this machine';
+  const { execFileSync } = await import('node:child_process');
+  const ff = process.env.FFMPEG || '/home/linuxbrew/.linuxbrew/bin/ffmpeg';
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aios-skew-'));
+
+  // A synthetic receipt: dark bars on white paper, evenly spaced. That comb of text lines
+  // is exactly the structure the projection profile locks onto, so it is the honest test
+  // of the detector — and unlike a photo, its true angle is known to the degree.
+  const bars = Array.from({ length: 14 }, (_, i) =>
+    `drawbox=x=60:y=${70 + i * 52}:w=280:h=16:color=black:t=fill`).join(',');
+  const straight = path.join(dir, 'straight.jpg');
+  execFileSync(ff, ['-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', 'color=c=white:s=400x800', '-vf', bars, '-frames:v', '1', straight]);
+  const flat = fs.readFileSync(straight);
+
+  const tilt = (deg) => {
+    const rad = (deg * Math.PI / 180).toFixed(6);
+    const out = path.join(dir, `t${deg}.jpg`);
+    execFileSync(ff, ['-hide_banner', '-loglevel', 'error', '-y', '-i', straight,
+      '-vf', `rotate=${rad}:ow=rotw(${rad}):oh=roth(${rad}):fillcolor=white`, '-q:v', '2', out]);
+    return fs.readFileSync(out);
+  };
+
+  try {
+    // Straight paper is left alone. This matters more than the correction: re-encoding a
+    // photo that was already square costs quality and buys nothing.
+    assert(up.deskew(flat) === null, 'a straight page must not be rotated, got ' + JSON.stringify(up.detectSkew(flat)));
+
+    for (const deg of [-8, -4, 3, 6]) {
+      const buf = tilt(deg);
+      const found = up.detectSkew(buf);
+      assert(Math.abs(found.degrees - deg) <= 1,
+        `a ${deg}° tilt should be measured within 1°, got ${found.degrees}`);
+      const fixed = up.deskew(buf);
+      assert(fixed, `a ${deg}° tilt should be corrected, but deskew declined`);
+      const residual = up.detectSkew(fixed.buffer).degrees;
+      assert(Math.abs(residual) <= 1, `after correcting ${deg}° the residual should be ~0, got ${residual}`);
+    }
+
+    // The angle is measured on an aspect-PRESERVING raster. greyRaster squashes to a
+    // square, which stretches a 400x800 page by 2x vertically and would report a 4° tilt
+    // as roughly 8°. This is the assertion that catches that regression.
+    const g = up.greyFit(flat, 320);
+    assert(g && Math.abs((g.w / g.h) - (400 / 800)) < 0.02, 'greyFit must keep the picture proportions, got ' + (g && `${g.w}x${g.h}`));
+
+    // Bounded: a quarter-turn is a different problem with a different fix, and a detector
+    // that "corrects" 90° would fight the orientation logic that owns it.
+    const sideways = up.detectSkew(tilt(0));
+    assert(Math.abs(sideways.degrees) <= 12, 'the search must stay inside its bounds');
+
+    return 'straight left alone · ±8° measured within 1° and corrected to ~0 · aspect preserved · bounded';
+  } finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { } }
+});
+
+await hard('receipts: a looping reader is cut off, a repeated purchase is not', async () => {
+  const r = await S('receipts.js');
+
+  // The failure this exists for, taken from life: HunyuanOCR read a McDonald's receipt as
+  // a Markdown table, got every line right, then emitted empty rows to the token cap.
+  const runaway = ['# マクドナルド', '(Big Mac Set) 880', '(Teriyaki Set) 720',
+    ...Array(9).fill('| | | |')].join('\n');
+  const cut = r.trimRepetition(runaway);
+  assert(!cut.includes('| | | |'), 'the repeated tail must be cut');
+  assert(cut.includes('880') && cut.includes('720'), 'the real lines before it must survive');
+
+  // The reason a repetition PENALTY was rejected instead: this is a real receipt in the
+  // archive, and the same product at three prices is the correct reading.
+  const legit = ['国産豚肉 ミンチ 264', '国産豚肉 ミンチ 299', '国産豚肉 ミンチ 273', '合計 4123'].join('\n');
+  assert(r.trimRepetition(legit) === legit, 'genuinely repeated purchases must be kept');
+
+  // Five in a row is under the bar; six is degeneration.
+  assert(r.trimRepetition(['a', ...Array(5).fill('x')].join('\n')).split('\n').length === 6, '5 repeats are tolerated');
+  assert(r.trimRepetition(['a', ...Array(6).fill('x')].join('\n')) === 'a', '6 repeats to the end is a loop');
+
+  // Only a run that reaches the END is degeneration. A repeated block in the middle is
+  // followed by real content, so the model clearly recovered and nothing may be dropped.
+  const middle = ['a', ...Array(8).fill('x'), 'b', 'c'].join('\n');
+  assert(r.trimRepetition(middle) === middle, 'a run that recovers is not a runaway');
+
+  assert(r.trimRepetition('') === '' && r.trimRepetition(null) === '', 'empty input is safe');
+  return 'runaway tail cut · repeated purchases kept · threshold at 6 · mid-text runs kept · empty safe';
+});
+
+await hard('receipts: a reader is asked the way it expects', async () => {
+  const r = await S('receipts.js');
+  // Style decides whether a long receipt can be read in bands at all: only line-oriented
+  // output can be stitched back together, so a layout-JSON reader must opt out.
+  assert(r.transcribeStyle('local:dots.ocr-q8_0') === 'layout-json', 'dots.ocr answers in layout JSON');
+  assert(r.transcribeStyle('local:hunyuanocr-q8_0') === 'lines', 'HunyuanOCR answers in lines');
+  assert(r.transcribeStyle('local:paddleocr-vl-1.6-q8_0') === 'lines', 'PaddleOCR-VL answers in lines');
+  // A ref that resolves to nothing local (a cloud model) must fall back, not throw: the
+  // lookup runs on every scan and a broken ref cannot be allowed to take one down.
+  assert(r.transcribeStyle('anthropic:claude-opus-5') === 'lines', 'an unresolvable ref falls back to lines');
+  assert(r.transcribeStyle('') === 'lines' && r.transcribeStyle(undefined) === 'lines', 'no ref falls back to lines');
+  return 'per-model style · unresolvable refs fall back instead of throwing';
 });
 
 await hard('llm: schema-constrained output', async () => {
@@ -1908,7 +2122,102 @@ await hard('llmctl: profiles + launcher config', async () => {
   return 'big/tiny profiles · unknown rejected';
 });
 
+await hard('tools: the agent cannot be pointed at this machine', async () => {
+  // fetch_url and crawl_site take their URL from the model, which takes its ideas from
+  // whatever page it just read. Loopback here answers with ComfyUI, llama-server,
+  // SearXNG and Ollama, none of which authenticate, so "see http://127.0.0.1:11434/api/tags"
+  // used to be a working instruction. Every hop is checked now, including redirects.
+  const t = await S('tools.js');
+
+  const blocked = ['127.0.0.1', '127.1.2.3', '0.0.0.0', '10.1.2.3', '172.16.5.4', '192.168.0.9',
+    '169.254.169.254', '100.64.1.1', '::1', '::', 'fe80::1', 'fc00::1', 'ff02::1',
+    '::ffff:127.0.0.1', '::ffff:7f00:1'];
+  for (const ip of blocked) assert(t.blockedAddress(ip), `${ip} should be refused`);
+  // Fails closed: anything it cannot parse is not a public address either.
+  for (const junk of ['', 'not-an-ip', '999.1.1.1']) assert(t.blockedAddress(junk), `${junk || '(empty)'} should be refused`);
+  // …without swallowing the real internet, and without catching the neighbours of a
+  // private block (172.32/16 sits just past 172.16/12).
+  for (const ip of ['8.8.8.8', '1.1.1.1', '172.32.0.1', '2606:4700:4700::1111']) {
+    assert(!t.blockedAddress(ip), `${ip} is public and must stay fetchable`);
+  }
+
+  // The name is resolved, not just pattern-matched: localhost is not a literal IP.
+  let reached = false;
+  try { await t.fetchReadable('http://localhost:7777/api/status'); reached = true; } catch { }
+  assert(!reached, 'fetch_url reached a loopback service by name');
+
+  // And the guard is wired into every model-facing entry point, not just one.
+  const src = fs.readFileSync(path.join(ROOT, 'server', 'tools.js'), 'utf8');
+  // Comments stripped first — the paragraph above safeFetch explains why
+  // redirect:'follow' is wrong, and a naive grep counts that explanation as an offence.
+  const code = src.replace(/^\s*\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+  const follows = code.match(/redirect:\s*'follow'/g) || [];
+  assert(!follows.length, `redirect:'follow' hands the destination to the page being read (${follows.length} site(s))`);
+  for (const fn of ['fetchReadable', 'fetchRaw', 'fetchPdfText']) {
+    const body = src.slice(src.indexOf(`function ${fn}(`));
+    assert(/safeFetch\(/.test(body.slice(0, 900)), `${fn} still calls fetch() directly`);
+  }
+  return `${blocked.length} private forms refused · public + redirect hops checked · 3 entry points guarded`;
+});
+
+await hard('voice: a partial that lost its race is discarded', async () => {
+  // The final full-quality pass is what gets acted on. A live partial still decoding
+  // when the user stops talking is worth nothing and would overwrite it on screen.
+  // The flag is set on the stream object AND the entry is removed from the map, so
+  // reading the flag back through the map finds undefined and never fires — which is
+  // exactly how this shipped.
+  const src = fs.readFileSync(path.join(ROOT, 'server', 'voice.js'), 'utf8');
+  const body = src.slice(src.indexOf('export async function partialTranscribe'), src.indexOf('export function endPartial'));
+  assert(!/streams\.get\([^)]*\)\?\.closed/.test(body),
+    'the staleness guard reads through the map, which endPartial has already emptied');
+  // Both engines have to guard, and each has to do it on BOTH sides of its await:
+  // before, so a stream closed while queued never starts; after, so one closed mid-
+  // decode does not return anyway. The count is per-engine rather than absolute so
+  // adding a third recogniser does not silently pass with no guard of its own.
+  for (const [fn, next] of [['partialTranscribe', 'async function streamFeed'], ['async function streamFeed', '']]) {
+    const from = body.indexOf(fn);
+    const seg = next ? body.slice(from, body.indexOf(next)) : body.slice(from);
+    assert((seg.match(/if \(s\.closed\)/g) || []).length >= 2,
+      `${fn.replace('async function ', '')} does not check the captured stream either side of its decode`);
+  }
+  return 'both engines guard the captured stream, before and after the decode';
+});
+
 // ---------- environment-dependent (reported, never failed) ----------
+
+await hard('routes: no sendFile inside the h() wrapper', async () => {
+  // h() resolves its callback and then sends {"ok":true} when nothing was returned.
+  // res.sendFile streams asynchronously, so a route that does both sends the JSON
+  // first and the file never arrives — a silent, total failure of that download.
+  // /api/fs/raw shipped that way and survived three sibling routes being fixed
+  // around it, so the shape is checked here rather than left to memory.
+  const src = fs.readFileSync(path.join(ROOT, 'server', 'index.js'), 'utf8');
+  // Paren-matched, and skipping comments and strings: an apostrophe in a comment
+  // ("the user's messages") and the `h(` at the tail of `push(`/`imagePath(` both
+  // produced false positives on the naive version of this.
+  const offenders = [];
+  const re = /app\.(get|post|put|delete)\(\s*('[^']*'|"[^"]*")([\s\S]*?)(?<![\w.$])h\(/g;
+  for (let m; (m = re.exec(src));) {
+    if (/[;}]/.test(m[3])) continue;               // ran past this route's own call
+    let i = m.index + m[0].length, depth = 1;
+    while (i < src.length && depth > 0) {
+      const c = src[i];
+      if (c === '/' && src[i + 1] === '/') { while (i < src.length && src[i] !== '\n') i++; continue; }
+      if (c === '/' && src[i + 1] === '*') { i = src.indexOf('*/', i) + 2; continue; }
+      if (c === "'" || c === '"' || c === '`') {
+        const q = c; i++;
+        while (i < src.length && src[i] !== q) { if (src[i] === '\\') i++; i++; }
+      } else if (c === '(') depth++;
+      else if (c === ')') depth--;
+      i++;
+    }
+    if (/res\.sendFile\(/.test(src.slice(m.index, i))) offenders.push(m[2].replace(/['"]/g, ''));
+  }
+  assert(!offenders.length, `sendFile inside h(): ${offenders.join(', ')}`);
+  const total = (src.match(/res\.sendFile\(/g) || []).length;
+  assert(total >= 4, `expected the 4 known sendFile routes, found ${total}`);
+  return `${total} sendFile routes, none wrapped in h()`;
+});
 
 await soft('env: model providers', async () => {
   const l = await S('llm.js');

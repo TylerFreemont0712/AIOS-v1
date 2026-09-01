@@ -49,6 +49,22 @@ is_aios_pid() {
   ps -p "$p" -o args= 2>/dev/null | grep -q "server/index.js"
 }
 
+# Whoever is actually LISTENING on our port, however it was started.
+#
+# This is the authority, not the pidfile and not a cmdline pattern. A server started
+# by hand (`npm start`), from an editor, or by a launcher whose pidfile has since gone
+# stale answers on the port just the same — and a restart that cannot find it leaves
+# the old code running while the new instance dies of EADDRINUSE. That is exactly what
+# happened here: a six-day-old server kept serving while every restart quietly failed,
+# so shipped changes never took effect.
+port_owner() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnpH "sport = :${PORT}" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -tiTCP:"${PORT}" -sTCP:LISTEN 2>/dev/null
+  fi
+}
+
 stop_server() {
   local pid=""
   [ -f "$PIDFILE" ] && pid="$(cat "$PIDFILE" 2>/dev/null)"
@@ -59,6 +75,11 @@ stop_server() {
   # `npm start`, or an orphaned instance the launcher never recorded.
   pkill -f "${PROJECT_DIR}/server/index.js" 2>/dev/null || true
   pkill -f "server/index.js"                2>/dev/null || true
+  # …and whatever still holds the port, which is the only check that cannot miss.
+  # SIGTERM first: the server's handler stops MCP children and closes the socket,
+  # and killing it outright orphans them.
+  local owner
+  for owner in $(port_owner); do kill "$owner" 2>/dev/null || true; done
 
   # Wait for the port to actually free; escalate to SIGKILL if it clings on.
   local i
@@ -69,6 +90,7 @@ stop_server() {
   is_aios_pid "$pid" && kill -9 "$pid" 2>/dev/null || true
   pkill -9 -f "${PROJECT_DIR}/server/index.js" 2>/dev/null || true
   pkill -9 -f "server/index.js"                2>/dev/null || true
+  for owner in $(port_owner); do kill -9 "$owner" 2>/dev/null || true; done
   sleep 0.5
   rm -f "$PIDFILE"
   notify "Server stopped."
@@ -91,15 +113,30 @@ start_server() {
   # Start detached so the hub outlives this launcher, and remember the PID.
   cd "$PROJECT_DIR" || { notify "Project folder missing: $PROJECT_DIR"; return 1; }
   setsid node server/index.js >> "$LOG" 2>&1 < /dev/null &
-  echo $! > "$PIDFILE"
+  local newpid=$!
+  echo "$newpid" > "$PIDFILE"
 
   # Wait up to ~20s for it to answer, then open the browser.
+  #
+  # "Answers on the port" is NOT enough to call this started. If an old instance
+  # survived the stop, it answers happily while the one we just launched dies of
+  # EADDRINUSE — and the launcher reports success while the running code is whatever
+  # was there before. That failure is invisible and can persist for days, so the
+  # process we started has to be the one holding the port.
   local _n
   for _n in $(seq 1 40); do
     if is_up; then
-      notify "Running at ${URL}"
-      open_url
-      return 0
+      if kill -0 "$newpid" 2>/dev/null && port_owner | grep -qx "$newpid"; then
+        notify "Running at ${URL}"
+        open_url
+        return 0
+      fi
+      # Someone else owns it. Say so loudly rather than pretending we restarted.
+      if ! kill -0 "$newpid" 2>/dev/null; then
+        notify "Start failed — an older AIOS still holds port ${PORT}. See $(basename "$LOG")"
+        echo "aios-launch: the new server exited; port ${PORT} is held by: $(port_owner | tr '\n' ' ')" >&2
+        return 1
+      fi
     fi
     sleep 0.5
   done
@@ -110,15 +147,19 @@ start_server() {
 }
 
 # Kill whatever is running (if anything), then bring up a fresh server.
+#
+# stop_server runs UNCONDITIONALLY. The old code only swept properly when `is_up`
+# said the server was answering; the "not answering" branch pkill'd the
+# absolute-path pattern alone, which never matches how the server is actually
+# started (`node server/index.js`, relative, from the project dir). So one flaky
+# health check — a two-second curl timeout is all it takes — left the running
+# instance untouched, the new one died of EADDRINUSE, and the launcher reported
+# success. That is how a server from six days earlier kept serving stale code
+# through every restart. stop_server is idempotent and costs nothing when nothing
+# is running, so there is no reason to guess first.
 restart_server() {
-  if is_up; then
-    notify "Restarting AIOS…"
-    stop_server
-  else
-    # Nothing answering on the port — clear a stale pidfile / orphan quietly.
-    rm -f "$PIDFILE"
-    pkill -f "${PROJECT_DIR}/server/index.js" >/dev/null 2>&1 || true
-  fi
+  is_up && notify "Restarting AIOS…"
+  stop_server
   start_server
 }
 

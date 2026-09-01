@@ -1,9 +1,11 @@
 // Chat: streaming conversations with any configured model.
 
-import { el, icon, icons, toast, confirmBox, askText, modelPicker, timeAgo, throttle, thinkingPanel, attachTray, attachmentView, perfBadge } from '../ui.js';
+import { el, icon, icons, toast, confirmBox, askText, menu, modelPicker, timeAgo, throttle, thinkingPanel, attachTray, attachmentView, perfBadge } from '../ui.js';
 import { get, post, patch, del, wsSend, sub, uploadFile } from '../api.js';
 import { renderMd } from '../markdown.js';
 import { openApp } from '../wm.js';
+import { Recorder, transcribe, speak, speakStream, stopSpeaking, voiceStatus, micProblem, prefs as voicePrefs, setPrefs as setVoicePrefs } from '../voice.js';
+import { openVoiceMode } from '../voicemode.js';
 
 export default {
   id: 'chat', title: 'Chat', icon: 'chat', width: 980, height: 660,
@@ -43,9 +45,21 @@ export default {
     ui.file = el('input', { type: 'file', multiple: true, style: { display: 'none' }, onchange: () => { ui.tray.add([...ui.file.files]); ui.file.value = ''; } });
     ui.attach = el('button', { class: 'btn sm ghost attach-btn', title: 'Attach image, PDF, or file', onclick: () => ui.file.click() }, icon('paperclip'));
 
+    // --- voice ---
+    // The two live where the two jobs live: talking sits next to Send, because it is
+    // a way of composing a message; how it talks BACK is a setting, so it sits with
+    // the other settings next to Tools.
+    ui.mic = el('button', { class: 'btn sm ghost mic-btn', title: 'Dictate (click again to stop)', onclick: () => toggleMic() }, icon('mic'));
+    ui.voiceMode = el('button', {
+      class: 'btn sm ghost mic-btn', title: 'Voice mode — talk to AIOS hands-free',
+      onclick: () => startVoiceMode(),
+    }, icon('waveform'));
+
     const box = el('div', { class: 'composer-box' },
       ui.tray.node, ui.input,
-      el('div', { class: 'composer-row' }, ui.attach, ui.model, el('span', { class: 'grow' }), ui.send));
+      el('div', { class: 'composer-row' },
+        ui.attach, ui.model,
+        el('span', { class: 'grow' }), ui.mic, ui.voiceMode, ui.send));
     const composer = el('div', { class: 'composer' }, box, ui.file);
 
     // drag-and-drop files onto the composer, and paste images from the clipboard
@@ -58,10 +72,16 @@ export default {
     });
 
     ui.toolsToggle = el('button', { class: 'btn sm ghost tools-toggle', title: 'Tools — let chat search the web and read your notes, inbox, and planner (read-only) to answer with current, grounded information', onclick: toggleTools }, icon('wrench'), 'Tools');
+    ui.speakToggle = el('button', {
+      class: 'btn sm ghost speak-toggle', title: 'How replies are spoken',
+      onclick: (e) => voiceMenu(e),
+    }, icon('speaker'), el('span', { class: 'speak-label' }, 'Voice'));
+
     ui.head = el('div', { class: 'pane-head' },
       el('span', { class: 'ttl' }, 'New chat'),
       el('span', { class: 'grow' }),
       ui.toolsToggle,
+      ui.speakToggle,
       el('button', { class: 'btn sm ghost', title: 'System prompt', onclick: editSystem }, icon('edit'), 'system'),
       el('button', { class: 'btn sm ghost danger', title: 'Delete chat', onclick: deleteChat }, icon('trash')));
 
@@ -243,6 +263,9 @@ export default {
 
     async function load(id) {
       win.chatState.unsub?.();
+      // Leaving a conversation stops its voice with it — otherwise the previous
+      // chat's answer keeps being read out over the one you just opened.
+      stopSpeaking(); autoSpeaker = null;
       const c = await get('/chats/' + id);
       win.chatState.chatId = id;
       win.chatState.streaming = false;
@@ -253,7 +276,7 @@ export default {
       ui.msgs.innerHTML = '';
       for (const m of c.messages) {
         if (m.role === 'user') appendMsg('user', m.text, m.attachments);
-        else appendAsst(m.text, m.reasoning, m.perf, m.tools);
+        else appendAsst(m.text, m.reasoning, m.perf, m.tools, m.proposals);
       }
       scrollDown(true);
       win.chatState.unsub = sub('chat:' + id, onEvent);
@@ -278,13 +301,14 @@ export default {
 
     // A persisted assistant turn: collapsed reasoning panel (if any) + answer bubble,
     // plus a compact chip noting any read-only tools the turn used.
-    function appendAsst(text, reasoning, perf, tools) {
+    function appendAsst(text, reasoning, perf, tools, proposals) {
       const content = el('div', { class: 'msg-content' });
       if (reasoning) { const t = thinkingPanel({ collapsed: true, doneLabel: 'Thought process' }); t.setText(reasoning); content.append(t.node); }
       if (tools?.length) content.append(el('div', { class: 'msg-tools' }, icon('wrench'), 'used ' + tools.join(' · ')));
       content.append(el('div', { class: 'msg-bubble' }, renderMd(text)));
-      const badge = perfBadge(perf);
-      if (badge) content.append(el('div', { class: 'msg-perf' }, badge));
+      if (proposals?.length) content.append(el('div', { class: 'prop-list' }, proposals.map(proposalCard)));
+      const badge = perfBadge(perf), read = readAloudBtn(() => text);
+      if (badge || read) content.append(el('div', { class: 'msg-perf' }, badge, read));
       ui.msgs.append(el('div', { class: 'msg asst' }, el('div', { class: 'msg-role' }, 'assistant'), content));
     }
 
@@ -343,9 +367,10 @@ export default {
       } else if (ev.type === 'delta') {
         const L = ensureLive();
         if (L.think?.live) L.think.done();               // reasoning is over once the answer starts
-        if (!L.bubble) { L.bubble = el('div', { class: 'msg-bubble' }); L.content.append(L.bubble); }
+        if (!L.bubble) { L.bubble = el('div', { class: 'msg-bubble' }); L.content.insertBefore(L.bubble, L.props || null); }
         win.chatState.buf += ev.delta;
         rerenderLive();
+        speakDelta(ev.delta);
       } else if (ev.type === 'tool.start') {
         const L = ensureLive();
         if (L.think?.live) L.think.done();
@@ -356,17 +381,37 @@ export default {
       } else if (ev.type === 'tool.end') {
         finishToolCard(ev.callId, ev.ok, ev.content);
         scrollDown();
+      } else if (ev.type === 'proposal') {
+        // What gets read aloud is the card, not the model's sentence about the card:
+        // the card's line is built from the fields that are actually about to be
+        // written, so it cannot drift from them.
+        turnProposals.push(ev.proposal);
+        if (autoSpeaker) { stopSpeaking(); autoSpeaker = null; }
+        // The card lands as soon as the model asks for the write, before the reply
+        // text finishes — so it is on screen by the time the sentence explaining it is.
+        const L = ensureLive();
+        if (!L.props) { L.props = el('div', { class: 'prop-list' }); L.content.append(L.props); }
+        L.props.append(proposalCard(ev.proposal));
+        scrollDown();
+      } else if (ev.type === 'proposal.update') {
+        updateProposal(ev.proposal);
       } else if (ev.type === 'done') {
         if (live?.think?.live) live.think.done();
-        if (live?.bubble) { live.bubble.innerHTML = ''; live.bubble.append(renderMd(ev.text || win.chatState.buf)); }
-        else if ((ev.text || win.chatState.buf) && live) live.content.append(el('div', { class: 'msg-bubble' }, renderMd(ev.text || win.chatState.buf)));
-        const badge = perfBadge(ev.perf);
-        if (badge && live) live.content.append(el('div', { class: 'msg-perf' }, badge));
+        const finalText = ev.text || win.chatState.buf;
+        if (live?.bubble) { live.bubble.innerHTML = ''; live.bubble.append(renderMd(finalText)); }
+        else if (finalText && live) live.content.append(el('div', { class: 'msg-bubble' }, renderMd(finalText)));
+        if (live && finalText) {
+          const badge = perfBadge(ev.perf), read = readAloudBtn(() => finalText);
+          if (badge || read) live.content.append(el('div', { class: 'msg-perf' }, badge, read));
+        }
+        speakDone(finalText, turnProposals);
+        turnProposals = [];
         live = null;
         setSending(false);
         refreshList();
         scrollDown();
       } else if (ev.type === 'error') {
+        turnProposals = [];
         toast(ev.message, 'err');
         if (live) { live.content.append(el('div', { class: 'muted small' }, '⚠ ' + ev.message)); live = null; }
         setSending(false);
@@ -376,6 +421,311 @@ export default {
     function scrollDown(force) {
       const nearBottom = ui.msgs.scrollHeight - ui.msgs.scrollTop - ui.msgs.clientHeight < 160;
       if (force || nearBottom) ui.msgs.scrollTop = ui.msgs.scrollHeight;
+    }
+
+    // --- voice ---
+    //
+    // Two separate things share these buttons. The mic DICTATES: what you say lands
+    // in the composer so you can fix a misheard word before it is sent, which is the
+    // right default for a thing that will act on what it hears. Voice mode is the
+    // other half — send-as-you-speak, replies read back — and it lives in its own
+    // overlay because it is a different posture, not a different button state.
+    let voiceInfo = null, mic = null, autoSpeaker = null;
+    // Writes staged during the turn in flight — they decide what gets spoken at the end.
+    let turnProposals = [];
+
+    async function initVoice() {
+      voiceInfo = await voiceStatus();
+      paintAutoSpeak();
+    }
+
+    /**
+     * Why nothing here hides itself.
+     *
+     * The first cut hid the mic whenever voice was unavailable, which made a blocked
+     * microphone and an absent feature look identical — and the most common reason
+     * for "unavailable" is not a missing model, it is that the page was opened on the
+     * LAN address, where browsers do not expose a microphone at all. A hidden button
+     * cannot say that. So the buttons are always there and the click explains.
+     */
+    function voiceBlocker() {
+      if (voiceInfo?.enabled === false) return 'Voice is turned off in Settings → Voice.';
+      if (voiceInfo?.unknown) return 'This server has no voice support yet — restart AIOS so it picks up the voice routes.';
+      if (!voiceInfo?.stt?.ok) return voiceInfo?.setup || 'No speech model installed yet — run `npm run voice` in the AIOS folder.';
+      return micProblem();
+    }
+
+    /**
+     * True when we can proceed; otherwise says why and returns false.
+     *
+     * Re-probes when the cached answer was a bad one. Apps stay mounted for the life
+     * of the session here, so a status fetched before the server had voice routes —
+     * or before `npm run voice` had finished — would otherwise be believed until the
+     * whole app was closed and reopened. Asking again at the moment of use means
+     * "restart AIOS, then press the mic" does what the user expects.
+     */
+    async function voiceReady() {
+      if (voiceBlocker()) {
+        voiceInfo = await voiceStatus({ fresh: true });
+        paintAutoSpeak();
+      }
+      const why = voiceBlocker();
+      if (!why) return true;
+      toast(why, 'err');
+      return false;
+    }
+
+    async function startVoiceMode() {
+      if (!await voiceReady()) return;
+      openVoiceMode({ chatId: win.chatState.chatId });
+    }
+
+    // How replies are spoken: three named positions rather than a button you click
+    // repeatedly to discover. It sits beside Tools because it is the same kind of
+    // thing — a switch that changes how the assistant behaves in this app.
+    const SPEAK_MODES = [
+      ['auto', 'Always on', 'Every reply is read aloud as it arrives'],
+      ['ask', 'On click', 'Silent until you press the speaker on a message'],
+      ['off', 'Muted', 'Never speaks — the microphone still works'],
+    ];
+    const SPEAK_LOOK = {
+      auto: ['speaker', 'Always on'],
+      ask: ['speaker', 'On click'],
+      off: ['speakerOff', 'Muted'],
+    };
+
+    function paintAutoSpeak() {
+      const mode = voicePrefs().speech;
+      const [ic, label] = SPEAK_LOOK[mode] || SPEAK_LOOK.ask;
+      ui.speakToggle.classList.toggle('on', mode === 'auto');
+      ui.speakToggle.classList.toggle('is-muted', mode === 'off');
+      ui.speakToggle.replaceChildren(icon(ic), el('span', { class: 'speak-label' }, label));
+      ui.speakToggle.title = `Spoken replies: ${label} — click to change`;
+      // With speech off there is nothing for the per-message buttons to do.
+      ui.msgs.classList.toggle('is-muted', mode === 'off');
+    }
+
+    function setSpeech(mode) {
+      setVoicePrefs({ speech: mode });
+      if (mode !== 'auto') { stopSpeaking(); autoSpeaker = null; }
+      paintAutoSpeak();
+    }
+
+    function voiceMenu(e) {
+      const cur = voicePrefs().speech;
+      const items = SPEAK_MODES.map(([v, label, hint]) => ({
+        label, hint, sel: cur === v,
+        icon: v === 'off' ? 'speakerOff' : 'speaker',
+        onclick: () => setSpeech(v),
+      }));
+      items.push('-',
+        { label: 'Voice mode — talk hands-free', icon: 'waveform', onclick: () => startVoiceMode() },
+        { label: 'Voice settings…', icon: 'settings', onclick: () => openApp('settings', { tab: 'voice' }) });
+      const r = e.currentTarget.getBoundingClientRect();
+      menu(r.left, r.bottom + 6, items);
+    }
+
+    function setMicState(on) {
+      ui.mic.classList.toggle('is-rec', on);
+      ui.mic.title = on ? 'Stop and transcribe' : 'Dictate (click again to stop)';
+      if (!on) ui.mic.style.removeProperty('--mic-level');
+    }
+
+    async function toggleMic() {
+      if (mic) { mic.stop(); return; }
+      if (!await voiceReady()) return;
+      try {
+        // Live text in the composer while you talk, when the streaming recogniser is
+        // installed. This is the case that feels most like phone dictation, so it is
+        // worth the extra state: `dictBase` is what was in the box before the mic
+        // opened, and each partial redraws base + heard-so-far. Redrawing rather than
+        // appending is what lets the transducer revise a word it got wrong mid-phrase.
+        const streaming = !!voiceInfo?.stt?.streaming;
+        const dictBase = ui.input.value.replace(/\s+$/, '');
+        let dictated = false, settled = false;
+        mic = new Recorder({
+          // Dictation is not hands-free: you stop when you say you have stopped.
+          // Auto-cutting a sentence someone is still composing is far more annoying
+          // here than in Voice mode, where the turn-taking is the point.
+          handsFree: false, maxSec: 180,
+          streaming, streamMs: voiceInfo?.stt?.streamMs || 200,
+          onPartial: !streaming ? null : (text) => {
+            // `settled` is the guard against the last word arriving after the real
+            // one. The flush that completes the utterance is a request of its own,
+            // so it races the accurate pass — usually by a wide margin, but a guess
+            // that lands on top of the finished reading is the one failure this
+            // whole path must not have.
+            if (!text || settled) return;
+            dictated = true;
+            ui.input.value = dictBase ? `${dictBase} ${text}` : text;
+            autoGrow();
+          },
+          onLevel: (v) => ui.mic.style.setProperty('--mic-level', String(v)),
+        });
+        await mic.start();
+        setMicState(true);
+      } catch (e) { mic = null; setMicState(false); toast(e.message, 'err'); return; }
+
+      const blob = await mic.done;
+      const spoke = mic.spoke;
+      mic = null;
+      setMicState(false);
+      if (!blob?.size || !spoke) { if (blob) toast('nothing was said'); return; }
+
+      ui.mic.classList.add('is-busy');
+      try {
+        const heard = await transcribe(blob);
+        settled = true;
+        const text = (heard.text || '').trim();
+        if (!text) {
+          if (dictated) { ui.input.value = dictBase; autoGrow(); }   // undo the guess
+          toast('did not catch that');
+          return;
+        }
+        // The accurate pass replaces the live text rather than appending to it —
+        // the provisional words are the same sentence, punctuated and cased properly
+        // this time. `dictBase` is the anchor, so anything typed before the mic
+        // opened survives and nothing the transducer guessed is left behind.
+        const cur = dictated ? dictBase : ui.input.value.replace(/\s+$/, '');
+        ui.input.value = cur ? `${cur} ${text}` : text;
+        autoGrow();
+        ui.input.focus();
+        if (voicePrefs().dictateSend) sendNow();
+      } catch (e) { toast(e.message, 'err'); }
+      finally { ui.mic.classList.remove('is-busy'); }
+    }
+
+    /** Called from onEvent: keep the spoken reply in step with the streamed one. */
+    function speakDelta(delta) {
+      if (voicePrefs().speech !== 'auto' || !voiceInfo?.tts?.ok) return;
+      if (!autoSpeaker) autoSpeaker = speakStream();
+      autoSpeaker?.push(delta);
+    }
+    function speakDone(finalText, proposals) {
+      if (voicePrefs().speech !== 'auto' || !voiceInfo?.tts?.ok) return;
+      if (proposals?.length) {                 // ask for the confirmation, don't narrate it
+        speak(proposals.map(p => p.spoken).join(' '));
+        autoSpeaker = null;
+        return;
+      }
+      if (autoSpeaker) { autoSpeaker.flush(); autoSpeaker = null; }
+      else if (finalText) speak(finalText);   // a reply that arrived without deltas
+    }
+
+    // --- confirmable actions ---
+    //
+    // The assistant proposes a write; this card is where it becomes real. Everything
+    // is shown before anything happens — the amount, the category, the date — because
+    // the whole point is catching a misheard "5万" before it is in the ledger rather
+    // than after. Fields are editable in place, so a wrong guess costs a keystroke
+    // instead of a re-explanation.
+    function proposalCard(p) {
+      const card = el('div', { class: 'prop-card', dataset: { id: p.id } });
+      const render = (prop) => {
+        card.dataset.status = prop.status;
+        const settled = prop.status !== 'pending';
+        const inputs = new Map();
+
+        const head = el('div', { class: 'prop-head' },
+          icon(prop.icon || 'sparkle'),
+          el('span', { class: 'prop-title' }, prop.title),
+          el('span', { class: 'grow' }),
+          el('span', { class: 'prop-state' },
+            prop.status === 'confirmed' ? 'added'
+              : prop.status === 'discarded' ? 'discarded'
+                : prop.status === 'failed' ? 'failed'
+                  : prop.status === 'running' ? 'saving…' : 'needs your ok'));
+
+        const body = el('div', { class: 'prop-summary' }, prop.summary);
+
+        // Editing is behind a toggle: the summary line is the thing to read, and a
+        // form of six inputs in the middle of a conversation is not.
+        const form = el('div', { class: 'prop-fields', style: { display: 'none' } },
+          prop.fields.map((f) => {
+            let input;
+            if (f.type === 'select') {
+              input = el('select', { class: 'input sm' },
+                (f.options || []).map(([v, label]) => el('option', { value: String(v), selected: String(v) === String(f.value) }, label)));
+              // `free` fields accept a value the model invented that is not in the list
+              if (f.free && f.value && !(f.options || []).some(([v]) => String(v) === String(f.value))) {
+                input.prepend(el('option', { value: String(f.value), selected: true }, String(f.value)));
+              }
+            } else if (f.type === 'textarea') {
+              input = el('textarea', { class: 'input sm', rows: 3 });
+              input.value = f.value ?? '';
+            } else {
+              input = el('input', {
+                class: 'input sm',
+                type: f.type === 'number' ? 'number' : f.type === 'date' ? 'date' : f.type === 'time' ? 'time' : f.type === 'month' ? 'month' : 'text',
+              });
+              input.value = f.value ?? '';
+            }
+            inputs.set(f.key, input);
+            return el('label', { class: 'prop-field' + (f.wide ? ' wide' : '') },
+              el('span', { class: 'prop-field-label' }, f.label), input);
+          }));
+
+        const collect = () => {
+          const out = {};
+          for (const [k, node] of inputs) out[k] = node.value;
+          return out;
+        };
+
+        const settle = async (decision) => {
+          card.classList.add('is-busy');
+          try {
+            const next = await post(`/chats/${win.chatState.chatId}/actions/${prop.id}`,
+              { decision, args: decision === 'confirm' ? collect() : undefined });
+            render(next);
+            if (next.status === 'confirmed') toast(next.title + ' — done', 'ok');
+            else if (next.status === 'failed') toast(next.result || 'that did not work', 'err');
+          } catch (e) { toast(e.message, 'err'); }
+          finally { card.classList.remove('is-busy'); }
+        };
+
+        const actionsRow = settled
+          ? el('div', { class: 'prop-result' }, prop.result || (prop.status === 'discarded' ? 'Nothing was saved.' : ''))
+          : el('div', { class: 'prop-actions' },
+            el('button', { class: 'btn sm primary', onclick: () => settle('confirm') }, icon('check'), 'Confirm'),
+            el('button', {
+              class: 'btn sm ghost', onclick: () => { form.style.display = form.style.display === 'none' ? '' : 'none'; },
+            }, icon('edit'), 'Edit'),
+            el('button', { class: 'btn sm ghost', onclick: () => settle('discard') }, 'Discard'));
+
+        card.replaceChildren(head, body, form, actionsRow);
+        // Voice mode listens for these so a spoken "yes" can settle the same card.
+        card.settle = settle;
+        card.proposal = prop;
+      };
+      render(p);
+      return card;
+    }
+
+    /** Live updates (another tab confirmed it, or Voice mode did). */
+    function updateProposal(prop) {
+      const card = ui.msgs.querySelector(`.prop-card[data-id="${prop.id}"]`);
+      if (!card) return;
+      const fresh = proposalCard(prop);
+      card.replaceWith(fresh);
+    }
+
+    /** The per-message speaker button — for reading one answer back on demand.
+     *  null when this box has no speech model, so the row simply isn't drawn. */
+    function readAloudBtn(getText) {
+      if (!voiceInfo?.tts?.ok || voiceInfo?.enabled === false) return null;
+      // Rendered even when muted and hidden by CSS, so flipping the setting does not
+      // leave every message already on screen without a button until you reload.
+      return el('button', {
+        class: 'btn xs ghost msg-speak', title: 'Read this aloud',
+        onclick: (e) => {
+          const btn = e.currentTarget;
+          if (btn.classList.contains('on')) { stopSpeaking(); btn.classList.remove('on'); return; }
+          for (const b of ui.msgs.querySelectorAll('.msg-speak.on')) b.classList.remove('on');
+          btn.classList.add('on');
+          const s = speak(getText(), { onState: (st) => { if (st !== 'speaking') btn.classList.remove('on'); } });
+          if (!s) btn.classList.remove('on');
+        },
+      }, icon('speaker'));
     }
 
     // --- sending ---
@@ -441,10 +791,16 @@ export default {
     }
 
     paintTools();
+    initVoice().catch(() => { });
     refreshList();
     if (opts.fresh) newChat();
     if (opts.seed) seedChat(String(opts.seed));
     setTimeout(() => ui.input.focus(), 50);
+    win.chatState._voiceCleanup = () => {
+      try { mic?.abort(); } catch { /* already released */ }
+      mic = null; autoSpeaker = null;
+      stopSpeaking();
+    };
     this.reopen = (w, o) => { if (o?.seed) seedChat(String(o.seed)); else if (o?.fresh) newChat(); };
   },
 
@@ -452,5 +808,6 @@ export default {
     win.chatState?.unsub?.();
     if (win.chatState?._onKey) document.removeEventListener('keydown', win.chatState._onKey);
     win.chatState?._menu?.remove();
+    win.chatState?._voiceCleanup?.();
   },
 };

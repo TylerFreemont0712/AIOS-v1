@@ -234,32 +234,122 @@ export default {
         action ? el('span', { class: 'grow' }) : null, action),
       node);
 
-    /** Hero band: one dominant number, the two that make it up, and a delta. */
+    /**
+     * The band the Overview now leads with: "am I on my goal" and "what is left to
+     * spend", side by side and large.
+     *
+     * These were both small cards buried in the grid below the twelve-month chart,
+     * which put a year of history above the two questions actually asked daily. The
+     * arithmetic all happens server-side (finance.monthStatus) — including the part
+     * that is easy to get wrong, which is that money already committed for later this
+     * month is not money you still have.
+     */
+    function statusBand(st) {
+      if (!st) return null;
+      const sp = st.spend, g = st.goal;
+      const live = st.isCurrent;
+
+      // --- left to spend ---
+      let spendCard;
+      if (sp.basis === 'none') {
+        spendCard = statusCard('Left to spend', '', teach('No budget set for this month.',
+          'Add caps per category in Plan and this becomes a live "how much is left".'));
+      } else {
+        // A month is "tight" once the pace would blow the ceiling, and "over" once it
+        // already has. Colour follows that, not the raw remaining figure — ¥20,000
+        // left on the 3rd and on the 28th are not the same situation.
+        const tone = sp.over ? 'is-over' : (live && sp.onTrack === false) ? 'is-tight' : 'is-good';
+        const headline = sp.available;
+        spendCard = statusCard(
+          sp.over ? 'Over budget' : 'Left to spend', tone,
+          el('div', {},
+            el('div', { class: 'fin-status-value' + (headline < 0 ? ' is-neg' : '') },
+              (headline < 0 ? '−' : '') + money(Math.abs(headline))),
+            el('div', { class: 'fin-status-sub' },
+              sp.basis === 'budget'
+                ? `of ${money(sp.limit)} budgeted across ${sp.categoriesCovered} categor${sp.categoriesCovered === 1 ? 'y' : 'ies'}`
+                : `of ${money(sp.limit)} that came in this month`),
+            // A bare bar with its own caption: the default one reads "29,500 /
+            // 60,000", which sat directly under a headline of "29,010" and made two
+            // different quantities look like the same one mistyped.
+            meter(sp.spent, sp.limit, { format: money, danger: sp.over, bare: true }),
+            el('div', { class: 'fin-status-scale' },
+              el('span', {}, `${money(sp.spent)} spent`),
+              el('span', { class: 'muted' }, `of ${money(sp.limit)}`)),
+            el('ul', { class: 'fin-status-facts' },
+              live && sp.perDayLeft !== null
+                ? fact(`${money(sp.perDayLeft)} a day for the ${st.days.left} day${st.days.left === 1 ? '' : 's'} left`)
+                : null,
+              sp.committed > 0
+                ? fact(`${money(sp.committed)} still to come out`, 'is-warn',
+                  sp.committedItems.map(c => `${c.name} · ${c.date.slice(5)}`).join('\n'))
+                : null,
+              live && sp.pace !== null
+                ? fact(sp.spent > sp.pace
+                  ? `${money(sp.spent - sp.pace)} ahead of an even pace`
+                  : `${money(sp.pace - sp.spent)} behind an even pace — comfortable`,
+                  sp.spent > sp.pace ? 'is-warn' : 'is-ok')
+                : null,
+              live && sp.onTrack === false
+                ? fact(`On this pace the month ends at ${compact(sp.projected)}`, 'is-warn')
+                : null)));
+      }
+
+      // --- goal ---
+      let goalCard;
+      if (!g.target) {
+        goalCard = statusCard('Monthly goal', '', teach('No goal set.',
+          'Set a monthly side-income target in Plan to track it here.'));
+      } else {
+        const tone = g.met ? 'is-good' : (live ? 'is-tight' : 'is-over');
+        goalCard = statusCard(
+          g.met ? (g.stretchMet ? 'Stretch goal met' : 'Goal met') : 'Goal', tone,
+          el('div', {},
+            el('div', { class: 'fin-status-value' },
+              money(g.progress),
+              el('span', { class: 'fin-status-badge ' + (g.met ? 'is-ok' : '') },
+                g.met ? `${g.pct}%` : `${money(g.toGo)} to go`)),
+            el('div', { class: 'fin-status-sub' },
+              `${g.includeMainJob ? 'All income' : 'Side income'} against ${money(g.target)}`),
+            meter(g.progress, g.target, { stretch: g.majorGoal, format: money, good: true }),
+            el('ul', { class: 'fin-status-facts' },
+              !g.met && live && g.perDayNeeded
+                ? fact(`${money(g.perDayNeeded)} a day for the remaining ${st.days.left} day${st.days.left === 1 ? '' : 's'}`)
+                : null,
+              g.met && !g.stretchMet && g.majorGoal
+                ? fact(`${money(g.majorGoal - g.progress)} to the ${money(g.majorGoal)} stretch target`)
+                : null,
+              g.stretchMet ? fact('Both targets cleared', 'is-ok') : null,
+              !live ? fact(`${prettyMonth(st.month)} · closed`) : null)));
+      }
+
+      return el('div', { class: 'fin-status' }, spendCard, goalCard);
+    }
+
+    const statusCard = (label, tone, bodyNode) => el('section', { class: 'fin-status-card ' + (tone || '') },
+      el('div', { class: 'fin-status-label' }, label), bodyNode);
+
+    const fact = (text, cls = '', title = '') =>
+      el('li', { class: cls || null, title: title || null }, text);
+
+    /** Compact stat strip: the old hero, demoted so the band above it can lead. */
     function hero(s, deltaSpent) {
       const positive = s.net >= 0;
-      return el('div', { class: 'fin-hero' },
-        el('div', { class: 'fin-hero-main' },
-          el('div', { class: 'fin-hero-label' }, positive ? 'Net saved' : 'Net shortfall'),
-          el('div', { class: 'fin-hero-value' + (positive ? '' : ' is-neg') }, money(Math.abs(s.net))),
-          el('div', { class: 'fin-hero-meta' },
-            s.savingsRate === null
-              ? el('span', { class: 'muted' }, `${s.count} transactions`)
-              : el('span', {}, `${s.savingsRate}% of income kept · ${s.count} transactions`))),
-        el('div', { class: 'fin-hero-split' },
-          el('div', { class: 'fin-hero-stat is-in' },
-            el('span', { class: 'fin-hero-stat-label' }, 'In'),
-            el('span', { class: 'fin-hero-stat-value' }, money(s.earned))),
-          el('div', { class: 'fin-hero-stat is-out' },
-            el('span', { class: 'fin-hero-stat-label' }, 'Out'),
-            el('span', { class: 'fin-hero-stat-value' }, money(s.spent)),
-            deltaSpent !== null && deltaSpent !== undefined
-              ? el('span', { class: 'fin-delta ' + (deltaSpent > 0 ? 'is-up' : deltaSpent < 0 ? 'is-down' : '') },
-                deltaSpent === 0 ? 'same as last month'
-                  : `${deltaSpent > 0 ? '↑' : '↓'} ${compact(Math.abs(deltaSpent))} vs last month`)
-              : null),
-          el('div', { class: 'fin-hero-stat' },
-            el('span', { class: 'fin-hero-stat-label' }, 'Per day'),
-            el('span', { class: 'fin-hero-stat-value' }, money(s.avgSpendPerDay)))),
+      const stat = (label, value, cls = '', extra = null) => el('div', { class: 'fin-strip-stat ' + cls },
+        el('span', { class: 'fin-strip-label' }, label),
+        el('span', { class: 'fin-strip-value' }, value), extra);
+      return el('div', { class: 'fin-strip' },
+        stat(positive ? 'Net saved' : 'Net shortfall', money(Math.abs(s.net)), positive ? '' : 'is-neg',
+          s.savingsRate === null ? null : el('span', { class: 'fin-strip-note' }, `${s.savingsRate}% kept`)),
+        stat('In', money(s.earned), 'is-in'),
+        stat('Out', money(s.spent), 'is-out',
+          deltaSpent !== null && deltaSpent !== undefined
+            ? el('span', { class: 'fin-delta ' + (deltaSpent > 0 ? 'is-up' : deltaSpent < 0 ? 'is-down' : '') },
+              deltaSpent === 0 ? 'same as last month'
+                : `${deltaSpent > 0 ? '↑' : '↓'} ${compact(Math.abs(deltaSpent))} vs last month`)
+            : null),
+        stat('Per day', money(s.avgSpendPerDay)),
+        stat('Entries', String(s.count)),
       );
     }
 
@@ -273,6 +363,9 @@ export default {
       const deltaSpent = prev && curM ? Math.round(curM.spent - prev.spent) : null;
 
       content.append(
+        // Goal vs what's left first, the totals underneath: the band answers "how am
+        // I doing right now", the strip answers "out of what".
+        statusBand(d.status),
         hero(s, S.range && S.range !== 'this-month' ? null : deltaSpent),
 
         el('div', { class: 'fin-grid' },
@@ -306,14 +399,8 @@ export default {
             ? areaLine(daily, { width: chartWidth(2), cumulative: true })
             : teach('Nothing recorded yet.', 'The line tracks your balance across the period.'), 'span2'),
 
-          card('Goal', d.goal && (d.goal.minGoal || d.goal.majorGoal)
-            ? el('div', {},
-              el('div', { class: 'fin-goal-label' }, 'Side income · ' + prettyMonth(d.goal.month)),
-              meter(d.goal.progress, d.goal.minGoal || d.goal.majorGoal, { stretch: d.goal.majorGoal, format: money }),
-              d.goal.majorGoal && d.goal.majorPct !== null
-                ? el('p', { class: 'fin-goal-hint' }, `${d.goal.majorPct}% of the stretch target`)
-                : null)
-            : teach('No goal set.', 'Set a monthly side-income target in Plan.')),
+          // The Goal card that used to sit here is now the right half of the status
+          // band above — one goal shown twice on one screen is just noise.
 
           // Year to date, because a month in isolation cannot tell you whether the year
           // is working. This is also the number a tax return starts from.
@@ -339,6 +426,31 @@ export default {
                 el('span', { class: 'fin-budget-name' }, b.category),
                 meter(b.spent, b.amount, { format: money, danger: b.over }))))
             : teach('No budgets yet.', 'Caps per category live in Plan.')),
+
+          // Work done but not yet paid for, kept visibly apart from every other number
+          // on this screen: it is owed, not earned. Only shown once there is any.
+          d.pending ? card('Expected · 想定', el('div', { class: 'fin-ytd' },
+            el('div', { class: 'fin-ytd-row' },
+              el('span', {}, 'Awaiting'),
+              el('strong', {}, money(d.pending.open.total))),
+            el('div', { class: 'fin-ytd-meta' },
+              d.pending.open.count
+                ? `${d.pending.open.count} estimate${d.pending.open.count === 1 ? '' : 's'}${d.pending.open.oldest ? ` · oldest ${d.pending.open.oldest}` : ''}`
+                : 'Nothing outstanding'),
+            d.pending.groups.length
+              ? el('ul', { class: 'fin-kv' }, d.pending.groups.map(g => el('li', {},
+                el('span', {}, g.payer),
+                el('span', {}, `${money(g.total)} · ${g.count}`))))
+              : null,
+            d.pending.settled
+              ? el('div', { class: 'fin-ytd-row is-net' },
+                el('span', {}, 'Guessed vs paid'),
+                el('strong', { class: d.pending.settled.variance < 0 ? 'is-neg' : '' },
+                  `${d.pending.settled.variance >= 0 ? '+' : '−'}${fmtNum(Math.abs(d.pending.settled.variance))}` +
+                  (d.pending.settled.biasPct === null ? '' : ` (${d.pending.settled.biasPct > 0 ? '+' : ''}${d.pending.settled.biasPct}%)`)))
+              : null,
+            el('button', { class: 'btn ghost xs', onclick: () => { S.tab = 'income'; paintTabs(); refresh(); } }, 'Record a payment →')))
+            : null,
         ),
 
         d.recent.length ? card('Latest activity', txnTable(d.recent, { compact: true }),
@@ -1023,7 +1135,7 @@ export default {
               },
             }, 'Save')),
           g.minGoal || g.majorGoal
-            ? meter(g.progress, g.minGoal || g.majorGoal, { stretch: g.majorGoal, format: money })
+            ? meter(g.progress, g.minGoal || g.majorGoal, { stretch: g.majorGoal, format: money, good: true })
             : el('p', { class: 'fin-teach-hint' }, 'Set a target to track progress on the Overview.'),
         ), 'span2'),
 
@@ -1043,24 +1155,24 @@ export default {
           el('button', { class: 'btn sm', onclick: openBudgetEditor }, icon('plus'), 'Add budget'),
         )),
 
-        card('Quick-log presets', el('div', {},
+        card('Templates & quick-log', el('div', {},
           d.presets.length
             ? el('ul', { class: 'fin-preset-list' }, d.presets.map(p =>
               el('li', {},
                 el('div', { class: 'fin-preset-main' },
-                  el('span', { class: 'fin-preset-name' }, p.name),
-                  el('span', { class: 'fin-preset-meta' },
-                    `${p.amount} ${p.currency}${p.payUnit === 'hour' ? '/hr' : p.payUnit === 'minute' ? '/min' : ''} · ${p.category}${p.uses ? ` · ${p.uses}×` : ''}`)),
+                  el('span', { class: 'fin-preset-name' }, p.name,
+                    p.isEstimate ? el('span', { class: 'fin-tag is-est' }, '想定') : null),
+                  el('span', { class: 'fin-preset-meta' }, [
+                    p.asksAmount
+                      ? `asks for the amount${p.payUnit === 'flat' ? '' : ` and the ${p.payUnit}s`}`
+                      : `${p.amount} ${p.currency}${p.payUnit === 'hour' ? '/hr' : p.payUnit === 'minute' ? '/min' : ''}`,
+                    p.category, p.merchant || p.name, p.uses ? `${p.uses}×` : '',
+                  ].filter(Boolean).join(' · '))),
                 el('button', { class: 'btn sm primary', onclick: () => logPreset(p) }, 'Log'),
-                el('button', {
-                  class: 'btn ghost xs', title: 'Delete preset',
-                  onclick: async () => {
-                    if (!await confirmBox(`Delete preset "${p.name}"?`, 'Transactions already logged from it are kept.')) return;
-                    await del(`/finance/presets/${p.id}`); toast('Preset deleted'); refresh();
-                  },
-                }, icon('trash')))))
-            : el('p', { class: 'fin-teach-hint' }, 'Presets are one-tap entries for anything you log repeatedly — a shift, a commute, a coffee.'),
-          el('button', { class: 'btn sm', onclick: openPresetEditor }, icon('plus'), 'Add preset'),
+                el('button', { class: 'btn ghost xs', title: 'Edit template', onclick: () => openPresetEditor(p) }, icon('edit')),
+                el('button', { class: 'btn ghost xs', title: 'Delete', onclick: () => removePreset(p) }, icon('trash')))))
+            : el('p', { class: 'fin-teach-hint' }, 'A template answers everything about an income stream except the amount, so logging one is a click and a number. Leave its amount fixed instead and it logs on the click alone.'),
+          el('button', { class: 'btn sm', onclick: () => openPresetEditor() }, icon('plus'), 'Add template'),
         )),
 
         card('Recurring', el('div', { class: 'fin-recurring-slot' }, el('p', { class: 'empty sm' }, 'Loading…')), 'span2'),
@@ -1134,7 +1246,7 @@ export default {
     function renderIncome() {
       const d = S.income;
       if (!d) { content.append(el('p', { class: 'empty sm' }, 'Loading…')); return; }
-      const s = d.summary, y = d.ytd;
+      const s = d.summary, y = d.ytd, pend = d.pending;
       const monthly = d.monthly.items.map(m => ({ label: MONTH_NAMES[Number(m.month.slice(5, 7)) - 1], a: m.earned, b: m.spent, net: m.net }));
       const cats = d.byCategory.items.map(c => ({ label: c.category, value: c.total }));
 
@@ -1161,21 +1273,45 @@ export default {
                 (y.net < 0 ? '−' : '+') + money(Math.abs(y.net)).replace(/^\S+\s/, S.currency + ' ')),
               y.isCurrent
                 ? el('span', { class: 'fin-delta' }, `on track for ${compact(y.projectedNet)}`)
-                : null))),
+                : null),
+            // Work done and not yet paid for. Deliberately its own stat rather than part
+            // of "earned": it is a claim, not money, and the two must never blur.
+            pend?.open.count
+              ? el('div', { class: 'fin-hero-stat is-pending' },
+                el('span', { class: 'fin-hero-stat-label' }, 'Awaiting'),
+                el('span', { class: 'fin-hero-stat-value' }, money(pend.open.total)),
+                el('span', { class: 'fin-delta' }, `${pend.open.count} estimate${pend.open.count === 1 ? '' : 's'}`))
+              : null)),
 
-        // ---- quick log: the presets, one tap ----
+        // ---- quick log: the templates, one tap ----
+        //
+        // Two kinds of chip sit here and they behave differently on purpose. A chip with
+        // a figure on it is a fixed entry and logs on the click. A chip marked "amount →"
+        // is a TEMPLATE: the payer, the type, the currency and the note are already
+        // settled, so it opens a single field and the whole entry is one number.
         el('div', { class: 'fin-quick' },
           el('span', { class: 'fin-quick-label' }, 'Log'),
           ...d.presets.map(p => el('button', {
-            class: 'fin-chip', title: presetHint(p),
+            class: 'fin-chip' + (p.asksAmount ? ' is-tpl' : '') + (p.isEstimate ? ' is-est' : ''),
+            title: presetHint(p),
             onclick: () => logPreset(p),
+            oncontextmenu: (e) => {
+              e.preventDefault();
+              menu(e.clientX, e.clientY, [
+                { label: 'Log…', icon: 'plus', onclick: () => logPreset(p) },
+                { label: 'Open in the full form', icon: 'edit', onclick: () => openIncomeForm(seedFromPreset(p)) },
+                '-',
+                { label: 'Edit template', icon: 'edit', onclick: () => openPresetEditor(p) },
+                { label: 'Delete', icon: 'trash', danger: true, onclick: () => removePreset(p) },
+              ]);
+            },
           }, p.name, el('span', { class: 'fin-chip-rate' }, presetRate(p)))),
           el('button', { class: 'fin-chip is-add', onclick: () => openIncomeForm() }, '+ Log income'),
           el('button', {
             class: 'fin-chip is-add', title: 'Screenshot an Uber, delivery or marketplace payout screen and it fills the form in',
             onclick: () => openEarningsShot(),
           }, icon('image'), 'From a screenshot'),
-          el('button', { class: 'btn sm ghost', onclick: () => openPresetEditor() }, icon('plus'), 'New quick-log')),
+          el('button', { class: 'btn sm ghost', onclick: () => openPresetEditor() }, icon('plus'), 'New template')),
 
         el('div', { class: 'fin-grid' },
           card('Twelve months', groupedBars(monthly, {
@@ -1209,17 +1345,20 @@ export default {
           card('Side-income goal', d.goal && (d.goal.minGoal || d.goal.majorGoal)
             ? el('div', {},
               el('div', { class: 'fin-goal-label' }, prettyMonth(d.goal.month)),
-              meter(d.goal.progress, d.goal.minGoal || d.goal.majorGoal, { stretch: d.goal.majorGoal, format: money }),
+              meter(d.goal.progress, d.goal.minGoal || d.goal.majorGoal, { stretch: d.goal.majorGoal, format: money, good: true }),
               d.goal.majorGoal && d.goal.majorPct !== null
                 ? el('p', { class: 'fin-goal-hint' }, `${d.goal.majorPct}% of the stretch target`)
                 : null)
             : teach('No goal set.', 'A monthly side-income target lives in Plan.')),
 
+          pendingCard(pend),
+          calibrationCard(pend),
+
           d.recurring.length
-            ? card('Recurring income', el('ul', { class: 'fin-budget-mini' }, d.recurring.map(r =>
+            ? card('Recurring income', el('ul', { class: 'fin-kv' }, d.recurring.map(r =>
               el('li', {},
-                el('span', { class: 'fin-budget-name' }, r.name),
-                el('span', { class: 'mono' }, `${money(r.amount)} · ${r.cadence}`)))))
+                el('span', {}, r.name),
+                el('span', {}, `${money(r.amount)} · ${r.cadence}`)))))
             : null,
         ),
 
@@ -1253,9 +1392,33 @@ export default {
       );
     }
 
-    const presetRate = (p) => p.payUnit === 'hour' ? `${money(p.amount)}/h`
-      : p.payUnit === 'minute' ? `${money(p.amount)}/min` : money(p.amount);
-    const presetHint = (p) => `${p.category}${p.isMainJob ? ' · main job' : ''} — ${presetRate(p)}`;
+    // A template's chip says what it will ask for; a fixed preset's says what it logs.
+    const presetRate = (p) => p.asksAmount
+      ? (p.payUnit === 'flat' ? 'amount →' : p.payUnit === 'hour' ? 'amount + h →' : 'amount + min →')
+      : p.payUnit === 'hour' ? `${money(p.amount)}/h`
+        : p.payUnit === 'minute' ? `${money(p.amount)}/min` : money(p.amount);
+    const presetHint = (p) => [
+      p.merchant || p.name, p.category, p.isMainJob ? 'main job' : '',
+      p.isEstimate ? 'logged as expected (想定)' : '',
+      p.asksAmount ? 'type the amount' : presetRate(p),
+    ].filter(Boolean).join(' · ') + '\n\nRight-click to edit.';
+
+    /** Everything a template already knows, in the shape openIncomeForm seeds from. */
+    const seedFromPreset = (p, extra = {}) => ({
+      presetId: p.id, templateName: p.name,
+      merchant: p.merchant || p.name, category: p.category, currency: p.currency,
+      note: p.note || '', isMainJob: p.isMainJob, estimate: p.isEstimate,
+      mode: p.payUnit === 'hour' ? 'hourly' : 'amount',
+      rate: p.payUnit === 'hour' || p.payUnit === 'minute' ? (p.amount || undefined) : undefined,
+      amount: p.asksAmount ? undefined : p.amount,
+      ...extra,
+    });
+
+    async function removePreset(p) {
+      if (!await confirmBox(`Delete "${p.name}"?`, 'Entries already logged from it are kept.')) return;
+      try { await del(`/finance/presets/${p.id}`); toast('Template deleted'); refresh(); }
+      catch (e) { toast(e.message, 'err'); }
+    }
     const dayLabel = (iso) => {
       const t = todayStr();
       if (iso === t) return 'Today';
@@ -1264,27 +1427,383 @@ export default {
       return new Date(iso + 'T00:00:00').toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
     };
 
-    /** One tap on a quick-log chip. Hourly/per-minute presets ask for the amount of work. */
+    /**
+     * One tap on a quick-log chip.
+     *
+     * Which of four things happens is decided entirely by what the preset already knows:
+     *
+     *   fixed amount, income  → logged on the click. This is the one-tap case the Income
+     *                           tab promises, and nothing should stand in front of it.
+     *   fixed amount, expense → asks how many, because three coffees is one click and a
+     *                           digit, not three clicks.
+     *   no amount (template)  → asks for the amount. Payer, category, currency, note and
+     *                           the main-job flag are already answered, so they are not
+     *                           shown; "More fields…" is there for the day one is wrong.
+     *   hourly / per minute   → asks for the work, and for the amount too if the template
+     *                           carries no rate.
+     *
+     * There were two functions by this name in this file, both live, the second silently
+     * overriding the first — so the one-tap path above had never actually run. One now.
+     */
     async function logPreset(p) {
-      const body = { date: todayStr() };
-      if (p.payUnit === 'flat') {
-        body.count = 1;
-      } else {
-        const field = el('input', { class: 'input', type: 'number', step: '0.25', min: '0.25', value: '1' });
-        const ok = await modal({
-          title: p.name,
-          sub: `${presetRate(p)} — how ${p.payUnit === 'hour' ? 'many hours' : 'long in minutes'}?`,
-          body: el('div', { class: 'fin-form' }, row(p.payUnit === 'hour' ? 'Hours' : 'Minutes', field)),
-          actions: [{ label: 'Cancel', value: false }, { label: 'Log', value: true, kind: 'primary' }],
-        });
-        if (!ok) return;
-        body.units = Number(field.value) || 1;
+      const needsAmount = p.asksAmount;
+      const needsUnits = p.payUnit === 'hour' || p.payUnit === 'minute';
+      const needsCount = !needsAmount && !needsUnits && p.kind === 'expense';
+      if (!needsAmount && !needsUnits && !needsCount) return sendPresetLog(p, { date: todayStr() });
+
+      const amount = el('input', { class: 'input', type: 'number', step: '1', min: '0', placeholder: '0', inputmode: 'decimal' });
+      const units = el('input', { class: 'input', type: 'number', step: '0.25', min: '0.25', value: '1' });
+      const count = el('input', { class: 'input', type: 'number', step: '1', min: '1', value: '1' });
+      const date = el('input', { class: 'input', type: 'date', value: todayStr() });
+      const note = el('input', { class: 'input', placeholder: p.note || 'optional' });
+      const estimate = el('input', { type: 'checkbox', checked: !!p.isEstimate });
+      const preview = el('div', { class: 'fin-form-preview' });
+
+      const paint = () => {
+        const a = needsAmount ? Number(amount.value) || 0
+          : needsUnits ? p.amount * (Number(units.value) || 0)
+            : p.amount * (Number(count.value) || 0);
+        fill(preview,
+          el('span', { class: 'fin-form-preview-label' },
+            `${p.category} · ${p.merchant || p.name}${p.isMainJob ? ' · main job' : ''}`),
+          el('strong', {}, a > 0 ? money(a) : 'Enter the amount'),
+          p.kind === 'income'
+            ? el('span', { class: 'muted' }, estimate.checked ? ' — expected, not yet received' : ' — received')
+            : null);
+      };
+      for (const n of [amount, units, count]) n.addEventListener('input', paint);
+      estimate.addEventListener('change', paint);
+      paint();
+
+      // Type, Enter, done — the caret never has to leave the field to reach a button.
+      for (const n of [amount, units, count]) n.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        n.closest('.modal')?.querySelector('.modal-actions .btn.primary')?.click();
+      });
+
+      const first = needsAmount ? amount : needsUnits ? units : count;
+      focusSoon(first);
+      const actions = [{ label: 'Cancel', value: null }];
+      // The escape hatch only makes sense for income — the full form it opens is the
+      // income form, and pointing an expense preset at it would be a dead end.
+      if (p.kind === 'income') actions.push({ label: 'More fields…', value: 'more' });
+      actions.push({ label: 'Log', value: 'log', kind: 'primary' });
+
+      const choice = await modal({
+        title: p.name,
+        sub: needsAmount ? presetHint(p).split('\n')[0]
+          : needsUnits ? `${presetRate(p)} — how ${p.payUnit === 'hour' ? 'many hours' : 'long in minutes'}?`
+            : `${presetRate(p)} each`,
+        body: el('div', { class: 'fin-form' },
+          needsAmount ? row('Amount', amount) : null,
+          needsUnits ? row(p.payUnit === 'hour' ? 'Hours' : 'Minutes', units) : null,
+          needsCount ? row('How many', count) : null,
+          row('Date', date), row('Note', note),
+          p.kind === 'income'
+            ? el('label', { class: 'fin-form-check' }, estimate,
+              el('span', {}, 'Expected only (想定) — record the actual when it is paid'))
+            : null,
+          preview),
+        actions,
+      });
+      if (!choice) return;
+      if (choice === 'more') {
+        return openIncomeForm(seedFromPreset(p, {
+          date: date.value, note: note.value.trim() || p.note || '',
+          estimate: estimate.checked,
+          amount: needsAmount ? (Number(amount.value) || undefined) : undefined,
+          qty: needsUnits ? (Number(units.value) || 1) : undefined,
+        }));
       }
+      if (needsAmount && !(Number(amount.value) > 0)) return toast('Enter an amount', 'err');
+      return sendPresetLog(p, {
+        date: date.value,
+        amount: needsAmount ? Number(amount.value) : undefined,
+        units: needsUnits ? Number(units.value) || 1 : undefined,
+        count: needsCount ? Math.max(1, Math.trunc(Number(count.value) || 1)) : undefined,
+        note: note.value.trim() || undefined,
+        estimate: estimate.checked,
+      });
+    }
+
+    async function sendPresetLog(p, body) {
       try {
         const r = await post(`/finance/presets/${p.id}/log`, body);
-        toast(`Logged ${money(r.created.reduce((a, t) => a + t.amountBase, 0))}`, 'ok');
+        const rows = r.estimate ? r.pending : r.created;
+        const total = rows.reduce((a, t) => a + t.amountBase, 0);
+        const many = rows.length > 1 ? ` · ${rows.length} entries` : '';
+        toast(r.estimate ? `Expected ${money(total)} recorded` : `Logged ${money(total)}${many}`, 'ok');
         refresh();
       } catch (e) { toast(e.message, 'err'); }
+    }
+
+    // ---------- expected income (想定) ----------
+    //
+    // Income that is earned and estimated on the day, then paid in a lump some time
+    // later. Two things follow from that, and both are load-bearing:
+    //
+    //   * An estimate is NOT money. It never enters the ledger, never moves "earned",
+    //     never counts towards a goal. It sits in its own list until a payout lands.
+    //   * A payout covers many estimates at once. So settling is a batch action — pick
+    //     a client, type what actually arrived, and every estimate it covers is marked
+    //     off against it and compared with it.
+    //
+    // The comparison is the point. A month of guesses that lands 6% under what was paid
+    // is a calibration you can use the next month, and it is invisible unless both
+    // numbers are kept.
+
+    S.openPendGroups = S.openPendGroups || {};
+
+    const pendDay = (iso) => new Date(iso + 'T00:00:00').toLocaleDateString([], { month: 'short', day: 'numeric' });
+    const dateSpan = (from, to) => (from === to ? pendDay(from) : `${pendDay(from)} → ${pendDay(to)}`);
+    const signed = (n) => (n > 0 ? '+' : n < 0 ? '−' : '') + money(Math.abs(n));
+    /** Which way the intuition leans, said in the direction that is actually useful:
+     *  money arriving ABOVE the estimate means the guesses were too low. */
+    const biasWord = (b) => b === null ? '' : b > 0 ? `guesses run ${b}% low` : b < 0 ? `guesses run ${-b}% high` : 'guesses are on the nose';
+
+    function pendingCard(pend) {
+      const openList = pend?.open;
+      const head = el('button', { class: 'btn sm', onclick: () => openPendingEditor() }, icon('plus'), 'Add');
+      if (!openList?.count) {
+        return card('Expected · 想定', teach('Nothing outstanding.',
+          'Log a day’s freelance work as expected when you can only estimate it, then record the real amount when the payout lands. The difference is tracked for you.'),
+          '', head);
+      }
+
+      const oldestDays = Math.max(0, Math.round((Date.parse(todayStr()) - Date.parse(openList.oldest)) / 86400000));
+      return card('Expected · 想定', el('div', { class: 'fin-pend' },
+        el('div', { class: 'fin-pend-sum' },
+          el('strong', {}, money(openList.total)),
+          el('span', { class: 'muted' },
+            ` awaiting across ${openList.count} estimate${openList.count === 1 ? '' : 's'}`),
+          oldestDays > 0
+            ? el('span', { class: 'fin-pend-age' + (oldestDays > 45 ? ' is-old' : '') }, `oldest ${oldestDays}d`)
+            : null),
+
+        ...openList.groups.map(g => {
+          const isOpen = !!S.openPendGroups[g.payer];
+          const rows = openList.items.filter(r => (r.merchant || r.category) === g.payer);
+          return el('div', { class: 'fin-pend-group' + (isOpen ? ' is-open' : '') },
+            el('div', {
+              class: 'fin-pend-head',
+              onclick: () => { S.openPendGroups[g.payer] = !isOpen; render(); },
+            },
+              el('span', { class: 'fin-pend-caret' }, isOpen ? '▾' : '▸'),
+              el('span', { class: 'fin-pend-payer' }, g.payer),
+              el('span', { class: 'fin-pend-meta' }, `${g.count} · ${dateSpan(g.from, g.to)}`),
+              el('span', { class: 'grow' }),
+              el('span', { class: 'fin-pend-total' }, money(g.total)),
+              el('button', {
+                class: 'btn xs primary',
+                title: `Record what ${g.payer} actually paid`,
+                onclick: (e) => { e.stopPropagation(); openSettleForm(g, rows); },
+              }, 'Record payment')),
+            isOpen
+              ? el('ul', { class: 'fin-pend-entries' }, rows.map(r => el('li', {
+                ondblclick: () => openPendingEditor(r),
+                oncontextmenu: (e) => {
+                  e.preventDefault();
+                  menu(e.clientX, e.clientY, [
+                    { label: 'Edit estimate', icon: 'edit', onclick: () => openPendingEditor(r) },
+                    { label: 'Record payment for just this', icon: 'plus', onclick: () => openSettleForm({ ...g, count: 1, total: r.amountBase, from: r.date, to: r.date }, [r]) },
+                    '-',
+                    { label: 'Write off (never paid)', icon: 'x', onclick: () => writeOffPending(r) },
+                    { label: 'Delete', icon: 'trash', danger: true, onclick: () => removePending(r) },
+                  ]);
+                },
+              },
+                el('span', { class: 'fin-entry-src' }, pendDay(r.date)),
+                el('span', { class: 'fin-entry-note' },
+                  [r.units && r.unit ? `${r.units} ${r.unit}${r.units === 1 ? '' : 's'}` : '', r.note].filter(Boolean).join(' · ')),
+                el('span', { class: 'fin-entry-amt' }, money(r.amountBase)))))
+              : null);
+        }),
+      ), 'span2', head);
+    }
+
+    /**
+     * How good the guesses were. Two windows, on purpose: the selected period answers
+     * "did this month work out", and a six-month lookback per client answers "which way
+     * should I lean next time" — which one month of payouts is far too little to say.
+     */
+    function calibrationCard(pend) {
+      const st = pend?.settled;
+      if (!st?.count && !pend?.byPayer?.length) return null;
+
+      const body = el('div', { class: 'fin-cal' });
+      if (st?.count) {
+        const good = st.variance >= 0;
+        body.append(
+          el('div', { class: 'fin-cal-head' },
+            el('div', { class: 'fin-cal-pair' },
+              el('span', { class: 'fin-cal-label' }, 'Guessed'),
+              el('span', { class: 'fin-cal-value' }, money(st.expected))),
+            el('span', { class: 'fin-cal-arrow' }, '→'),
+            el('div', { class: 'fin-cal-pair' },
+              el('span', { class: 'fin-cal-label' }, 'Paid'),
+              el('span', { class: 'fin-cal-value is-in' }, money(st.actual)))),
+          el('p', { class: 'fin-cal-verdict' + (good ? '' : ' is-neg') },
+            `${signed(st.variance)}${st.biasPct === null ? '' : ` (${st.biasPct > 0 ? '+' : ''}${st.biasPct}%)`}`,
+            el('span', { class: 'muted' }, ` across ${st.payouts} payout${st.payouts === 1 ? '' : 's'} this period`)),
+          st.items.length
+            ? el('ul', { class: 'fin-cal-list' }, st.items.slice(0, 6).map(pay => el('li', {
+              title: 'Open the payout in the ledger',
+              onclick: () => { S.tab = 'ledger'; S.search = pay.payer; S.kindFilter = 'income'; paintTabs(); refresh(); },
+            },
+              el('span', { class: 'fin-cal-date' }, pendDay(pay.date)),
+              el('span', { class: 'fin-cal-payer' }, pay.payer),
+              el('span', { class: 'fin-cal-nums' }, `${compact(pay.expected)} → ${compact(pay.actual)}`),
+              el('span', { class: 'fin-cal-var' + (pay.variance < 0 ? ' is-neg' : '') },
+                pay.biasPct === null ? signed(pay.variance) : `${pay.biasPct > 0 ? '+' : ''}${pay.biasPct}%`))))
+            : null);
+      } else {
+        body.append(teach('No payouts recorded in this period.',
+          'Record a payment against your estimates and the comparison shows up here.'));
+      }
+
+      if (pend.byPayer?.length) {
+        body.append(
+          el('div', { class: 'fin-cal-sub' }, 'Last 6 months, by client'),
+          el('ul', { class: 'fin-bias-list' }, pend.byPayer.slice(0, 6).map(b => el('li', {},
+            el('div', { class: 'fin-bias-head' },
+              el('span', { class: 'fin-bias-payer' }, b.payer),
+              el('span', { class: 'fin-bias-word' }, biasWord(b.biasPct))),
+            // A bar either side of a centre line: left of it the estimates were high,
+            // right of it they were low. A one-sided meter cannot show a sign.
+            el('div', { class: 'fin-bias-bar' },
+              el('i', {
+                class: b.biasPct >= 0 ? 'is-low' : 'is-high',
+                style: { width: Math.min(50, Math.abs(b.biasPct || 0)) + '%' },
+              })),
+            el('div', { class: 'fin-bias-meta' },
+              `${compact(b.expected)} guessed · ${compact(b.actual)} paid · ${b.payouts} payout${b.payouts === 1 ? '' : 's'}`))))); 
+      }
+      return card('Guess vs paid', body);
+    }
+
+    /**
+     * Record what actually arrived.
+     *
+     * The received amount starts at the sum of the estimates it covers, because that is
+     * the number most often right and the one worth showing a difference against. The
+     * difference is live: type the real figure and the modal says, before anything is
+     * written, how far off the intuition was.
+     */
+    async function openSettleForm(group, rows) {
+      const ids = rows.map(r => r.id);
+      const expected = rows.reduce((n, r) => n + r.amountBase, 0);
+      const cur = S.income?.settings?.codes?.includes(group.currency) ? group.currency : S.currency;
+
+      const amount = el('input', { class: 'input', type: 'number', step: '1', min: '0', inputmode: 'decimal', value: String(Math.round(expected)) });
+      const date = el('input', { class: 'input', type: 'date', value: todayStr() });
+      const currency = el('select', { class: 'input select' },
+        (S.income?.settings?.codes || [S.currency]).map(c => el('option', { value: c, selected: c === cur }, c)));
+      const note = el('input', { class: 'input', placeholder: 'optional — invoice number, payout id…' });
+      const diff = el('div', { class: 'fin-form-preview' });
+
+      const paint = () => {
+        const got = Number(amount.value) || 0;
+        const d = Math.round((got - expected) * 100) / 100;
+        const pct = expected > 0 ? Math.round(d / expected * 100) : null;
+        fill(diff,
+          el('span', { class: 'fin-form-preview-label' },
+            `${rows.length} estimate${rows.length === 1 ? '' : 's'} · ${dateSpan(group.from, group.to)} · ${money(expected)} expected`),
+          got > 0
+            ? el('strong', { class: d < 0 ? 'is-neg' : '' },
+              d === 0 ? 'Exactly as estimated'
+                : `${signed(d)} ${d > 0 ? 'more' : 'less'} than estimated${pct === null ? '' : ` (${pct > 0 ? '+' : ''}${pct}%)`}`)
+            : el('strong', {}, 'What actually arrived?'));
+      };
+      amount.addEventListener('input', paint);
+      paint();
+      amount.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        amount.closest('.modal')?.querySelector('.modal-actions .btn.primary')?.click();
+      });
+
+      focusSoon(amount);
+      const ok = await modal({
+        title: `Payment from ${group.payer}`,
+        sub: 'Writes one income entry for what arrived, and closes the estimates it covers.',
+        body: el('div', { class: 'fin-form' },
+          row('Received', amount), row('Currency', currency), row('Paid on', date), row('Note', note), diff),
+        actions: [{ label: 'Cancel', value: null }, { label: 'Record it', value: true, kind: 'primary' }],
+      });
+      if (!ok) return;
+      if (!(Number(amount.value) > 0)) return toast('Enter what actually arrived', 'err');
+      try {
+        const r = await post('/finance/pending/settle', {
+          ids, amount: Number(amount.value), currency: currency.value,
+          date: date.value, note: note.value.trim() || undefined,
+        });
+        toast(r.variance === 0
+          ? `Recorded ${money(r.actual)} — exactly as estimated`
+          : `Recorded ${money(r.actual)} · ${signed(r.variance)} vs estimate`, 'ok');
+        refresh();
+      } catch (e) { toast(e.message, 'err'); }
+    }
+
+    /** Add or correct a single estimate. Same fields as an income entry minus the ones
+     *  only real money has, plus the date the money is expected to arrive. */
+    async function openPendingEditor(entry = null) {
+      const isEdit = !!entry?.id;
+      const cats = S.income?.categories || S.categories.income || [];
+      const sources = S.income?.sources || [];
+
+      const amount = el('input', { class: 'input', type: 'number', step: '1', min: '0', inputmode: 'decimal', value: entry?.amount ?? '' });
+      const date = el('input', { class: 'input', type: 'date', value: entry?.date || todayStr() });
+      const due = el('input', { class: 'input', type: 'date', value: entry?.dueDate || '' });
+      const merchant = el('input', { class: 'input', placeholder: 'client or platform', value: entry?.merchant || '', list: 'fin-pend-src' });
+      const srcList = el('datalist', { id: 'fin-pend-src' }, sources.map(x => el('option', { value: x.value })));
+      const cat = el('select', { class: 'input select' },
+        cats.map(c => el('option', { value: c, selected: c === (entry?.category || 'Freelance') }, c)));
+      const cur = el('select', { class: 'input select' },
+        (S.income?.settings?.codes || [S.currency]).map(c => el('option', { value: c, selected: c === (entry?.currency || S.currency) }, c)));
+      const qty = el('input', { class: 'input', type: 'number', step: '0.25', min: '0', value: entry?.units || '' });
+      const unit = el('select', { class: 'input select' },
+        ['', 'hour', 'minute', 'item', 'day', 'word'].map(u => el('option', { value: u, selected: u === (entry?.unit || '') }, u || '—')));
+      const note = el('input', { class: 'input', placeholder: 'what was it for (optional)', value: entry?.note || '' });
+
+      focusSoon(amount);
+      const ok = await modal({
+        title: isEdit ? 'Edit estimate' : 'Expected income · 想定',
+        sub: 'Not counted as earned until you record the payment.',
+        body: el('div', { class: 'fin-form' }, srcList,
+          row('Amount', amount), row('Worked on', date), row('From', merchant),
+          row('Type', cat), row('Currency', cur),
+          el('label', { class: 'fin-form-row' }, el('span', {}, 'Work'),
+            el('div', { class: 'fin-form-pair' }, qty, unit)),
+          row('Paid on (if known)', due), row('Note', note)),
+        actions: [{ label: 'Cancel', value: null }, { label: isEdit ? 'Save' : 'Add', value: true, kind: 'primary' }],
+      });
+      if (!ok) return;
+      if (!(Number(amount.value) > 0)) return toast('Enter an amount', 'err');
+      const bodyOut = {
+        amount: Number(amount.value), date: date.value, dueDate: due.value || '',
+        merchant: merchant.value.trim(), category: cat.value, currency: cur.value,
+        units: Number(qty.value) || 0, unit: unit.value, note: note.value.trim(),
+      };
+      try {
+        if (isEdit) await patch(`/finance/pending/${entry.id}`, bodyOut);
+        else await post('/finance/pending', bodyOut);
+        toast(isEdit ? 'Estimate updated' : `Expected ${money(bodyOut.amount)} recorded`, 'ok');
+        refresh();
+      } catch (e) { toast(e.message, 'err'); }
+    }
+
+    async function writeOffPending(r) {
+      if (!await confirmBox(`Write off ${money(r.amountBase)} from ${r.merchant || r.category}?`,
+        'It stays on record as expected-but-never-paid, and drops out of every total.', 'Write off', 'danger')) return;
+      try { await post('/finance/pending/void', { ids: [r.id] }); toast('Written off'); refresh(); }
+      catch (e) { toast(e.message, 'err'); }
+    }
+
+    async function removePending(r) {
+      if (!await confirmBox(`Delete this estimate?`, `${r.date} · ${money(r.amountBase)}`)) return;
+      try { await del(`/finance/pending/${r.id}`); toast('Estimate deleted'); refresh(); }
+      catch (e) { toast(e.message, 'err'); }
     }
 
     /**
@@ -1307,7 +1826,13 @@ export default {
       const cur = el('select', { class: 'input select' },
         (S.income?.settings?.codes || [S.currency]).map(c => el('option', { value: c, selected: c === S.currency }, c)));
       const note = el('input', { class: 'input', placeholder: 'what was it for (optional)', value: seed.note || '' });
-      const mainJob = el('input', { type: 'checkbox' });
+      const mainJob = el('input', { type: 'checkbox', checked: !!seed.isMainJob });
+      // 想定: the money has been earned but not received. Ticking this sends the entry to
+      // the expected ledger instead of the real one — see the 想定 section above.
+      const estimate = el('input', { type: 'checkbox', checked: !!seed.estimate });
+      const due = el('input', { class: 'input', type: 'date', value: seed.dueDate || '' });
+      const dueRow = row('Paid on (if known)', due);
+      let presetId = seed.presetId || '';
 
       // mode-specific inputs
       const amount = el('input', { class: 'input', type: 'number', step: '1', min: '0', placeholder: '0' });
@@ -1331,6 +1856,43 @@ export default {
       const modeRow = el('div', { class: 'fin-chips' });
       const fieldSlot = el('div', {});
 
+      // The templates, one click. Applying one fills every field that never changes for
+      // that stream, so the full form is only ever "the template, plus the bit that is
+      // unusual today" rather than a fresh retype.
+      const templates = (S.income?.presets || []).filter(p => p.kind === 'income');
+      const tplRow = el('div', { class: 'fin-chips fin-tpl-row' });
+      const applyTemplate = (p) => {
+        presetId = presetId === p.id ? '' : p.id;
+        if (presetId) {
+          source.value = p.merchant || p.name;
+          cat.value = cats.includes(p.category) ? p.category : cat.value;
+          if ((S.income?.settings?.codes || []).includes(p.currency)) cur.value = p.currency;
+          if (p.note) note.value = p.note;
+          mainJob.checked = !!p.isMainJob;
+          estimate.checked = !!p.isEstimate;
+          if (p.payUnit === 'hour' || p.payUnit === 'minute') {
+            mode = 'hourly';
+            if (p.amount > 0) rate.value = p.amount;
+          } else if (!p.asksAmount) {
+            mode = 'amount';
+            amount.value = p.amount;
+          }
+        }
+        paintTpl();
+        paintMode({ focus: true });
+        paintEstimate();
+      };
+      const paintTpl = () => fill(tplRow,
+        el('span', { class: 'fin-quick-label' }, 'Template'),
+        templates.map(p => el('button', {
+          class: 'fin-chip' + (presetId === p.id ? ' is-on' : ''),
+          title: presetHint(p),
+          onclick: () => applyTemplate(p),
+        }, p.name)),
+        el('button', { class: 'fin-chip is-add', title: 'Create a template from scratch', onclick: () => openPresetEditor() }, '+'));
+      const paintEstimate = () => { dueRow.hidden = !estimate.checked; paintPreview(); };
+      estimate.addEventListener('change', paintEstimate);
+
       const computed = () => {
         if (mode === 'amount') return { amount: Number(amount.value) || 0 };
         if (mode === 'hourly') return { amount: (Number(rate.value) || 0) * (Number(qty.value) || 0), units: Number(qty.value) || 0, unit: 'hour' };
@@ -1353,8 +1915,13 @@ export default {
         const c = computed();
         fill(preview,
           el('span', { class: 'fin-form-preview-label' }, INCOME_MODES.find(m => m.id === mode).hint),
-          el('strong', {}, c.amount > 0 ? `You keep ${money(c.amount)}` : 'Enter the numbers'),
-          mode === 'fee' && c.fee > 0 ? el('span', { class: 'muted' }, ` (fee ${money(c.fee)})`) : null);
+          el('strong', {}, c.amount > 0
+            ? (estimate.checked ? `Expecting ${money(c.amount)}` : `You keep ${money(c.amount)}`)
+            : 'Enter the numbers'),
+          mode === 'fee' && c.fee > 0 ? el('span', { class: 'muted' }, ` (fee ${money(c.fee)})`) : null,
+          estimate.checked
+            ? el('span', { class: 'muted' }, ' — held as expected until you record the payment')
+            : null);
       };
 
       // The first field of the chosen mode is the one you always type into, so switching
@@ -1391,14 +1958,20 @@ export default {
 
       // modal() focuses the first focusable thing in the body, which here is a mode chip.
       // The mode is usually already right, so land in the number instead.
+      if (templates.length) paintTpl();
+      paintEstimate();
+
       focusSoon(firstField);
       const ok = await modal({
-        title: 'Log income', sub: seed.readFrom, wide: true,
+        title: 'Log income', sub: seed.readFrom || (seed.templateName ? `From the ${seed.templateName} template` : ''), wide: true,
         body: el('div', { class: 'fin-form' },
+          templates.length ? tplRow : null,
           modeRow, fieldSlot, preview, srcList,
           row('Date', date), row('From', source), row('Type', cat), row('Currency', cur),
-          row('Note', note),
-          el('label', { class: 'fin-form-check' }, mainJob, el('span', {}, 'Main job (excluded from the side-income goal)'))),
+          row('Note', note), dueRow,
+          el('label', { class: 'fin-form-check' }, mainJob, el('span', {}, 'Main job (excluded from the side-income goal)')),
+          el('label', { class: 'fin-form-check' }, estimate,
+            el('span', {}, 'Expected only (想定) — an estimate, not money received yet'))),
         actions: [{ label: 'Cancel', value: null }, { label: 'Log it', value: true, kind: 'primary' }],
       });
       if (!ok) return;
@@ -1407,13 +1980,21 @@ export default {
       if (!(c.amount > 0)) return toast('That comes to zero — check the numbers', 'err');
       const noteParts = [note.value.trim()];
       if (mode === 'fee' && c.fee > 0) noteParts.push(`gross ${c.gross} − fee ${c.fee}`);
+      // Same numbers, two ledgers. An estimate is a claim on money that has not arrived,
+      // so it goes to the expected table and touches no total until it is settled.
+      const payload = {
+        date: date.value, amount: c.amount, currency: cur.value,
+        category: cat.value, merchant: source.value.trim(), note: noteParts.filter(Boolean).join(' · '),
+        isMainJob: mainJob.checked, units: c.units || 0, unit: c.unit || '', presetId,
+      };
       try {
-        await post('/finance/txns', {
-          date: date.value, kind: 'income', amount: c.amount, currency: cur.value,
-          category: cat.value, merchant: source.value.trim(), note: noteParts.filter(Boolean).join(' · '),
-          isMainJob: mainJob.checked, units: c.units || 0, unit: c.unit || '',
-        });
-        toast(`Logged ${money(c.amount)}`, 'ok');
+        if (estimate.checked) {
+          await post('/finance/pending', { ...payload, dueDate: due.value || '' });
+          toast(`Expected ${money(c.amount)} recorded`, 'ok');
+        } else {
+          await post('/finance/txns', { ...payload, kind: 'income' });
+          toast(`Logged ${money(c.amount)}`, 'ok');
+        }
         refresh();
       } catch (e) { toast(e.message, 'err'); }
     }
@@ -2017,23 +2598,81 @@ export default {
       catch (e) { toast(e.message, 'err'); }
     }
 
-    async function openPresetEditor() {
-      const name = el('input', { class: 'input', placeholder: 'e.g. Tutoring hour' });
-      const amount = el('input', { class: 'input', type: 'number', step: '0.01' });
-      const kind = el('select', { class: 'input' }, el('option', { value: 'income' }, 'Income'), el('option', { value: 'expense' }, 'Expense'));
-      const unit = el('select', { class: 'input' }, ['flat', 'hour', 'minute'].map(u => el('option', { value: u }, u)));
-      const cat = el('input', { class: 'input', list: 'fin-cats-p', placeholder: 'Category' });
+    /**
+     * A template for an income stream you log over and over.
+     *
+     * The whole point is that everything constant about the stream — who pays, what type
+     * it counts as, which currency, whether it is main-job work, the standing note — is
+     * answered once here, so logging it later is one number. Leaving Amount BLANK is what
+     * makes it a template rather than a fixed one-tap entry: the chip then asks for the
+     * figure and fills in all the rest.
+     */
+    async function openPresetEditor(preset = null) {
+      const isEdit = !!preset?.id;
+      const name = el('input', { class: 'input', placeholder: 'e.g. Micro1', value: preset?.name || '' });
+      const amount = el('input', {
+        class: 'input', type: 'number', step: '0.01', inputmode: 'decimal',
+        placeholder: 'leave blank to be asked each time',
+        value: preset && preset.amount > 0 ? preset.amount : '',
+      });
+      const kind = el('select', { class: 'input select' },
+        el('option', { value: 'income' }, 'Income'), el('option', { value: 'expense' }, 'Expense'));
+      kind.value = preset?.kind || 'income';
+      const unit = el('select', { class: 'input select' },
+        ['flat', 'hour', 'minute'].map(u => el('option', { value: u, selected: u === (preset?.payUnit || 'flat') }, u)));
+      const cat = el('input', { class: 'input', list: 'fin-cats-p', placeholder: 'Category', value: preset?.category || '' });
+      const merchant = el('input', {
+        class: 'input', placeholder: 'defaults to the template name',
+        value: preset?.merchant || '',
+      });
+      const cur = el('select', { class: 'input select' },
+        (S.income?.settings?.codes || [S.currency]).map(c => el('option', { value: c, selected: c === (preset?.currency || S.currency) }, c)));
+      const note = el('input', { class: 'input', placeholder: 'standing note (optional)', value: preset?.note || '' });
+      const mainJob = el('input', { type: 'checkbox', checked: !!preset?.isMainJob });
+      const isEstimate = el('input', { type: 'checkbox', checked: !!preset?.isEstimate });
+      const estRow = el('label', { class: 'fin-form-check' }, isEstimate,
+        el('span', {}, 'Log as expected (想定) by default — for work you guess now and are paid for later'));
+
+      const hint = el('p', { class: 'fin-teach-hint' });
+      const paint = () => {
+        estRow.hidden = kind.value !== 'income';
+        const n = name.value.trim() || 'this';
+        hint.textContent = amount.value.trim()
+          ? `One click logs ${amount.value}${unit.value === 'flat' ? '' : ` per ${unit.value}`} — nothing to type.`
+          : unit.value === 'flat'
+            ? `Clicking ${n} will ask for the amount and fill in everything else.`
+            : `Clicking ${n} will ask for the amount and the ${unit.value}s.`;
+      };
+      for (const n of [name, amount, unit, kind]) n.addEventListener('input', paint);
+      kind.addEventListener('change', paint);
+      unit.addEventListener('change', paint);
+      paint();
+
       const ok = await modal({
-        title: 'New quick-log preset',
+        title: isEdit ? `Edit ${preset.name}` : 'New income template',
+        sub: 'Leave the amount blank for a stream where only the figure changes.',
         body: el('div', { class: 'fin-form' },
           el('datalist', { id: 'fin-cats-p' }, [...S.categories.income, ...S.categories.expense].map(c => el('option', { value: c }))),
-          row('Name', name), row('Amount', amount), row('Type', kind), row('Per', unit), row('Category', cat)),
-        actions: [{ label: 'Cancel', value: false }, { label: 'Create', value: true, kind: 'primary' }],
+          row('Name', name), row('Amount', amount), row('Per', unit), row('Type', kind),
+          row('Category', cat), row('Paid by', merchant), row('Currency', cur), row('Note', note),
+          el('label', { class: 'fin-form-check' }, mainJob, el('span', {}, 'Main job (excluded from the side-income goal)')),
+          estRow, hint),
+        actions: [{ label: 'Cancel', value: false }, { label: isEdit ? 'Save' : 'Create', value: true, kind: 'primary' }],
       });
       if (!ok) return;
+      if (!name.value.trim()) return toast('Give the template a name', 'err');
+      const payload = {
+        name: name.value.trim(),
+        // '' rather than 0: the server reads a blank amount as "ask me".
+        amount: amount.value.trim() === '' ? '' : Number(amount.value),
+        kind: kind.value, payUnit: unit.value, category: cat.value.trim(),
+        merchant: merchant.value.trim(), currency: cur.value, note: note.value.trim(),
+        isMainJob: mainJob.checked, isEstimate: isEstimate.checked,
+      };
       try {
-        await post('/finance/presets', { name: name.value, amount: Number(amount.value), kind: kind.value, payUnit: unit.value, category: cat.value });
-        toast('Preset created', 'ok'); refresh();
+        if (isEdit) await patch(`/finance/presets/${preset.id}`, payload);
+        else await post('/finance/presets', payload);
+        toast(isEdit ? 'Template saved' : 'Template created', 'ok'); refresh();
       } catch (e) { toast(e.message, 'err'); }
     }
 
@@ -2060,27 +2699,6 @@ export default {
           cadence: cadence.value, day: Number(day.value), category: cat.value,
         });
         toast('Recurring entry created', 'ok'); refresh();
-      } catch (e) { toast(e.message, 'err'); }
-    }
-
-    async function logPreset(p) {
-      const body = { date: todayStr() };
-      const isFlat = p.payUnit === 'flat';
-      const field = el('input', {
-        class: 'input', type: 'number', value: isFlat ? 1 : 1,
-        step: isFlat ? '1' : '0.25', min: isFlat ? '1' : '0.25',
-      });
-      const ok = await modal({
-        title: `Log "${p.name}"`,
-        body: el('div', { class: 'fin-form' }, row(isFlat ? 'How many' : p.payUnit === 'hour' ? 'Hours' : 'Minutes', field)),
-        actions: [{ label: 'Cancel', value: false }, { label: 'Log', value: true, kind: 'primary' }],
-      });
-      if (!ok) return;
-      if (isFlat) body.count = Number(field.value) || 1; else body.units = Number(field.value) || 1;
-      try {
-        const r = await post(`/finance/presets/${p.id}/log`, body);
-        toast(`Logged ${r.created.length} entr${r.created.length === 1 ? 'y' : 'ies'}`, 'ok');
-        refresh();
       } catch (e) { toast(e.message, 'err'); }
     }
 

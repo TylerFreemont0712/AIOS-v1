@@ -167,6 +167,8 @@ const PLAN = {
   finance_summary: { args: {}, ok: nonEmpty, after: 'finance_log' },
   finance_search: { args: { search: 'Audit Mart' }, ok: nonEmpty, after: 'finance_log' },
   finance_insights: { args: {}, ok: nonEmpty, after: 'finance_log' },
+  finance_budget_set: { args: { category: 'Food & Drink', amount: 45000 }, ok: (s) => /45,000/.test(s) },
+  finance_goal_set: { args: { minGoal: 100000, majorGoal: 180000 }, ok: (s) => /100,000/.test(s) && /180,000/.test(s) },
   price_check: { args: {}, ok: nonEmpty },
   research_status: { args: { id: 'no-such-run' }, ok: nonEmpty, expectError: true },
   research_start: { needs: 'skip', why: 'kicks off a long multi-model run' },

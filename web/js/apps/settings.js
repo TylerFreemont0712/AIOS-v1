@@ -25,6 +25,7 @@ export default {
       ['mail', 'Mail & Alerts', 'send'],
       ['agent', 'Agent', 'agent'],
       ['finance', 'Finances', 'graph'],
+      ['voice', 'Voice', 'mic'],
       ['network', 'Network & Security', 'network'],
       ['profile', 'Profile', 'user'],
       ['about', 'About', 'sparkle'],
@@ -247,6 +248,377 @@ export default {
         toast(existing ? 'saved — reconnect to pick it up' : 'added — hit Connect to start it', 'ok');
         renderPanel();
       } catch (e) { toast(e.message, 'err'); }
+    }
+
+    /**
+     * Voice.
+     *
+     * Two kinds of setting live on this page and they are deliberately separated.
+     * The engine settings (which models, which voice, how long to keep them loaded)
+     * are server-side and shared by every device on the LAN. The playback habits
+     * (read replies aloud, hands-free, send on dictation) are per-browser, because
+     * "read everything out loud" is a reasonable answer on the laptop in the study
+     * and a terrible one on the phone in a meeting.
+     */
+    async function renderVoice(c) {
+      const V = await import('../voice.js');
+      ui.panel.append(el('h2', {}, 'Voice'),
+        el('div', { class: 'desc' }, 'Speak to AIOS and have it answer out loud. Both models run on this machine — no audio leaves it.'));
+
+      let st;
+      try { st = await V.voiceStatus({ fresh: true }); }
+      catch (e) { ui.panel.append(el('div', { class: 'set-sub' }, 'could not read voice status: ' + e.message)); return; }
+
+      // --- installation ---
+      const dot = (ok) => el('span', { class: 'pdot ' + (ok ? 'up' : 'warn') });
+      const statusBox = el('div', { class: 'set-block' },
+        el('div', { class: 'row', style: { gap: '14px', flexWrap: 'wrap' } },
+          el('span', { class: 'row', style: { gap: '6px' } }, dot(st.stt?.ok), 'Listening · ', el('code', {}, st.stt?.model || '—')),
+          el('span', { class: 'row', style: { gap: '6px' } }, dot(st.tts?.ok), 'Speaking · ', el('code', {}, st.tts?.voice || '—')),
+          el('span', { class: 'row', style: { gap: '6px' } }, dot(st.running), st.running ? 'models loaded' : 'idle')),
+        !st.installed ? el('div', { class: 'set-sub', style: { marginTop: '8px' } },
+          'Not installed. Run ', el('code', {}, 'npm run voice'), ' in the AIOS folder — about 1.5GB, a few minutes.') : null,
+        st.lastError ? el('div', { class: 'set-sub', style: { marginTop: '8px', color: 'var(--err)' } }, st.lastError) : null);
+      ui.panel.append(statusBox);
+
+      // The single most confusing failure this feature has: the mic is missing on
+      // the LAN address and present on localhost, with no error either way.
+      const micIssue = V.micProblem();
+      if (micIssue) {
+        ui.panel.append(el('div', { class: 'set-block', style: { borderColor: 'var(--warn)' } },
+          el('div', { class: 'set-name' }, 'This browser will not give AIOS a microphone'),
+          el('div', { class: 'set-sub' }, micIssue)));
+      }
+
+      ui.panel.append(row('Voice enabled', 'Turn the whole feature off, buttons and all',
+        switchBtn(c.voice?.enabled !== false, async (on) => { await save({ voice: { enabled: on } }); V.invalidateVoiceStatus(); renderPanel(); })));
+
+      if (!st.installed) return;
+
+      // --- listening ---
+      ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '18px' } }, 'LISTENING'));
+
+      const sttSel = el('select', { class: 'input sm', onchange: async () => { await save({ voice: { stt: { model: sttSel.value } } }); V.invalidateVoiceStatus(); renderPanel(); } },
+        ...[['tiny', 'tiny — fastest, least accurate'], ['base', 'base — ~0.7s an utterance'],
+        ['small', 'small — ~1.9s, much better on names and Japanese'], ['medium', 'medium — slowest, best']]
+          .map(([v, l]) => el('option', { value: v, selected: (c.voice?.stt?.model || 'small') === v }, l)));
+      ui.panel.append(row('Speech model', 'Whisper size. Cost barely changes with how long you speak — it is one window either way. Switching needs the model downloaded: `npm run voice -- --stt base`.', sttSel));
+
+      // The streaming transducer. When it is installed it owns the live text and the
+      // whisper-rerun partials below are irrelevant, so the two are presented as one
+      // choice rather than two that quietly override each other.
+      if (st.stt?.streamInstalled) {
+        const streamOn = el('input', { type: 'checkbox', checked: st.stt?.streaming !== false });
+        streamOn.addEventListener('change', async () => {
+          await save({ voice: { stt: { streaming: streamOn.checked } } });
+          V.invalidateVoiceStatus();
+          renderPanel();
+        });
+        ui.panel.append(row('Words as you speak',
+          'A streaming recogniser that emits text while you are still talking, and notices when your'
+          + ' sentence ends. Whisper cannot do this — it reads a fixed 30-second window, so a two-second'
+          + ' phrase costs it the same as a ten-second one. What it hears is feedback only: rougher, upper-case,'
+          + ' unpunctuated, and replaced by the full-quality pass the moment you stop.',
+          streamOn));
+      }
+
+      // Live partials: a second, smaller model re-reads the utterance about once a
+      // second while you speak. It has to finish inside that interval, which is the
+      // whole reason it is not the accurate one. Only reachable when the streaming
+      // recogniser is off or absent — otherwise it is dead configuration.
+      const PARTIALS = [['', 'Off'], ['tiny', 'tiny — fastest'], ['base', 'base — recommended'], ['small', 'small — same as final']];
+      const partialSel = el('select', { class: 'input sm' },
+        ...PARTIALS.map(([v, l]) => el('option', { value: v, selected: (c.voice?.stt?.partialModel ?? 'base') === v }, l)));
+      partialSel.addEventListener('change', async () => {
+        await save({ voice: { stt: { partialModel: partialSel.value } } });
+        V.invalidateVoiceStatus();
+        renderPanel();
+      });
+      if (!st.stt?.streaming) {
+        ui.panel.append(row('Live text while you speak',
+          st.stt?.partial
+            ? 'Words appear as you talk, from a quicker and rougher model. It is feedback only — what actually gets used is still the full-quality pass when you stop, so a partial being wrong costs nothing.'
+            : 'Off, or the chosen model is not downloaded. `npm run voice -- --stt base` fetches one.',
+          partialSel));
+      }
+
+      const LANGS = [['', 'Detect automatically'], ['en', 'English'], ['ja', '日本語'], ['zh', '中文'], ['ko', '한국어'], ['es', 'Español'], ['fr', 'Français'], ['de', 'Deutsch']];
+      const langSel = el('select', { class: 'input sm', onchange: async () => { await save({ voice: { stt: { language: langSel.value } } }); V.invalidateVoiceStatus(); } },
+        ...LANGS.map(([v, l]) => el('option', { value: v, selected: (c.voice?.stt?.language || '') === v }, l)));
+      ui.panel.append(row('Spoken language', 'Auto-detection is unreliable on short clips — pin it if you always speak one language', langSel));
+
+      // Whisper takes a vocabulary hint and it is the difference between "Lawson" and
+      // "it lost in". Most of the list builds itself from the ledger; this is for the
+      // names it cannot know — platforms, people, projects.
+      const hintTa = el('textarea', {
+        class: 'input', rows: 2, placeholder: 'Micro1, Outlier, DataAnnotation, …',
+        style: { width: '100%', fontSize: '12.5px' },
+      });
+      hintTa.value = c.voice?.stt?.prompt || '';
+      const hintInfo = el('div', { class: 'set-sub', style: { marginTop: '6px' } }, 'building…');
+      const showVocab = () => get('/voice/vocabulary')
+        .then(r => { hintInfo.textContent = `Whisper is primed with: ${r.prompt || '(nothing yet)'}`; })
+        .catch(() => { hintInfo.textContent = ''; });
+      showVocab();
+      ui.panel.append(el('div', { class: 'set-block' },
+        el('div', { class: 'set-name' }, 'Words to listen for'),
+        el('div', { class: 'set-sub' },
+          'Names the model would otherwise guess at — platforms, people, products. Your merchants and categories are added automatically. Comma-separated; keep it short, a long hint makes whisper quote it back at you.'),
+        hintTa,
+        el('div', { class: 'row', style: { marginTop: '6px' } },
+          el('button', {
+            class: 'btn sm primary',
+            onclick: async () => { await save({ voice: { stt: { prompt: hintTa.value } } }, 'vocabulary saved'); V.invalidateVoiceStatus(); showVocab(); },
+          }, 'Save')),
+        hintInfo));
+
+      // --- speaking ---
+      ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '18px' } }, 'SPEAKING'));
+
+      // Voice names are Kokoro's own: <language><gender>_<name>. Spelling that out
+      // beats 54 opaque identifiers in a dropdown.
+      const GENDER = { f: 'female', m: 'male' };
+      const REGION = { a: 'American', b: 'British', e: 'Spanish', f: 'French', h: 'Hindi', i: 'Italian', j: 'Japanese', p: 'Portuguese', z: 'Chinese' };
+      const voiceLabel = (v) => {
+        const m = /^([a-z])([fm])_(.+)$/.exec(v);
+        if (!m) return v;
+        const name = m[3][0].toUpperCase() + m[3].slice(1);
+        return `${name} — ${REGION[m[1]] || m[1]} ${GENDER[m[2]] || ''}`.trim();
+      };
+      let current = c.voice?.tts?.voice || 'af_heart';
+
+      // Kokoro ships 54 voices and they are NOT equally good — the model card grades
+      // them, and the difference between an A and a D is the difference between a
+      // voice you would leave on and one you would mute. These are the ones worth
+      // hearing, in the order worth hearing them, with a word about how each sounds
+      // so the choice is not 54 coin flips.
+      // Kokoro ships 54 and they are NOT equally good — nor equally suitable for an
+      // assistant. The whispery close-mic ones (af_nicole) are technically fine and
+      // sound like an ASMR channel, which is not what you want reading your budget
+      // back at you; they stay in the full list below, out of the shortlist.
+      const PICKS = [
+        ['af_heart', 'Warm, natural, unhurried. The best of them.'],
+        ['af_bella', 'More expressive and animated than Heart.'],
+        ['af_kore', 'Crisp and matter-of-fact. Good for numbers.'],
+        ['af_aoede', 'Bright and even, lighter than Heart.'],
+        ['bf_emma', 'British, calm — good for long answers.'],
+        ['bf_isabella', 'British, warmer and rounder.'],
+        ['am_fenrir', 'Male, steady and low.'],
+        ['am_michael', 'Male, neutral and plain.'],
+        ['am_puck', 'Male, brighter and quicker.'],
+        ['bm_george', 'British male, measured.'],
+        ['bm_lewis', 'British male, deeper and slower.'],
+        ['jf_alpha', '日本語 female — reads kanji properly.'],
+        ['jm_kumo', '日本語 male.'],
+      ];
+
+      // Preview in the voice's OWN language — a Japanese voice reading an English
+      // sentence tells you nothing about how it will sound. Keyed off the base voice,
+      // since a blend spec looks like "af_heart+bf_emma".
+      const sampleFor = (spec) => {
+        const base = String(spec || '').split('+')[0];
+        if (base.startsWith('j')) return '今月の食費は、あと一万二千円残っています。';
+        if (base.startsWith('z')) return '本月的食品预算还剩一万二千日元。';
+        return 'Your grocery budget has twelve thousand yen left, with nine days to go.';
+      };
+
+      const preview = async (v) => {
+        try {
+          const meta = await V.previewVoice(sampleFor(v), { voice: v });
+          // A CJK voice that fell back to espeak reads kanji as "Chinese letter" —
+          // it is obviously broken to listen to and impossible to attribute.
+          if (/^(ja|cmn|zh)/.test(meta.lang) && !meta.g2p.startsWith('misaki')) {
+            toast(`${voiceLabel(v)} is speaking through espeak — run: ${st.home}/venv/bin/pip install "misaki[ja]"`, 'warn');
+          }
+        } catch (e) { toast(e.message, 'err'); }
+      };
+
+      const gallery = el('div', { class: 'voice-gallery' });
+      const paintGallery = () => {
+        const base = current.split('+')[0];
+        gallery.replaceChildren(...PICKS
+          .filter(([v]) => !st.tts?.voices?.length || st.tts.voices.includes(v))
+          .map(([v, blurb]) => el('button', {
+            class: 'voice-chip' + (base === v ? ' on' : ''), type: 'button',
+            title: 'Select and play a sample',
+            onclick: async () => {
+              // Picking from the gallery changes the BASE voice; any blend partner
+              // set below survives it.
+              current = blendState.second ? `${v}+${blendState.second}` : v;
+              voiceSel.value = v;
+              paintGallery();
+              fillSecond(st.tts?.voices || [v]);
+              await save({ voice: { tts: { voice: current } } });
+              V.invalidateVoiceStatus();
+              preview(current);
+            },
+          },
+            el('span', { class: 'voice-chip-name' }, voiceLabel(v)),
+            el('span', { class: 'voice-chip-blurb' }, blurb),
+            el('span', { class: 'voice-chip-play' }, icon('play')))));
+      };
+      const voiceSel = el('select', { class: 'input sm', style: { maxWidth: '230px' } });
+      const fillVoices = (list) => {
+        voiceSel.replaceChildren(...list.map(v => el('option', { value: v, selected: current.split('+')[0] === v }, voiceLabel(v))));
+        voiceCount.textContent = `${list.length} installed — the shortlist above is the pick of them`;
+      };
+      const voiceCount = el('div', { class: 'set-sub' }, 'loading voices…');
+      voiceSel.addEventListener('change', async () => {
+        current = blendState.second ? `${voiceSel.value}+${blendState.second}` : voiceSel.value;
+        paintGallery();
+        await save({ voice: { tts: { voice: current } } });
+        V.invalidateVoiceStatus();
+        preview(current);
+      });
+
+      ui.panel.append(
+        el('div', { class: 'set-row set-row-stack' },
+          el('div', { class: 'set-info' },
+            el('div', { class: 'set-name' }, 'Voice'),
+            el('div', { class: 'set-sub' }, 'Click one to select it and hear it straight away.')),
+          gallery),
+        el('div', { class: 'set-row' },
+          el('div', { class: 'set-info' }, el('div', { class: 'set-name' }, 'Every voice'), voiceCount),
+          el('div', { class: 'set-ctl' }, voiceSel)));
+      paintGallery();
+
+      // The list is cached server-side after the first read, but the cache lives with
+      // the data directory — on a fresh one this is the call that fills it, and it is
+      // worth the ~1s worker spawn rather than showing a dropdown with one entry.
+      if (st.tts?.voices?.length) fillVoices(st.tts.voices);
+      else {
+        fillVoices([current]);
+        voiceCount.textContent = 'loading voices…';
+        get('/voice/voices')
+          .then(r => { if (r.voices?.length) { st.tts.voices = r.voices; fillVoices(r.voices); paintGallery(); } })
+          .catch(() => { voiceCount.textContent = 'could not list voices'; });
+      }
+
+      const speedVal = el('span', { class: 'set-sub', style: { minWidth: '34px', fontFamily: 'var(--mono)' } }, String(c.voice?.tts?.speed ?? 1));
+      const speed = el('input', {
+        type: 'range', min: '0.6', max: '1.6', step: '0.05', value: String(c.voice?.tts?.speed ?? 1), style: { width: '150px' },
+        oninput: () => { speedVal.textContent = speed.value; },
+        onchange: async () => { await save({ voice: { tts: { speed: Number(speed.value) } } }); V.invalidateVoiceStatus(); },
+      });
+      ui.panel.append(row('Speaking rate', 'Kokoro accepts 0.5–2.0; past about 1.4 it starts to slur', el('div', { class: 'row' }, speed, speedVal)));
+
+      // --- a voice nobody else has ---
+      // Kokoro addresses a voice by an embedding, not a name, so two can be averaged
+      // into a real third one. This is the only way to get something unique out of a
+      // fixed model, and it costs one array operation per utterance.
+      const blendState = { second: (c.voice?.tts?.voice || '').split('+')[1] || '', amount: c.voice?.tts?.blend ?? 0.5 };
+      const secondSel = el('select', { class: 'input sm', style: { maxWidth: '190px' } });
+      const fillSecond = (list) => secondSel.replaceChildren(
+        el('option', { value: '' }, 'None — single voice'),
+        ...list.filter(v => v !== current.split('+')[0]).map(v => el('option', { value: v, selected: blendState.second === v }, voiceLabel(v))));
+      const blendVal = el('span', { class: 'set-sub', style: { minWidth: '52px', fontFamily: 'var(--mono)' } }, '');
+      const blendRange = el('input', {
+        type: 'range', min: '0', max: '1', step: '0.05', value: String(blendState.amount), style: { width: '150px' },
+      });
+      const paintBlend = () => {
+        const base = current.split('+')[0];
+        const pct = Math.round(Number(blendRange.value) * 100);
+        blendVal.textContent = blendState.second ? `${pct}/${100 - pct}` : '—';
+        blendRange.disabled = !blendState.second;
+        blendRow.style.opacity = blendState.second ? '1' : '.55';
+        void base;
+      };
+      const applyBlend = async () => {
+        const base = current.split('+')[0];
+        current = blendState.second ? `${base}+${blendState.second}` : base;
+        await save({ voice: { tts: { voice: current, blend: Number(blendRange.value) } } });
+        V.invalidateVoiceStatus();
+        paintBlend();
+        preview(current);
+      };
+      secondSel.addEventListener('change', () => { blendState.second = secondSel.value; applyBlend(); });
+      blendRange.addEventListener('input', paintBlend);
+      blendRange.addEventListener('change', applyBlend);
+      const blendRow = el('div', { class: 'row' }, blendRange, blendVal);
+      ui.panel.append(
+        el('div', { class: 'set-row' },
+          el('div', { class: 'set-info' },
+            el('div', { class: 'set-name' }, 'Blend with a second voice'),
+            el('div', { class: 'set-sub' }, 'Averages the two voice embeddings into one that is not in the list. Subtle at the edges, a genuinely different speaker in the middle.')),
+          el('div', { class: 'set-ctl' }, secondSel)),
+        row('Blend amount', 'How much of the first voice', blendRow));
+      fillSecond(st.tts?.voices?.length ? st.tts.voices : [current.split('+')[0]]);
+      paintBlend();
+
+      const pitchVal = el('span', { class: 'set-sub', style: { minWidth: '40px', fontFamily: 'var(--mono)' } }, String(c.voice?.tts?.pitch ?? 1));
+      const pitch = el('input', {
+        type: 'range', min: '0.75', max: '1.3', step: '0.01', value: String(c.voice?.tts?.pitch ?? 1), style: { width: '150px' },
+        oninput: () => { pitchVal.textContent = Number(pitch.value).toFixed(2); },
+        onchange: async () => { await save({ voice: { tts: { pitch: Number(pitch.value) } } }); V.invalidateVoiceStatus(); preview(current); },
+      });
+      ui.panel.append(row('Pitch',
+        'Shifts the voice up or down. The speaking rate is compensated so the sentence takes roughly as long as before — roughly, because the model\'s own rate control is not quite linear, so a lower pitch also reads a little quicker. Small moves go a long way; past ±20% it starts to sound processed.',
+        el('div', { class: 'row' }, pitch, pitchVal)));
+
+      ui.panel.append(row('Try it', 'Plays a sentence with the current voice, blend, pitch and speed',
+        el('button', { class: 'btn sm', onclick: () => preview(current) }, icon('play'), 'Preview')));
+
+      // --- this device ---
+      ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '18px' } }, 'ON THIS DEVICE'),
+        el('div', { class: 'set-sub', style: { marginBottom: '8px' } }, 'Stored in this browser, not on the server — each device decides for itself.'));
+
+      const p = V.prefs();
+
+      // One control with three positions rather than an "aloud" switch and a "mute"
+      // switch, which between them could be set to contradict each other. "Never" is
+      // a first-class answer: voice becomes a dictation-only input method, the
+      // speaker buttons disappear, and the speech model is never even loaded.
+      const speechSeg = el('div', { class: 'seg' }, ...[
+        ['auto', 'Always'], ['ask', 'When I ask'], ['off', 'Never'],
+      ].map(([v, label]) => el('button', {
+        class: 'seg-btn' + (p.speech === v ? ' on' : ''),
+        onclick: () => { V.setPrefs({ speech: v }); if (v !== 'auto') V.stopSpeaking(); renderPanel(); },
+      }, label)));
+      ui.panel.append(row('Spoken replies',
+        p.speech === 'off'
+          ? 'Muted. The microphone still works — this is voice input only.'
+          : p.speech === 'auto'
+            ? 'Every chat answer is read aloud as it arrives.'
+            : 'Silent until you press the speaker on a message.',
+        speechSeg));
+
+      // MEASURED, not guessed: at 1100ms a normal 0.9s mid-sentence pause ended the
+      // recording and the rest of the sentence was never captured — which is
+      // indistinguishable from the model mishearing you. See scripts/voice-bench.mjs.
+      const PAUSES = [[1200, 'Snappy'], [1500, 'Natural'], [2000, 'Patient'], [2600, 'Very patient']];
+      const curPause = p.silenceMs || 1500;
+      const pauseSeg = el('div', { class: 'seg' }, ...PAUSES.map(([ms, label]) => el('button', {
+        class: 'seg-btn' + (curPause === ms ? ' on' : ''),
+        title: `${(ms / 1000).toFixed(1)}s of quiet ends your turn`,
+        onclick: () => { V.setPrefs({ silenceMs: ms }); renderPanel(); },
+      }, label)));
+      ui.panel.append(row('How long a pause ends your turn',
+        `${(curPause / 1000).toFixed(1)}s. Too short and it cuts you off while you are still thinking — which reads as the model mishearing you, not as a timing problem. Too long and every answer waits.`,
+        pauseSeg));
+
+      const devSwitch = (name, sub, key) => row(name, sub, switchBtn(p[key], (on) => { V.setPrefs({ [key]: on }); renderPanel(); }));
+      ui.panel.append(
+        devSwitch('Hands-free in Voice mode', 'Send when you stop talking, then listen again — instead of tapping each turn', 'handsFree'),
+        devSwitch('Audio cues', 'Short tones when the microphone opens and closes, so you can tell listening from thinking without looking', 'cues'),
+        devSwitch('Send dictation immediately', 'The composer mic normally leaves the text for you to check first', 'dictateSend'),
+      );
+
+      // --- resources ---
+      ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '18px' } }, 'RESOURCES'));
+      const idle = el('input', {
+        class: 'input sm', type: 'number', min: '0', max: '240', style: { width: '80px' },
+        value: String(c.voice?.idleMinutes ?? 15),
+        onchange: async () => { await save({ voice: { idleMinutes: Math.max(0, Number(idle.value) || 0) } }); V.invalidateVoiceStatus(); },
+      });
+      ui.panel.append(row('Unload after (minutes)', 'The two models hold ~1.2GB. 0 keeps them resident, which is the right answer only if nothing else on this box wants the memory.', idle));
+
+      ui.panel.append(row('Models',
+        st.running ? 'Loaded and ready'
+          : p.speech === 'off' ? 'Loaded on first use — only the listening model, while replies are muted'
+            : 'Loaded on first use',
+        el('div', { class: 'row' },
+          el('button', { class: 'btn sm', onclick: async () => { try { await post('/voice/warm', { stt: true, tts: p.speech !== 'off' }); toast('models loaded', 'ok'); } catch (e) { toast(e.message, 'err'); } V.invalidateVoiceStatus(); renderPanel(); } }, 'Load now'),
+          el('button', { class: 'btn sm ghost', onclick: async () => { try { await post('/voice/stop', {}); toast('released'); } catch (e) { toast(e.message, 'err'); } V.invalidateVoiceStatus(); renderPanel(); } }, 'Unload'))));
     }
 
     async function renderPanel() {
@@ -672,6 +1044,10 @@ export default {
         ui.panel.append(row('Tools by default', 'New chats can call read-only tools (web search, your notes, inbox, planner) so answers stay current. Each chat has its own toggle too.',
           switchBtn(c.defaults.chatTools !== false, async (v) => { await save({ defaults: { chatTools: v } }); renderPanel(); })));
 
+        ui.panel.append(row('Confirm before writing',
+          'Say "I made 50000 through Uber Eats today" and you get a card — amount, category, date, all editable — with a Confirm button, instead of a ledger row appearing. Turn it off and the assistant writes directly, which is faster and occasionally wrong in a way you find out about weeks later.',
+          switchBtn(c.defaults.confirmActions !== false, async (v) => { await save({ defaults: { confirmActions: v } }); renderPanel(); })));
+
         const baseTa = el('textarea', { class: 'input', rows: 8, style: { width: '100%', fontFamily: 'var(--mono)', fontSize: '12.5px' } }, '');
         baseTa.value = c.defaults.chatSystem || '';
         const baseSave = el('button', { class: 'btn sm primary', onclick: () => save({ defaults: { chatSystem: baseTa.value } }) }, 'Save base prompt');
@@ -868,6 +1244,8 @@ export default {
           }
         })();
       }
+
+      if (S.tab === 'voice') { await renderVoice(c); }
 
       if (S.tab === 'agent') {
         ui.panel.append(el('h2', {}, 'Agent defaults'), el('div', { class: 'desc' }, 'How new agent sessions behave. Each session can override these.'));

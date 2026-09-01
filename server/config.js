@@ -32,7 +32,11 @@ const defaults = () => ({
   },
   // contextTokens: the context window of your local models (llama.cpp/Ollama). AIOS
   // keeps prompts under this so a ~32k model never overflows. Anthropic uses its own large window.
-  defaults: { chatModel: '', agentModel: '', agentMode: 'edits', agentPlanMode: false, chatTools: true, chatSystem: DEFAULT_CHAT_SYSTEM, contextTokens: 32000 },
+  // confirmActions: writes the assistant wants to make (log a payment, add an event,
+  // set a budget) come back as a confirmation card instead of just happening. Turning
+  // this off restores the old behaviour, where chat wrote to the ledger and the
+  // planner directly — fast, and occasionally wrong in a way you find out about later.
+  defaults: { chatModel: '', agentModel: '', agentMode: 'edits', agentPlanMode: false, chatTools: true, chatSystem: DEFAULT_CHAT_SYSTEM, contextTokens: 32000, confirmActions: true },
   // The AI learns the user's communication style + stable facts from their chat inputs,
   // keeps a profile note in the vault, and injects a condensed version into chat/agent.
   profile: { enabled: true, everyN: 6, inject: true, notePath: 'About Me.md' },
@@ -103,6 +107,69 @@ const defaults = () => ({
   // PATH (set an absolute path if AIOS runs from systemd, whose PATH is minimal).
   // maxEdge: long edge in pixels after conversion; vision models gain nothing above it.
   uploads: { ffmpeg: '', maxEdge: 2048 },
+  // Speech in and out, both local (faster-whisper + Kokoro-82M on the CPU). See
+  // server/voice.js for the layout; `npm run voice` installs it.
+  //   home/python: '' = the default ~/.local/share/aios/voice.
+  //   idleMinutes: drop the worker after this long unused — the two models cost
+  //     ~1.2GB of RAM and this box has an 8GB card that also wants to run an LLM.
+  //   stt.model: 'small' (accurate, ~1.9s an utterance) or 'base' (~0.7s, worse on
+  //     Japanese and proper nouns). Both are one whisper window, so cost barely
+  //     moves with how long you speak.
+  //   stt.language: '' auto-detects, which is shaky on very short clips — set 'en'
+  //     or 'ja' if you always speak one language.
+  //   tts.autoSpeak: read chat replies aloud without being asked.
+  //   handsFree: in Voice mode, send when you stop talking instead of on a click.
+  voice: {
+    enabled: true, home: '', python: '', idleMinutes: 15,
+    //   stt.partialModel: the small model behind the live text that appears WHILE you
+    //     speak. It is re-run over the whole utterance about once a second, so it has
+    //     to be quicker than that interval — 'base' is ~0.7s, 'tiny' ~0.3s. '' turns
+    //     partials off. It never produces the text that gets acted on; the accurate
+    //     model still does one full pass when you stop.
+    //   stt.streaming: the live words that appear WHILE you speak now come from a
+    //     streaming Zipformer transducer (sherpa-onnx), not from re-running whisper
+    //     over the utterance-so-far. Whisper is a 30s-window seq2seq model — measured
+    //     here, 0.83s of audio costs it 1786ms and 9.71s costs 2163ms, so short
+    //     dictation pays the full window price and partials were quadratic. The
+    //     transducer carries state between chunks (RTF ~0.065 on 4 CPU threads), so
+    //     text grows word by word the way phone dictation does.
+    //     It is feedback ONLY: it is less accurate than whisper (no punctuation,
+    //     upper-case English) and the committed text is still whisper's full pass.
+    //   stt.streamMs: how often the browser ships audio. 200ms reads as continuous.
+    //   stt.streamRule2: trailing silence (seconds) that ends an utterance, judged
+    //     against what was decoded rather than loudness — replaces the fixed VAD wait.
+    //   stt.streamDecoding: 'modified_beam_search' or 'greedy_search'. Greedy is
+    //     cheaper (RTF 0.086 vs 0.111 on 4 threads) and cannot do contextual bias at
+    //     all — hotwords are scored against beams, and greedy has none. Measured on
+    //     32 clips: the same word error rate, the first word 130ms sooner, and 22.3%
+    //     -> 20.9% once the ledger's merchants are biasing it. On a 200ms chunk
+    //     budget neither number is one a person can feel, so beam search is default.
+    //   stt.streamBeam: how many beams (sherpa's max_active_paths). 4 is its default.
+    //   stt.streamHotwords: bias the live recogniser toward the ledger's merchants,
+    //     the same list whisper gets as a prompt. OFF by default because it was
+    //     MEASURED on this ledger and did not pay: the merchants here are ordinary
+    //     English words ("Outlier", "Mercor", "Prolific", "Micro1") that the model
+    //     already reads correctly, so the score moved 25.0% -> 26.4% — noise, in the
+    //     wrong direction. It earns its keep on names the model cannot spell:
+    //     "FAMILY MARCH" becomes "FAMILY MART" and 32 mixed clips went 22.3% ->
+    //     20.9%. Turn it on if the shops you say out loud are Japanese.
+    //   stt.streamHotwordScore: how hard to lean on them. Above 3 it starts pulling
+    //     unrelated words toward a merchant ("for lunch" -> "for nge"); 2 is the
+    //     point where names improve and nothing else moves.
+    stt: {
+      model: 'small', partialModel: 'base', partialMs: 1100, device: 'cpu', compute: 'int8',
+      threads: 0, beam: 1, language: '', prompt: '',
+      streaming: true, streamModel: 'sherpa-onnx-streaming-zipformer-ar_en_id_ja_ru_th_vi_zh-2025-02-10',
+      streamMs: 200, streamThreads: 4, streamProvider: 'cpu', streamRule2: 0.8,
+      streamDecoding: 'modified_beam_search', streamBeam: 4,
+      streamHotwords: false, streamHotwordScore: 2,
+    },
+    // voice may name TWO voices ("af_heart+bf_emma"); `blend` is how much of the
+    // first, and the result is a voice the model does not ship. `pitch` shifts it
+    // up or down without changing how long the sentence takes to say.
+    tts: { model: 'kokoro-v1.0.onnx', voices: 'voices-v1.0.bin', voice: 'af_heart', blend: 0.5, pitch: 1, speed: 1, lang: 'en-us', autoSpeak: false },
+    handsFree: true, silenceMs: 1100, maxUtteranceSec: 60,
+  },
   // Money. ocrModel MUST be vision-capable (a model whose preset names an mmproj that
   // exists) — receipts.js refuses to OCR with a text-only model rather than silently
   // returning nothing. Empty = pick the best vision model on this machine at scan time.
@@ -136,6 +203,12 @@ const defaults = () => ({
   tools: {
     disabled: [],                                   // tool names the agent may not use
     searxng: { url: 'http://127.0.0.1:8890' },      // bundled metasearch instance (npm run searxng)
+    // fetch_url / crawl_site / research refuse private and loopback addresses, because
+    // the URL comes from the model and the model got it from a web page — and this box
+    // answers on loopback with ComfyUI, llama-server, Ollama and AIOS itself, none of
+    // which ask a passing request for a password. Turn this on only if you actually
+    // want the agent reading your own LAN services. See safeFetch in server/tools.js.
+    allowPrivateFetch: false,
     // Maps & directions. Keyless by default (OpenStreetMap Nominatim + public OSRM);
     // a Google Directions key unlocks transit and exact walking/cycling times.
     // units: metric | imperial (distances in directions/find_places).
@@ -195,7 +268,7 @@ export function publicConfig() {
 /** Apply a partial update from the client. Secrets arrive via explicit fields. */
 export function updateConfig(patch) {
   const c = loadConfig();
-  const allowed = ['user', 'appearance', 'defaults', 'projectsRoot', 'vault', 'agent', 'tools', 'sampling', 'weather', 'llm', 'comfy', 'profile', 'finance', 'uploads'];
+  const allowed = ['user', 'appearance', 'defaults', 'projectsRoot', 'vault', 'agent', 'tools', 'sampling', 'weather', 'llm', 'comfy', 'profile', 'finance', 'uploads', 'voice'];
   for (const k of allowed) if (patch[k] !== undefined) c[k] = deepMerge(c[k], patch[k]);
   if (patch.mail) {
     const m = patch.mail, M = c.mail;

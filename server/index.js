@@ -2,6 +2,16 @@
 // (chat, agent events, approvals, terminals, vault AI). Binds 0.0.0.0 so every
 // machine on the LAN can use it; non-localhost requests need the token by default.
 
+// Four stores in this hub are node:sqlite, which is only importable without a flag
+// from Node 22.13 / 23.4 on. Older runtimes fail deep inside whichever data module
+// happens to load first, with an error about an unknown module rather than about the
+// version — so the check happens here, once, in words.
+const [major, minor] = process.versions.node.split('.').map(Number);
+if (major < 22 || (major === 22 && minor < 13)) {
+  console.error(`AIOS needs Node 22.13 or newer (this is ${process.version}) — node:sqlite is not available unflagged before then.`);
+  process.exit(1);
+}
+
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import http from 'node:http';
@@ -39,6 +49,8 @@ import * as finance from './finance.js';
 import * as receipts from './receipts.js';
 import * as financeai from './financeai.js';
 import * as items from './items.js';
+import * as voice from './voice.js';
+import * as interview from './interview.js';
 import { gpuStats } from './gpu.js';
 
 const cfg = loadConfig();
@@ -90,7 +102,13 @@ app.get('/api/status', h(async () => ({
   dataDir: DATA, providers: await probeProviders(), urls: lanUrls(),
 })));
 app.get('/api/config', h(() => publicConfig()));
-app.put('/api/config', h(req => updateConfig(req.body || {})));
+app.put('/api/config', h(req => {
+  const out = updateConfig(req.body || {});
+  // Voice hints and finance categories both feed the transcription vocabulary; a
+  // two-minute cache would make an edit look like it did nothing.
+  if (req.body?.voice || req.body?.finance) voice.invalidateVocabulary();
+  return out;
+}));
 app.get('/api/config/token', h((req) => {
   // only reveal the pairing token to localhost callers
   const ip = req.socket?.remoteAddress || '';
@@ -192,11 +210,18 @@ app.post('/api/fs/mkdir', h(req => { files.mkdir(req.body.root, req.body.path); 
 app.post('/api/fs/rename', h(req => { files.rename(req.body.root, req.body.from, req.body.to); }));
 app.post('/api/fs/delete', h(req => { files.remove(req.body.root, req.body.path); }));
 app.get('/api/fs/search', h(req => files.search(req.query.root, req.query.q || '')));
-app.get('/api/fs/raw', h((req, res) => {
-  const { abs, mime } = files.raw(req.query.root, req.query.path);
-  res.setHeader('content-type', mime);
-  res.sendFile(abs);
-}));
+// Plain handler (not h()): sendFile streams asynchronously, so the h() wrapper races
+// it and sends its {"ok":true} fallback first — which is exactly what this did, for
+// every download the Files app has ever made, until 2026-08-18. Three sibling routes
+// were converted when the bug was first understood and this one was missed, so the
+// audit now greps for the shape rather than trusting the next person to remember.
+app.get('/api/fs/raw', (req, res) => {
+  let file;
+  try { file = files.raw(req.query.root, req.query.path); }
+  catch (e) { return res.status(e.status || 500).json({ error: e.message }); }
+  res.setHeader('content-type', file.mime);
+  res.sendFile(file.abs, (err) => { if (err && !res.headersSent) res.status(err.status || 500).end(); });
+});
 
 // ---------- agent ----------
 
@@ -229,6 +254,72 @@ app.get('/api/uploads/:id', (req, res) => {
   res.sendFile(served.abs, (err) => { if (err && !res.headersSent) res.status(err.status || 500).end(); });
 });
 
+// ---------- voice (speech in / speech out, both local) ----------
+
+registerService({
+  id: 'voice', name: 'Voice', group: 'Service', settingsTab: 'voice',
+  probe: () => voice.serviceProbe(),
+});
+
+// Voice reads the ledger's own vocabulary (merchants, categories) to prime whisper.
+// Injected rather than imported so server/voice.js stays free of a SQLite dependency
+// and remains usable on an install where the ledger was never opened.
+voice.useFinance(finance);
+
+app.get('/api/voice/status', h(() => voice.status()));
+app.get('/api/voice/vocabulary', h(() => ({ prompt: voice.vocabularyPrompt() })));
+app.get('/api/voice/voices', h(async () => ({ voices: await voice.voices() })));
+app.post('/api/voice/warm', h(req => voice.warm(req.body || {})));
+
+// Live partials. The client posts only the bytes recorded since last time; the server
+// keeps the running concatenation and re-reads the whole utterance with the fast
+// model. Raw body for the same reason as every other audio route.
+app.post('/api/voice/partial', express.raw({ type: '*/*', limit: '4mb' }), h(req => voice.partialTranscribe(
+  String(req.query.id || ''), req.body, {
+    mime: req.query.mime || req.headers['content-type'] || '',
+    // The browser ships PCM at whatever rate its AudioContext runs at and names it
+    // here, rather than resampling in JS: a box filter in the worklet cost 3.2
+    // points of word error against sherpa's own resampler.
+    rate: Number(req.query.rate) || 0,
+  },
+)));
+// Awaited, not fire-and-forget: the flush is what emits the last word or two of the
+// utterance, which the transducer's fixed decode chunks otherwise never produce.
+app.delete('/api/voice/partial', h(req => voice.endPartial(String(req.query.id || ''))));
+app.post('/api/voice/stop', h(() => voice.stop()));
+
+// Raw body, like /api/uploads/raw: a recording is bytes, and base64-in-JSON would
+// inflate every utterance by a third for no gain. Recordings are transient — they are
+// transcribed and deleted, never stored alongside the user's real uploads.
+app.post('/api/voice/transcribe', express.raw({ type: '*/*', limit: '26mb' }), h(req => voice.transcribe(req.body, {
+  mime: req.query.mime || req.headers['content-type'] || '',
+  language: req.query.language,
+  prompt: req.query.prompt,
+})));
+
+// Returns WAV bytes rather than JSON — the client makes an object URL out of it and
+// hands it to an <audio> element. Plain handler: h() serialises whatever is returned
+// as JSON, which is not what a body of PCM wants.
+app.post('/api/voice/speak', async (req, res) => {
+  try {
+    const out = await voice.speak(req.body?.text, {
+      voice: req.body?.voice, speed: req.body?.speed, lang: req.body?.lang,
+      blend: req.body?.blend, pitch: req.body?.pitch,
+    });
+    res.setHeader('content-type', 'audio/wav');
+    res.setHeader('cache-control', 'no-store');
+    res.setHeader('x-voice-ms', String(out.ms));
+    res.setHeader('x-voice-seconds', String(out.seconds));
+    // Which language and phonemizer actually ran — Settings uses it to tell you when
+    // a voice fell back rather than letting it silently speak the wrong language.
+    res.setHeader('x-voice-lang', String(out.lang || ''));
+    res.setHeader('x-voice-g2p', String(out.g2p || ''));
+    res.send(out.wav);
+  } catch (e) {
+    if (!res.headersSent) res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
 // ---------- chat ----------
 
 // what the chat/agent currently "knows" about your day — for transparency + testing
@@ -239,7 +330,40 @@ app.get('/api/chats/:id', h(req => chat.getChat(req.params.id)));
 app.patch('/api/chats/:id', h(req => chat.updateChat(req.params.id, req.body || {})));
 app.delete('/api/chats/:id', h(req => { chat.deleteChat(req.params.id); }));
 app.post('/api/chats/bulk-delete', h(req => chat.bulkDelete(req.body?.ids || [])));
+
+// Confirmable actions: the assistant proposes a write, this is where it becomes real.
+// PATCH edits the staged fields, POST settles it. Nothing here can run a tool the
+// registry in actions.js does not list.
+app.patch('/api/chats/:cid/actions/:aid', h(req => chat.editProposal(req.params.cid, req.params.aid, req.body || {})));
+app.post('/api/chats/:cid/actions/:aid', h(req => chat.decideProposal(
+  req.params.cid, req.params.aid,
+  req.body?.decision === 'confirm' ? 'confirm' : 'discard',
+  req.body?.args,
+)));
 app.post('/api/chats/move', h(req => chat.moveChats(req.body?.ids || [], req.body?.folder || '')));
+
+// ---------- interview mode (how voice answers, and the answer bank) ----------
+//
+// A session is a normal chat underneath, so there is nothing here that streams — the
+// conversation still runs over the chat WebSocket. These routes only compose the
+// prompt, remember the configuration, and keep the answers worth studying.
+
+app.get('/api/interview/options', h(() => interview.options()));
+app.get('/api/interview/sessions', h(req => interview.listSessions({ limit: Number(req.query.limit) || 40 })));
+app.post('/api/interview/sessions', h(req => interview.createSession(req.body?.config || req.body || {}, { modelRef: req.body?.modelRef })));
+app.get('/api/interview/sessions/:id', h(req => interview.getSession(req.params.id)));
+app.patch('/api/interview/sessions/:id', h(req => interview.updateSession(req.params.id, req.body?.config || req.body || {})));
+app.delete('/api/interview/sessions/:id', h(req => interview.deleteSession(req.params.id)));
+
+app.get('/api/interview/answers', h(req => interview.listAnswers({
+  q: String(req.query.q || ''), focus: String(req.query.focus || ''),
+  topic: String(req.query.topic || ''), limit: Number(req.query.limit) || 200,
+})));
+app.get('/api/interview/topics', h(() => interview.topics()));
+app.post('/api/interview/answers', h(req => interview.saveAnswer(req.body || {})));
+app.get('/api/interview/answers/:id', h(req => interview.getAnswer(req.params.id)));
+app.patch('/api/interview/answers/:id', h(req => interview.updateAnswer(req.params.id, req.body || {})));
+app.delete('/api/interview/answers/:id', h(req => interview.deleteAnswer(req.params.id)));
 
 // ---------- user profile (AI's learned notes about the user) ----------
 app.get('/api/profile', h(() => profile.getProfile()));
@@ -300,6 +424,10 @@ app.post('/api/notify/test', h(() => notify.sendDiscord('🔔 AIOS test notifica
 // ?range=this-month|last-month|this-year|all|30d
 app.get('/api/finance/overview', h(req => finance.overview(req.query)));
 app.get('/api/finance/summary', h(req => finance.summary(req.query)));
+// Goal met vs what's left to spend — the dashboard's headline band, also the
+// cheapest thing to ask when something else (Home, an agent tool) wants the state
+// of the month without pulling the whole overview.
+app.get('/api/finance/status', h(req => finance.monthStatus(req.query)));
 app.get('/api/finance/insights', h(req => finance.insights(req.query)));
 // ---------- income ----------
 // Freelance income needs its own surface: what came in today, from whom, for what work,
@@ -334,6 +462,18 @@ app.post('/api/finance/presets', h(req => finance.addPreset(req.body || {})));
 app.patch('/api/finance/presets/:id', h(req => finance.updatePreset(req.params.id, req.body || {})));
 app.delete('/api/finance/presets/:id', h(req => { finance.deletePreset(req.params.id); }));
 app.post('/api/finance/presets/:id/log', h(req => finance.logPreset(req.params.id, req.body || {})));
+
+// Expected income (想定): guessed on the day, settled when the payout lands. These
+// rows are deliberately NOT transactions — see financedb.js finance_pending.
+app.get('/api/finance/pending', h(req => finance.listPending(req.query)));
+app.get('/api/finance/pending/overview', h(req => finance.pendingOverview(req.query)));
+app.post('/api/finance/pending', h(req => finance.addPending(req.body || {})));
+app.post('/api/finance/pending/settle', h(req => finance.settlePending(req.body || {})));
+app.post('/api/finance/pending/void', h(req => finance.voidPending(req.body?.ids || [])));
+app.post('/api/finance/pending/unsettle', h(req => finance.unsettlePending(req.body?.txnId)));
+app.get('/api/finance/pending/:id', h(req => finance.getPending(req.params.id)));
+app.patch('/api/finance/pending/:id', h(req => finance.updatePending(req.params.id, req.body || {})));
+app.delete('/api/finance/pending/:id', h(req => { finance.deletePending(req.params.id); }));
 
 app.get('/api/finance/goal', h(req => finance.getGoal(req.query.month)));
 app.put('/api/finance/goal', h(req => finance.setGoal(req.body?.month, req.body || {})));

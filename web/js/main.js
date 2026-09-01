@@ -18,6 +18,7 @@ import githubApp from './apps/github.js';
 import studio from './apps/studio.js';
 import vault from './apps/vault.js';
 import learn from './apps/learn.js';
+import interviewApp from './apps/interview.js';
 import benchApp from './apps/bench.js';
 import modelsApp from './apps/models.js';
 import planner from './apps/planner.js';
@@ -136,6 +137,14 @@ function openPalette() {
     ...apps().map(a => ({ group: 'Apps', label: 'Open ' + a.title, icon: a.icon, run: () => openApp(a.id) })),
     ...state.projects.map(p => ({ group: 'Projects', label: 'Switch to ' + p.name, icon: 'folder', run: () => setProject(p.id) })),
     { group: 'Actions', label: 'New chat', icon: 'chat', run: () => openApp('chat', { fresh: true }) },
+    { group: 'Actions', label: 'Voice mode — talk to AIOS', icon: 'waveform', run: () => import('./voicemode.js').then(m => m.openVoiceMode()) },
+    {
+      group: 'Actions', label: 'Practice interview — hands-free', icon: 'briefcase',
+      run: () => import('./interview.js').then(async (iv) => {
+        const cfg = await iv.setupDialog({ config: { ...iv.savedConfig(), mode: 'interview' } });
+        if (cfg) (await import('./voicemode.js')).openVoiceMode({ config: cfg });
+      }),
+    },
     { group: 'Actions', label: 'New agent session', icon: 'agent', run: () => openApp('agent', { fresh: true }) },
     { group: 'Actions', label: 'New deep research', icon: 'research', run: () => openApp('research', { fresh: true }) },
     { group: 'Actions', label: 'Today\'s agenda', icon: 'daily', run: () => openApp('planner') },
@@ -214,6 +223,7 @@ async function boot() {
   registerApp(studio);
   registerApp(vault);
   registerApp(learn);
+  registerApp(interviewApp);
   registerApp(benchApp);
   registerApp(modelsApp);
   registerApp(planner);
@@ -223,7 +233,7 @@ async function boot() {
   // palette) but are not top-level destinations: Bench is something you do TO a model,
   // so it opens from the Models header, and Files is per-project, so it opens from the
   // row of the project you want. Both were dock icons pressed about once a month.
-  renderDock(['home', '|', 'chat', 'agent', 'research', '|', 'planner', 'finance', 'github', 'studio', 'vault', 'learn', 'models', '|', 'terminal', 'projects', '|', 'settings']);
+  renderDock(['home', '|', 'chat', 'agent', 'research', '|', 'planner', 'finance', 'github', 'studio', 'vault', 'learn', 'interview', 'models', '|', 'terminal', 'projects', '|', 'settings']);
 
   // PWA: installable from the pairing link; the SW is a plain passthrough
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => { });

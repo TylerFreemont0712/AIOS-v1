@@ -5,6 +5,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import net from 'node:net';
+import dns from 'node:dns/promises';
 import { safePath, truncate, isBinary, walk } from './util.js';
 import { loadConfig, DATA } from './config.js';
 import { listSkills, getSkill } from './skills.js';
@@ -445,7 +447,7 @@ export const TOOL_DEFS = [
   },
   {
     name: 'finance_summary', write: false, group: 'apps',
-    description: 'Totals from the user\'s Finances ledger for a period: earned, spent, net, savings rate, and the biggest spending categories. Use whenever money, affordability, budgets or "can I" questions come up — do not guess at their finances.',
+    description: 'Totals from the user\'s Finances ledger for a period: earned, spent, net, savings rate, and the biggest spending categories. For a whole month it also reports how much is LEFT to spend (budget minus what is spent minus what is already committed to recurring bills), the safe daily allowance for the days remaining, and progress against the monthly income goal. Use whenever money, affordability, budgets, "how much is left", "am I on track" or "can I afford" questions come up — do not guess at their finances.',
     parameters: {
       type: 'object',
       properties: {
@@ -502,6 +504,32 @@ export const TOOL_DEFS = [
         currency: { type: 'string', description: 'ISO code (default: the user\'s base currency)' },
       },
       required: ['amount'],
+    },
+  },
+  {
+    name: 'finance_budget_set', write: true, group: 'apps',
+    description: 'Set (or change) the monthly spending cap for one expense category. Use for "cap groceries at 45000", "raise my eating out budget". Leave `month` empty for the standing budget that applies every month.',
+    parameters: {
+      type: 'object',
+      properties: {
+        category: { type: 'string', description: 'One of the app\'s expense categories' },
+        amount: { type: 'number', description: 'Monthly cap in the base currency' },
+        month: { type: 'string', description: 'YYYY-MM to override just that month; omit for every month' },
+      },
+      required: ['category', 'amount'],
+    },
+  },
+  {
+    name: 'finance_goal_set', write: true, group: 'apps',
+    description: "Set the user's monthly income goal (and optional stretch target). Use for \"my goal this month is 100000\", \"set a stretch target of 150k\".",
+    parameters: {
+      type: 'object',
+      properties: {
+        minGoal: { type: 'number', description: 'The target to hit' },
+        majorGoal: { type: 'number', description: 'Optional stretch target above it' },
+        month: { type: 'string', description: 'YYYY-MM (default: this month)' },
+      },
+      required: ['minGoal'],
     },
   },
   {
@@ -946,7 +974,8 @@ export function isWriteTool(name) {
 /** Additive upkeep calls (wiki folder, daily note, generated maps, planner items) —
  *  pre-approved by the gate when vault.autoApprove is on. */
 export function isWikiScopedCall(name, args) {
-  if (['wiki_learn', 'wiki_index', 'wiki_generate', 'daily_log', 'task_add', 'event_add', 'finance_log'].includes(name)) return true;
+  if (['wiki_learn', 'wiki_index', 'wiki_generate', 'daily_log', 'task_add', 'event_add', 'finance_log',
+    'finance_budget_set', 'finance_goal_set'].includes(name)) return true;
   if (['vault_write', 'vault_append'].includes(name) && typeof args?.path === 'string') return wiki.isWikiPath(args.path);
   return false;
 }
@@ -985,6 +1014,7 @@ const CHAT_TOOL_ALLOW = new Set([
   // additive writes Chat is allowed to make (see CHAT_SAFE_WRITES) — jotting notes,
   // logging the day, adding planner items on request
   'quick_note', 'vault_append', 'daily_log', 'task_add', 'event_add', 'finance_log',
+  'finance_budget_set', 'finance_goal_set',
 ]);
 // Deliberately NOT in chat, though they are read-only and would fit:
 //   crawl_site       — walks a whole site over many fetches; that is what the Research
@@ -1012,7 +1042,11 @@ export const chatCoreNames = () => CHAT_CORE;
 // exception: additive and non-destructive (create-or-append a note, log the day, add
 // a task/event), so an errant call can't clobber anything. Everything else that
 // writes stays out of Chat.
-const CHAT_SAFE_WRITES = new Set(['quick_note', 'vault_append', 'daily_log', 'task_add', 'event_add', 'finance_log']);
+// Chat's write list. Every one of these is CONFIRMABLE (server/actions.js): chat
+// proposes it and the user presses Confirm, so "safe" here means "safe to offer",
+// not "safe to do behind your back" — which is what it used to mean.
+const CHAT_SAFE_WRITES = new Set(['quick_note', 'vault_append', 'daily_log', 'task_add', 'event_add', 'finance_log',
+  'finance_budget_set', 'finance_goal_set']);
 export const isChatSafeWrite = (name) => CHAT_SAFE_WRITES.has(name);
 
 /** Enabled chat tools: read-only plus the additive-safe writes above (respects config
@@ -1561,9 +1595,42 @@ const impls = {
       `Finances ${s.range.start} → ${s.range.end} (${s.count} transactions)`,
       `  earned ${m(s.earned)} · spent ${m(s.spent)} · net ${m(s.net)}`,
       s.savingsRate === null ? '  savings rate: n/a (no income this period)' : `  savings rate ${s.savingsRate}% · avg spend ${m(s.avgSpendPerDay)}/day`,
-      cats.length ? 'Top expense categories:' : 'No expenses recorded in this period.',
-      ...cats.map(c => `  ${c.category}: ${m(c.total)} (${c.pct}%, ${c.count}x)`),
     ];
+
+    // "How much is left this month" is the single most common money question, and
+    // totals alone cannot answer it — the answer needs the budget, what is already
+    // committed, and how many days have to be paid for out of the remainder. Only
+    // when the period IS a month; goals and budgets do not mean anything otherwise.
+    const b = (() => { try { return finance.monthBounds(s.range.start.slice(0, 7)); } catch { return null; } })();
+    if (b && b.start === s.range.start && b.end === s.range.end) {
+      try {
+        const st = finance.monthStatus({ month: s.range.start.slice(0, 7) });
+        const sp = st.spend, g = st.goal;
+        // Projections and per-day allowances are estimates; quoting them to the
+        // sen makes them look like measurements, and reads terribly out loud.
+        const est = (n) => m(Math.round(n));
+        if (sp.basis !== 'none') {
+          lines.push(
+            `Left to spend: ${m(sp.available)} of ${m(sp.limit)} `
+            + (sp.basis === 'budget' ? `budgeted across ${sp.categoriesCovered} categories` : '(no budgets set — measured against income)')
+            + (st.isCurrent ? ` · ${st.days.left} days left` : ''),
+          );
+          if (sp.perDayLeft !== null) lines.push(`  that is ${est(sp.perDayLeft)}/day for the rest of the month`);
+          if (sp.committed > 0) lines.push(`  ${m(sp.committed)} of it is already committed: ${sp.committedItems.map(c => `${c.name} (${c.date})`).join(', ')}`);
+          if (sp.over) lines.push('  ALREADY OVER the budget for this month');
+          else if (st.isCurrent && sp.onTrack === false) lines.push(`  on the current pace the month ends at ${est(sp.projected)} — over`);
+        }
+        if (g.target > 0) {
+          lines.push(g.met
+            ? `Goal: MET — ${m(g.progress)} against a ${m(g.target)} target (${g.pct}%)`
+            : `Goal: ${m(g.progress)} of ${m(g.target)} (${g.pct}%), ${m(g.toGo)} to go`
+              + (g.perDayNeeded ? ` — ${est(g.perDayNeeded)}/day for the remaining ${st.days.left} days` : ''));
+        }
+      } catch { /* the totals above are still a useful answer on their own */ }
+    }
+
+    lines.push(cats.length ? 'Top expense categories:' : 'No expenses recorded in this period.',
+      ...cats.map(c => `  ${c.category}: ${m(c.total)} (${c.pct}%, ${c.count}x)`));
     return lines.join('\n');
   },
 
@@ -1654,6 +1721,22 @@ const impls = {
       ? ` (= ${Number(t.amountBase).toLocaleString('en-US')} ${finance.settings().baseCurrency} at ${t.fxRate})` : '';
     return `Logged ${t.kind}: ${Number(t.amount).toLocaleString('en-US')} ${t.currency}${conv} · ${t.category}` +
       `${t.merchant ? ` · ${t.merchant}` : ''} on ${t.date}. Visible in the Finances app (id ${t.id}).`;
+  },
+
+  async finance_budget_set({ category, amount, month }) {
+    const r = finance.setBudget({ category, amount, month: month || '' });
+    const b = r.items.find(x => x.category === category) || {};
+    return `Budget set: ${category} = ${Number(amount).toLocaleString('en-US')} ${r.currency}`
+      + `${month ? ` for ${month}` : ' every month'}.`
+      + (b.spent ? ` ${Number(b.spent).toLocaleString('en-US')} already spent this month (${b.pct}%).` : '');
+  },
+
+  async finance_goal_set({ minGoal, majorGoal, month }) {
+    const m = /^\d{4}-\d{2}$/.test(String(month || '')) ? month : new Date().toISOString().slice(0, 7);
+    const g = finance.setGoal(m, { minGoal, majorGoal: majorGoal || 0 });
+    return `Goal for ${m}: ${Number(g.minGoal).toLocaleString('en-US')} ${g.currency}`
+      + `${g.majorGoal ? ` (stretch ${Number(g.majorGoal).toLocaleString('en-US')})` : ''}.`
+      + ` Currently at ${Number(g.progress).toLocaleString('en-US')}${g.minPct !== null ? ` (${g.minPct}%)` : ''}.`;
   },
 
   async task_list({ status = 'open', limit = 25 }) {
@@ -2222,6 +2305,119 @@ export async function webSearch(query, { n = 8, category, time_range } = {}) {
 
 const BROWSER_UA = 'Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0';
 
+
+// ---------- where the agent is allowed to fetch from ----------
+//
+// fetch_url and crawl_site take their URL from the MODEL, and the model takes its
+// ideas from search results and the pages it just read. That is an untrusted path
+// into `fetch()`, and this host answers on loopback with ComfyUI (8188), llama-server
+// (8080), SearXNG (8890), Ollama (11434) — none of which ask for a password — plus
+// AIOS itself, whose LAN token travels in a query string. A page that says "the full
+// text is at http://127.0.0.1:11434/api/tags" was previously enough to read it, and
+// 169.254.169.254 is the same trick on any cloud box.
+//
+// So a name is resolved before it is fetched, every address it resolves to has to be
+// public unicast, and the check runs again on every redirect hop — `redirect: 'follow'`
+// delegates the destination to whoever wrote the Location header, which is precisely
+// the party that is not trusted here.
+//
+// Residual, and deliberately not chased: between the lookup here and undici's own,
+// a hostile resolver could answer differently (DNS rebinding). Closing that means
+// dialling the checked IP and carrying the Host header by hand, which breaks TLS
+// verification for every honest site to defend a personal hub against an attacker
+// who already runs the nameserver. The redirect re-check closes the cheap version.
+//
+// Escape hatch: tools.allowPrivateFetch = true in Settings, for someone who genuinely
+// wants the agent reading their own LAN services.
+
+const IPV4_BLOCKS = [
+  [[0, 0, 0, 0], 8],          // "this network"
+  [[10, 0, 0, 0], 8],         // private
+  [[100, 64, 0, 0], 10],      // carrier-grade NAT
+  [[127, 0, 0, 0], 8],        // loopback
+  [[169, 254, 0, 0], 16],     // link-local — includes the cloud metadata address
+  [[172, 16, 0, 0], 12],      // private
+  [[192, 0, 0, 0], 24],       // IETF protocol assignments
+  [[192, 0, 2, 0], 24],       // TEST-NET-1
+  [[192, 168, 0, 0], 16],     // private
+  [[198, 18, 0, 0], 15],      // benchmarking
+  [[224, 0, 0, 0], 4],        // multicast
+  [[240, 0, 0, 0], 4],        // reserved, and 255.255.255.255 with it
+];
+
+const v4Num = (parts) => ((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3];
+
+function v4Blocked(ip) {
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+  const n = v4Num(parts);
+  return IPV4_BLOCKS.some(([base, bits]) => {
+    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+    return (n & mask) === (v4Num(base) & mask);
+  });
+}
+
+/** True when this literal address must not be fetched. Unknown shapes fail closed. */
+export function blockedAddress(ip) {
+  const raw = String(ip || '').trim().replace(/^\[|\]$/g, '');
+  if (net.isIPv4(raw)) return v4Blocked(raw);
+  if (!net.isIPv6(raw)) return true;
+
+  const lower = raw.toLowerCase().split('%')[0];        // drop any zone id
+  // ::ffff:1.2.3.4 and 64:ff9b::1.2.3.4 are IPv4 wearing a hat; judge the v4 address.
+  const mapped = /(?:^::ffff:|^64:ff9b::)(\d+\.\d+\.\d+\.\d+)$/.exec(lower);
+  if (mapped) return v4Blocked(mapped[1]);
+  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(lower);
+  if (hex) {
+    const a = parseInt(hex[1], 16), b = parseInt(hex[2], 16);
+    return v4Blocked([a >> 8, a & 255, b >> 8, b & 255].join('.'));
+  }
+  if (lower === '::' || lower === '::1') return true;   // unspecified, loopback
+  const head = parseInt(lower.split(':')[0] || '0', 16) || 0;
+  if ((head & 0xfe00) === 0xfc00) return true;          // fc00::/7 unique-local
+  if ((head & 0xffc0) === 0xfe80) return true;          // fe80::/10 link-local
+  if ((head & 0xff00) === 0xff00) return true;          // ff00::/8 multicast
+  return false;
+}
+
+/** Throws unless every address `url`'s host resolves to is public unicast. */
+async function assertFetchable(url) {
+  if (loadConfig().tools?.allowPrivateFetch === true) return;
+  const host = url.hostname.replace(/^\[|\]$/g, '');
+  if (net.isIP(host)) {
+    if (blockedAddress(host)) throw new Error(`refusing to fetch a private address (${host})`);
+    return;
+  }
+  let addrs;
+  try { addrs = await dns.lookup(host, { all: true, verbatim: true }); }
+  catch { throw new Error(`could not resolve ${host}`); }
+  // ALL of them, not the first: a name that answers with one public and one loopback
+  // address is the standard way this check gets walked past.
+  const bad = addrs.find(a => blockedAddress(a.address));
+  if (bad) throw new Error(`refusing to fetch ${host} — it resolves to a private address (${bad.address})`);
+}
+
+const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
+
+/**
+ * `fetch`, with every hop checked. Follows redirects by hand because that is the only
+ * way to see them; returns the final Response exactly as `fetch` would.
+ */
+async function safeFetch(url, init = {}, { maxRedirects = 5 } = {}) {
+  let at = url instanceof URL ? url : new URL(url);
+  for (let hop = 0; ; hop++) {
+    if (!/^https?:$/.test(at.protocol)) throw new Error('only http(s) URLs');
+    await assertFetchable(at);
+    const res = await fetch(at, { ...init, redirect: 'manual' });
+    if (!REDIRECT_CODES.has(res.status)) return res;
+    const loc = res.headers.get('location');
+    if (!loc) return res;                              // a 3xx with nowhere to go
+    try { await res.body?.cancel(); } catch { /* already drained */ }
+    if (hop >= maxRedirects) throw new Error('too many redirects');
+    at = new URL(loc, at);
+  }
+}
+
 /** Strip HTML to readable plain text (scripts/styles/tags removed, entities decoded). */
 function htmlToText(html) {
   return String(html)
@@ -2236,12 +2432,10 @@ function htmlToText(html) {
 /** Fetch a URL and reduce it to readable text (HTML stripped). opts.headers lets
  *  callers pass auth cookies (e.g. platform availability checks). */
 export async function fetchReadable(url, cap = 2_000_000, opts = {}) {
-  const u = new URL(url);
-  if (!/^https?:$/.test(u.protocol)) throw new Error('only http(s) URLs');
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 20000);
   try {
-    const r = await fetch(url, { signal: ctl.signal, redirect: 'follow', headers: { 'user-agent': BROWSER_UA, ...(opts.headers || {}) } });
+    const r = await safeFetch(url, { signal: ctl.signal, headers: { 'user-agent': BROWSER_UA, ...(opts.headers || {}) } });
     const type = r.headers.get('content-type') || '';
     let body = await r.text();
     if (body.length > cap) body = body.slice(0, cap);
@@ -2279,14 +2473,12 @@ function extractLinks(html, base) {
 const normUrl = (u) => { try { const x = new URL(u); x.hash = ''; return (x.origin + x.pathname).replace(/\/+$/, '') + (x.search || ''); } catch { return u; } };
 
 async function fetchRaw(url, { signal, cap = 800_000 } = {}) {
-  const u = new URL(url);
-  if (!/^https?:$/.test(u.protocol)) throw new Error('only http(s) URLs');
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 15000);
   const onAbort = () => ctl.abort();
   signal?.addEventListener('abort', onAbort, { once: true });
   try {
-    const r = await fetch(url, { signal: ctl.signal, redirect: 'follow', headers: { 'user-agent': BROWSER_UA } });
+    const r = await safeFetch(url, { signal: ctl.signal, headers: { 'user-agent': BROWSER_UA } });
     const type = r.headers.get('content-type') || '';
     if (type && !/text|html|xml|json/.test(type)) throw new Error('not a text page');
     let body = await r.text();
@@ -2300,6 +2492,10 @@ async function fetchRaw(url, { signal, cap = 800_000 } = {}) {
 export async function crawlSite(startUrl, { query = '', maxPages = 6, depth = 2, signal } = {}) {
   const start = new URL(startUrl);
   if (!/^https?:$/.test(start.protocol)) throw new Error('only http(s) URLs');
+  // Checked here as well as in fetchRaw so a refused start URL says so. The crawl
+  // swallows per-page failures by design, which would otherwise report a blocked
+  // loopback address as "no readable pages" — true, but not the reason.
+  await assertFetchable(start);
   const host = start.host;
   const seen = new Set([normUrl(start.href)]);
   const queue = [{ url: start.href, d: 0 }];
@@ -2406,14 +2602,12 @@ async function ocrPdf(buf, opts = {}) {
 /** Fetch a PDF URL and return its extracted text as { status, text }.
  *  Text layer via pdftotext first; OCR fallback for scanned PDFs when available. */
 export async function fetchPdfText(url, cap = 500_000, opts = {}) {
-  const u = new URL(url);
-  if (!/^https?:$/.test(u.protocol)) throw new Error('only http(s) URLs');
   if (!hasCmd('pdftotext')) throw new Error('pdftotext not installed — install poppler-utils to read PDFs');
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), opts.timeoutMs || 30000);
   let buf;
   try {
-    const r = await fetch(url, { signal: ctl.signal, redirect: 'follow', headers: { 'user-agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0', ...(opts.headers || {}) } });
+    const r = await safeFetch(url, { signal: ctl.signal, headers: { 'user-agent': BROWSER_UA, ...(opts.headers || {}) } });
     if (!r.ok) throw new Error(`status ${r.status}`);
     buf = Buffer.from(await r.arrayBuffer());
   } finally { clearTimeout(t); }

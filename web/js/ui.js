@@ -71,6 +71,11 @@ export const icons = {
   external: I('<path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M18 14v4.5A1.5 1.5 0 0 1 16.5 20h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6H10"/>'),
   paperclip: I('<path d="M20.5 11.5 12 20a5.4 5.4 0 0 1-7.6-7.6l8.4-8.4a3.6 3.6 0 0 1 5.1 5.1l-8.4 8.4a1.8 1.8 0 0 1-2.6-2.6l7.7-7.7"/>'),
   image: I('<rect x="3" y="4.5" width="18" height="15" rx="2.5"/><circle cx="8.5" cy="10" r="1.9"/><path d="m4 17 4.5-4.5 3.5 3.5L16 12l4 4.5"/>'),
+  mic: I('<rect x="9" y="2.5" width="6" height="11.5" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0"/><path d="M12 18v3.5M8.5 21.5h7"/>'),
+  micOff: I('<path d="M9 5.5a3 3 0 0 1 6 0V9m0 3.4a3 3 0 0 1-4.7.9"/><path d="M5.5 11.5a6.5 6.5 0 0 0 9.9 5.5M18.5 11.5a6.4 6.4 0 0 1-.5 2.5"/><path d="M12 18v3.5M8.5 21.5h7"/><path d="m3.5 3.5 17 17"/>'),
+  speaker: I('<path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/><path d="M15.5 9.2a4 4 0 0 1 0 5.6"/><path d="M18.2 6.5a7.8 7.8 0 0 1 0 11"/>'),
+  speakerOff: I('<path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/><path d="m16 10 4 4m0-4-4 4"/>'),
+  waveform: I('<path d="M3 12h1.8M7.4 7v10M11 3.5v17M14.6 8.5v7M18.2 10.5v3M21.5 12h-.3"/>'),
 };
 
 export const icon = (name) => {
@@ -144,8 +149,21 @@ export function menu(x, y, items) {
   document.querySelectorAll('.ctx-menu').forEach(m => m.remove());
   const m = el('div', { class: 'ctx-menu' },
     ...items.map(it => it === '-' ? el('div', { class: 'ctx-sep' }) :
-      el('button', { class: 'ctx-item ' + (it.danger ? 'danger' : ''), onclick: () => { m.remove(); it.onclick?.(); } },
-        it.icon ? icon(it.icon) : null, it.label)));
+      el('button', {
+        class: 'ctx-item' + (it.danger ? ' danger' : '') + (it.hint ? ' has-hint' : '') + (it.sel ? ' sel' : ''),
+        title: it.hint || null,
+        onclick: () => { m.remove(); it.onclick?.(); },
+      },
+        it.icon ? icon(it.icon) : null,
+        // `hint` puts a second line under the label — for menus whose entries are
+        // modes rather than actions, where "On click" means nothing on its own. It
+        // wraps rather than widening the menu off the edge of the screen.
+        it.hint
+          ? el('span', { class: 'ctx-text' }, el('span', { class: 'ctx-label' }, it.label), el('span', { class: 'ctx-hint' }, it.hint))
+          : el('span', { class: 'ctx-label' }, it.label),
+        // `sel` marks the current value in a set of choices. A trailing tick keeps
+        // every label starting at the same x, which a "✓ " prefix does not.
+        it.sel ? el('span', { class: 'ctx-tick' }, '✓') : null)));
   document.body.append(m);
   const r = m.getBoundingClientRect();
   m.style.left = Math.min(x, innerWidth - r.width - 8) + 'px';
