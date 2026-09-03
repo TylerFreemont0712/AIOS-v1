@@ -186,6 +186,23 @@ export class Recorder {
       },
     });
 
+    // STOPPED WHILE THE DEVICE WAS STILL OPENING.
+    //
+    // getUserMedia is a round trip — a permission prompt the first time, tens of
+    // milliseconds after that — and every control that ends a recording can be
+    // pressed inside that window: a second click on the mic button, Pause, the Mode
+    // dialog, closing the overlay. Without this check the recorder carries on and
+    // opens the microphone anyway, and because nothing is waiting on the result the
+    // browser's recording indicator simply stays lit with no way to turn it off.
+    //
+    // `state` is the truth rather than a flag of its own: stop() and abort() both
+    // move it off 'idle' before this resumes.
+    if (this.state !== 'idle') {
+      try { this.stream.getTracks().forEach(t => t.stop()); } catch { /* already gone */ }
+      this.stream = null;
+      return this;
+    }
+
     const mime = pickMime();
     // 64kbps mono opus, not 32: at 32 the codec starts trading away exactly the
     // high-frequency detail that separates one consonant from another, and a ten
@@ -471,6 +488,12 @@ export class Recorder {
 
   /** Ends capture and resolves to the recorded Blob (also available as .result). */
   stop() {
+    // Pressed before the device finished opening: there is no recording to keep, so
+    // this is an abort rather than a stop — and it moves `state` off 'idle', which
+    // is what start() checks when it resumes. Without it the click was swallowed
+    // (stop() returned early, start() went on to open the mic) and the button was
+    // left showing a recording the user had already cancelled.
+    if (this.state === 'idle') { this.abort(); return this.done; }
     if (this.state !== 'recording') return this.done;
     this.state = 'stopping';
     cancelAnimationFrame(this._raf);

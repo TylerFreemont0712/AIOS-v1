@@ -126,6 +126,18 @@ async function step(label, expression, settle = 500, { allowError = false } = {}
   await wait(settle);
   const toasts = (await evalJs('window.__toastErrors') || []);
   if (!allowError) for (const t of toasts) problems.push(`[${label}] error toast: ${t}`);
+  // A THIRD place a failure hides. Voice mode's listen() wraps its whole turn in a
+  // try/catch that writes the message to the overlay's own status line — so a throw
+  // there is neither an exception, nor a console error, nor a toast. It is a phase
+  // attribute and some grey text, and the suite sailed straight past it while
+  // "Cannot read properties of null (reading 'spoke')" sat on screen.
+  if (!allowError) {
+    const bad = await evalJs(`(() => {
+      const o = document.querySelector('.vm-overlay');
+      return o?.dataset.phase === 'error' ? (o.querySelector('.vm-status')?.textContent || 'error phase') : '';
+    })()`);
+    if (bad) problems.push(`[${label}] voice mode fell into the error phase: ${bad}`);
+  }
   ok(problems.length === before, `${label}${problems.length > before ? ' — ' + problems[before] : ''}`);
 }
 
@@ -262,6 +274,23 @@ await step('back to Chat', `window.aios.open('chat')`, 1200);
 await step('composer mic: start dictating', `document.querySelector('.composer-row .mic-btn').click()`, 1500);
 await step('composer mic: stop dictating', `document.querySelector('.composer-row .mic-btn').click()`, 3500);
 
+// TWO CLICKS INSIDE THE WINDOW WHERE THE DEVICE IS STILL OPENING.
+// toggleMic awaits a status re-probe and then getUserMedia before `mic` exists, and
+// the second click used to take the "start" branch as well — two live recorders, the
+// first held by nothing, and a recording indicator with no way to turn it off.
+await step('composer mic: two fast clicks cancel rather than opening two mics',
+  `(() => { const b = document.querySelector('.composer-row .mic-btn'); b.click(); b.click(); })()`, 3000);
+ok(await evalJs(`!document.querySelector('.composer-row .mic-btn').classList.contains('is-rec')`),
+  'composer mic: a cancelled start leaves the button idle');
+// And the state machine is not wedged by the cancel: the next click must still
+// record. `micOpening` left true, or `mic` left pointing at a dead recorder, would
+// both show up here as a button that never turns on again.
+await step('composer mic: still works after a cancelled start',
+  `document.querySelector('.composer-row .mic-btn').click()`, 1500);
+ok(await evalJs(`document.querySelector('.composer-row .mic-btn').classList.contains('is-rec')`),
+  'composer mic: recording again after the cancel');
+await step('composer mic: stop again', `document.querySelector('.composer-row .mic-btn').click()`, 3000);
+
 // ------------------------------------------------------------------- Voice mode
 await evalJs(`localStorage.setItem('aios.voice.prefs', JSON.stringify({ handsFree: false, speech: 'auto', cues: true }))`);
 await step('open Voice mode', `import('/js/voicemode.js').then(m => m.openVoiceMode())`, 2500);
@@ -280,6 +309,47 @@ for (const [label, expr, opts] of [
   ['mute toggle', `[...document.querySelectorAll('.vm-head .btn')].find(b => /Voice|Muted/.test(b.textContent)).click()`],
   ['jump-to-latest', `document.querySelector('.vm-jump').click()`],
 ]) await step('voice mode: ' + label, expr, 1400, opts);
+
+// EVERY CONTROL THAT TAKES THE MICROPHONE AWAY, PRESSED WHILE IT IS LISTENING.
+//
+// This is the gap that let a crash ship. The loop above starts listening and stops
+// again before it touches anything else, so Pause, Mode and the rest were only ever
+// pressed from idle — and the bug only exists in the other order. Pause, Mode and an
+// interview restart all abort the recorder and null `this.rec` synchronously, while
+// listen() is parked on `await rec.done`; the continuation then read `.spoke` off
+// null. Deterministic, not a race: pressing Pause mid-sentence bricked voice mode
+// every time, and left the orb disabled so the overlay had to be reopened.
+for (const [label, expr] of [
+  ['Pause', `[...document.querySelectorAll('.vm-actions button')].find(b => /Pause/.test(b.textContent))?.click()`],
+  ['key "p"', `document.dispatchEvent(new KeyboardEvent('keydown', { key: 'p', bubbles: true }))`],
+  ['hands-free toggle', `[...document.querySelectorAll('.vm-head .btn')].find(b => /Hands-free/.test(b.textContent))?.click()`],
+  ['mute toggle', `[...document.querySelectorAll('.vm-head .btn')].find(b => /Voice|Muted/.test(b.textContent))?.click()`],
+  ['orb tap', `document.querySelector('.vm-orb').click()`],
+]) {
+  // Back to a known state: not paused, not listening, orb alive.
+  await evalJs(`(() => {
+    const o = document.querySelector('.vm-overlay');
+    if (o?.dataset.phase === 'listening') document.querySelector('.vm-orb').click();
+    const p = [...document.querySelectorAll('.vm-actions button')].find(b => /Resume/.test(b.textContent));
+    if (p) p.click();
+  })()`);
+  await wait(700);
+  await evalJs(`document.querySelector('.vm-overlay')?.dataset.phase !== 'listening' && document.querySelector('.vm-orb').click()`);
+  await wait(1200);
+  const listening = await evalJs(`document.querySelector('.vm-overlay')?.dataset.phase === 'listening'`);
+  ok(listening, `voice mode: listening before "${label}"`);
+  await step(`voice mode: ${label} WHILE LISTENING`, expr, 1600);
+  // The orb must still be usable — an unexpected throw used to disable it for good.
+  ok(await evalJs(`document.querySelector('.vm-orb') && !document.querySelector('.vm-orb').disabled`),
+    `voice mode: the orb still works after "${label}" while listening`);
+}
+await evalJs(`(() => {
+  const o = document.querySelector('.vm-overlay');
+  if (o?.dataset.phase === 'listening') document.querySelector('.vm-orb').click();
+  const r = [...document.querySelectorAll('.vm-actions button')].find(b => /Resume/.test(b.textContent));
+  if (r) r.click();
+})()`);
+await wait(700);
 
 for (const key of ['m', 'h', 'r', 'p', 'p']) {
   await step(`voice mode: key "${key}"`,

@@ -194,6 +194,64 @@ measurable answer that was not about hardware.
   CPU has been resolved (see above). That is a one-setting change and the single biggest
   remaining latency win.
 
+**2026-09-01 (later) — "Cannot read properties of null (reading 'spoke')": four bugs in
+who owns the microphone**
+
+Reported the moment the transducer went live, and nothing to do with streaming. The
+recorder handle is read back off `this.rec` / `mic` AFTER an await, and every control
+that ends a recording — Pause, the Mode button, `beginInterview`, the Chat pane's
+`_voiceCleanup` — calls `abort()` and nulls that field **synchronously**. `abort()`
+resolves `done`, but the continuation only runs a microtask later, by which time the
+field is already gone. **Deterministic, not a race:** pressing Pause while listening
+crashed every single time.
+
+- 🐛 **It bricked voice mode, not just the turn.** `listen()` wraps the whole turn in
+  its own try/catch and hands the message to `fail()` — which writes it to the
+  overlay's status line **and disables the orb**. The only control left was dead, so
+  the overlay had to be closed and reopened. `fail()` is right for "no model
+  installed" and wrong for a microphone that was busy for one turn; that path now
+  reports and returns to idle.
+- 🐛 **`stop()` on a recorder still inside `getUserMedia` was a no-op**, so `start()`
+  went on to open the microphone anyway — for a recording nobody was waiting on, with
+  the browser's recording indicator lit and no control left to turn it off. `stop()`
+  before the device opens is an abort now, and `start()` checks its own state when
+  getUserMedia resumes.
+- 🐛 **Two fast clicks on the composer mic opened TWO recorders.** `toggleMic` awaits a
+  status re-probe and then getUserMedia before assigning `mic`, and the second click
+  took the "start" branch as well. The first recorder was then held by nothing at all.
+- 🐛 **Closing the Chat pane mid-dictation left the microphone open**, for the same
+  reason one step earlier: `_voiceCleanup` finds `mic` still null and has nothing to
+  abort.
+
+The fix is ownership rather than four null checks: the recorder is held in a **local
+from the moment it is constructed**, the field is only ever an identity check
+(`this.rec !== rec` → this turn is no longer mine), and the catch is scoped the same
+way so a late error cannot null a *newer* turn's recorder out from under it.
+
+- ⚠️ **Three places a browser failure can hide, and the suites watched two.**
+  Exceptions and console errors were covered; error toasts were added after the "v is
+  not defined" bug. This one was **a phase attribute and some grey text inside the
+  overlay** — invisible to all three, so `voice-ui` sailed past a run with "Cannot read
+  properties of null" sitting on screen. `step()` now fails when `.vm-overlay` is in
+  the `error` phase.
+- ⚠️ **The coverage gap that let it ship: every control was only ever pressed from
+  idle.** The suite starts listening and stops again before touching anything else,
+  and the bug only exists in the other order. It now presses Pause, `p`, hands-free,
+  mute and the orb **while listening**, asserts the orb still works afterwards, and
+  double-clicks the composer mic. **122 voice-UI checks, up from 102.**
+- 🐛 **A test that lied, found while verifying the above.** `voice-convo`'s speaker
+  check started failing as `reports finished (["speaking"])` — which reads exactly
+  like the hands-free-loop regression it exists to catch. It was neither that nor the
+  mic work: `git stash`-ing the fixes reproduced it just as reliably, and a probe that
+  polled instead of sleeping showed the Speaker reaching `idle` in **6236ms** against
+  the fixed `setTimeout(4000)` the test allowed. The deadline was accidental — nobody
+  meant to assert that three sentences synthesize and play inside four seconds — and
+  the user's own browser being open on the hub was enough to blow it. The two halves
+  of that test need opposite waits: proving no false `idle` arrives BETWEEN sentences
+  is an absence and wants a fixed window; proving `idle` arrives after `flush()` is a
+  presence and wants a poll. It polls for 20s now, so a real regression still fails it
+  and a busy laptop does not.
+
 **2026-09-01 — the live recogniser, measured for the first time: 39.7% WER → 20.3%**
 
 The transducer shipped on 2026-08-30 with no bench of its own — `voice-bench` scored

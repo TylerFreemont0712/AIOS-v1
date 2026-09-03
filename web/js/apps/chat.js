@@ -430,7 +430,12 @@ export default {
     // right default for a thing that will act on what it hears. Voice mode is the
     // other half — send-as-you-speak, replies read back — and it lives in its own
     // overlay because it is a different posture, not a different button state.
-    let voiceInfo = null, mic = null, autoSpeaker = null;
+    // `micOpening` closes the window between the click and `mic` existing. It is
+    // several awaits wide — a status re-probe, then getUserMedia — and without it a
+    // second click in that window took the "start" branch as well and opened a
+    // SECOND recorder, with nothing holding the first: two live microphones and an
+    // indicator that never goes out.
+    let voiceInfo = null, mic = null, autoSpeaker = null, micOpening = false;
     // Writes staged during the turn in flight — they decide what gets spoken at the end.
     let turnProposals = [];
 
@@ -532,9 +537,17 @@ export default {
     }
 
     async function toggleMic() {
+      let rec = null;
       if (mic) { mic.stop(); return; }
-      if (!await voiceReady()) return;
+      // Clicked again before the device finished opening — which reads as "cancel",
+      // so the recorder is stopped the moment it exists rather than the click being
+      // swallowed. Recorder.stop() on an unstarted recorder aborts it, and start()
+      // checks its own state when getUserMedia resumes, so the microphone is never
+      // actually opened.
+      if (micOpening) { micOpening = 'cancel'; return; }
+      micOpening = true;
       try {
+        if (!await voiceReady()) return;
         // Live text in the composer while you talk, when the streaming recogniser is
         // installed. This is the case that feels most like phone dictation, so it is
         // worth the extra state: `dictBase` is what was in the box before the mic
@@ -543,7 +556,12 @@ export default {
         const streaming = !!voiceInfo?.stt?.streaming;
         const dictBase = ui.input.value.replace(/\s+$/, '');
         let dictated = false, settled = false;
-        mic = new Recorder({
+        // The recorder is held in a local from the moment it exists, and `mic` is
+        // only ever the shared handle to compare against. Everything that can take
+        // the microphone away — a second click, closing the pane — moves `mic`, and
+        // reading the recorder back off it after an await is how this went wrong in
+        // three different places.
+        rec = new Recorder({
           // Dictation is not hands-free: you stop when you say you have stopped.
           // Auto-cutting a sentence someone is still composing is far more annoying
           // here than in Voice mode, where the turn-taking is the point.
@@ -562,12 +580,25 @@ export default {
           },
           onLevel: (v) => ui.mic.style.setProperty('--mic-level', String(v)),
         });
-        await mic.start();
-        setMicState(true);
-      } catch (e) { mic = null; setMicState(false); toast(e.message, 'err'); return; }
+        mic = rec;
+        await rec.start();
+        // Cancelled, or the pane closed, while getUserMedia was in flight. Without
+        // this the microphone opens for a recording nobody is waiting on and the
+        // browser's indicator stays lit with no control left to turn it off.
+        if (micOpening === 'cancel' || mic !== rec) rec.abort();
+        setMicState(rec.state === 'recording');
+      } catch (e) {
+        if (mic === rec) mic = null;
+        setMicState(false); toast(e.message, 'err'); return;
+      } finally { micOpening = false; }
 
-      const blob = await mic.done;
-      const spoke = mic.spoke;
+      if (mic !== rec) return;              // cancelled, superseded, or pane closed
+      const blob = await rec.done;
+      // Closing the Chat pane mid-dictation runs _voiceCleanup, which aborts the
+      // recorder and nulls `mic` synchronously — so this await used to resume with
+      // nothing to read `spoke` off. Same shape as the Voice-mode crash.
+      if (mic !== rec) return;
+      const spoke = rec.spoke;
       mic = null;
       setMicState(false);
       if (!blob?.size || !spoke) { if (blob) toast('nothing was said'); return; }
@@ -798,6 +829,10 @@ export default {
     setTimeout(() => ui.input.focus(), 50);
     win.chatState._voiceCleanup = () => {
       try { mic?.abort(); } catch { /* already released */ }
+      // A recorder still inside getUserMedia has not been assigned yet, so there is
+      // nothing to abort — flag it instead and toggleMic drops it the moment it
+      // exists. Otherwise the pane closes and the microphone stays open behind it.
+      if (micOpening) micOpening = 'cancel';
       mic = null; autoSpeaker = null;
       stopSpeaking();
     };

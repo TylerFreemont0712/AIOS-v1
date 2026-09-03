@@ -430,8 +430,14 @@ class VoiceMode {
     this.heardEl.classList.remove('is-partial');
     this.setPhase('listening');
     this.cue('listen');
+    // Declared out here so the catch can tell whether the recorder it is clearing is
+    // still this turn's. Scoped to the try, it could not, and an error arriving after
+    // Pause-then-Resume had started a NEW turn would null that turn's recorder out
+    // from under it — leaving the overlay listening to a microphone whose result
+    // nothing would ever collect.
+    let rec = null;
     try {
-      this.rec = new Recorder({
+      rec = this.rec = new Recorder({
         handsFree: this.p.handsFree,
         // Live text as you speak. It is a rougher model than the one that produces
         // the real transcription, so it is shown as provisional and replaced wholesale
@@ -478,18 +484,40 @@ class VoiceMode {
         onLevel: (v, bands) => this.level(v, bands),
         onAuto: (why) => { if (why === 'nospeech') this.setPhase('idle'); },
       });
-      await this.rec.start();
+      // Held in a local as well as on `this`. Pause, the Mode button and an
+      // interview restart all abort the recorder and null `this.rec` — and they do
+      // it SYNCHRONOUSLY, so by the time the await below resumes (a microtask later)
+      // the field is already gone. Reading `this.rec.spoke` there threw "Cannot read
+      // properties of null", which listen()'s own catch turned into the overlay's
+      // status line and a disabled orb: pressing Pause mid-sentence bricked voice
+      // mode until it was closed and reopened.
+      //
+      // The identity check is the general form of that guard. It covers a recorder
+      // that was replaced as well as one that was dropped, which is what happens
+      // when the Mode dialog is dismissed and the loop starts listening again.
+      await rec.start();
       // Whatever ends the recording — the silence detector, another tap, the length
       // cap — settles `done`. This await IS the listening phase.
-      const audio = await this.rec.done;
+      const audio = await rec.done;
       this.level(0);
-      if (this.closed) return;
-      if (!this.rec.spoke) return this.nobodySpoke();
+      if (this.closed || this.rec !== rec) return;   // this turn is no longer ours
+      if (!rec.spoke) return this.nobodySpoke();
       this.quietRounds = 0;
       await this.handleAudio(audio);
     } catch (e) {
       this.level(0);
-      this.fail(e.message);
+      // Recoverable, deliberately. `fail()` disables the orb, which is right for a
+      // missing model but wrong for a microphone that was busy for one turn: it
+      // leaves the only control dead and the overlay has to be reopened to get it
+      // back. Say what happened and go back to idle so the next tap can try again.
+      // Nothing here belongs to a turn that has already been superseded.
+      if (this.closed || (rec && this.rec !== rec)) return;
+      // Drop the recorder that failed rather than leaving it addressable: Pause and
+      // close both call abort() on whatever `this.rec` holds, and a half-started one
+      // is not something to hand them.
+      this.rec = null;
+      this.setPhase('idle');
+      this.statusEl.textContent = e.message;
     }
   }
 

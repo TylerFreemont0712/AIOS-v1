@@ -196,20 +196,34 @@ ok(chunks.decimal === 1 && chunks.decimalKept.includes('1,234.56'),
   `chunking: a decimal is never split across chunks → "${chunks.decimalKept}"`);
 
 // The regression that made the hands-free loop talk over itself.
+//
+// The two halves need OPPOSITE kinds of wait, and getting that wrong made this test
+// lie. Proving no false 'idle' arrives BETWEEN sentences is an absence, so it needs a
+// fixed observation window. Proving 'idle' arrives once flushed is a presence, and a
+// fixed sleep there asserts a DEADLINE nobody meant to set: it allowed 4000ms to
+// synthesize and play three sentences, which measured at 6236ms on a box that was
+// merely busy — the user's own browser open on the hub was enough. It failed as
+// "reports finished (["speaking"])", which reads exactly like the bug it was written
+// to catch. Polling keeps the assertion (idle must arrive) and drops the accidental
+// stopwatch; a genuine regression still fails it, 20s later.
 const states = await evalJs(`(async () => {
   const v = await import('/js/voice.js');
   const seen = [];
   const sp = new v.Speaker({ onState: s => seen.push(s) });
   sp.push('One sentence. ');
-  await new Promise(r => setTimeout(r, 2500));
+  await new Promise(r => setTimeout(r, 2500));      // an absence: a fixed window is right
   const mid = [...seen];
   sp.push('Two sentence. Three.');
   sp.flush();
-  await new Promise(r => setTimeout(r, 4000));
-  return { mid, all: seen };
+  const t0 = performance.now(), deadline = t0 + 20000;
+  while (performance.now() < deadline && !seen.includes('idle')) {
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return { mid, all: seen, ms: Math.round(performance.now() - t0) };
 })()`);
 ok(!states.mid.includes('idle'), `speaker: no false "finished" between sentences (${JSON.stringify(states.mid)})`);
-ok(states.all.includes('idle'), `speaker: reports finished once flushed (${JSON.stringify(states.all)})`);
+ok(states.all.includes('idle'),
+  `speaker: reports finished once flushed (${JSON.stringify(states.all)}, ${states.ms}ms)`);
 
 // --- the loop ---
 /** Open Voice mode and watch it go round once. Returns the observed phases. */
