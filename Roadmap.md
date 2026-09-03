@@ -56,17 +56,28 @@ reason each one earns its slot.
 | 3 | **B5** — mark untrusted content | M | Promoted now that **B4** has shipped. The network half of the injection story is closed — the agent can no longer be *pointed* at this host — but a fetched page's text still arrives in the same context as tool access, unmarked. That is the half that is left. |
 | 4 | **B3** — finish rolling out `json_schema` | S | ✅ Down from 22 sites to **10**, across 5 modules (`learn` ×5, `vault` ×2, `comfy`, `financeai`, `mail`). The finish line is close enough to be worth crossing. |
 | 5 | **C1** — notification center | M | ✅ `server/notify.js` is still **34 lines**. Every long-running seam already emits events; nothing surfaces them. Highest felt-quality-per-hour in the UI, and **H1** wants it too. |
-| 6 | **B9** — harden the auth token | S | ✅ Re-confirmed 2026-08-30, `server/index.js:81`: still a plain `token === c.auth.token`, no attempt limiting, no log, and not a constant-time compare. An evening, and **H4** raises the stakes: synthetic input behind a brute-forcible token is a different risk class. |
+| 6 | ~~**B9** — harden the auth token~~ | S | ✅ **Shipped 2026-09-03** with remote access, which forced it. `server/auth.js`: constant-time compare, per-IP backoff, logged refusals, and the WebSocket upgrade sharing the counter. |
 | 7 | **C2** — wire up `density` | S | ✅ Re-confirmed 2026-08-30: still defined in `config.js` and read by **nothing**. Genuinely an evening, immediately visible on a laptop screen. |
 | 8 | **C14** — nothing on screen says something is running | S | Research, agent turns and bench sweeps all run for minutes with no global sign of life. Cheap, and every long-running seam already emits the events it would need. |
 | 9 | **C3** — global Ctrl+K search | M | ✅ `server/search.js` still absent; FTS5 + trigram verified available in `node:sqlite`. The palette finds apps, not the chat from Tuesday. |
 | 10 | **A5** — one SQLite helper, not four | S | Turns **B2** from a four-file change into one, and **§F**'s `jobs.db` would be the fifth copy of the same 60 lines. |
 
-**Retired from this list because they shipped:** **B4** and **B7** (both 2026-08-30 — the SSRF
-guard, and the `engines` pin with its boot guard; see below), **B1** (the `sendFile`/`h()` race —
-fixed and pinned by an audit check 2026-08-18) and **D2** (the MCP client — `server/mcp.js` has
-been complete since 2026-07-29, with a Settings tab, presets and an audit check; it sat at #3 of
-this table for three weeks after it was done).
+**Retired from this list because they shipped:** **B9** and **C7** (both 2026-09-03 — the auth
+hardening and the phone shell; see *Recently shipped*), **B4** and **B7** (both 2026-08-30 — the
+SSRF guard, and the `engines` pin with its boot guard; see below), **B1** (the `sendFile`/`h()`
+race — fixed and pinned by an audit check 2026-08-18) and **D2** (the MCP client —
+`server/mcp.js` has been complete since 2026-07-29, with a Settings tab, presets and an audit
+check; it sat at #3 of this table for three weeks after it was done).
+
+**New, from building remote access** — worth a slot next time this list is cut:
+- **Web Push to a locked phone (C8).** Now genuinely reachable: the tailnet's HTTPS origin is a
+  secure context with a stable name, which is exactly what the Push API requires and what `/m`
+  never had. This is the piece that would make an agent approval or a finished research run
+  reach you rather than wait to be noticed.
+- **A remote-scope switch.** Everything is currently all-or-nothing once paired. A mode where a
+  request that did not come from the LAN cannot reach the terminal or agent file-writes would
+  make a lost unlocked phone a much smaller problem. `auth.classify()` already returns the
+  source, so the gate has somewhere to live.
 
 ## What AIOS already is (don't re-suggest these)
 
@@ -134,6 +145,57 @@ three runtime dependencies, **88 tools**, 17 registered apps. On a provider abst
   checks**, mock-provider driven, ✅ all green 2026-08-18.
 
 ### Recently shipped
+
+**2026-09-03 — the hub leaves the house: Tailscale, a hardened door, and a phone shell that is the whole thing**
+
+`/m` did receipts and nothing else, and the hub was reachable only from the LAN. Both halves
+of **C7** ("the LAN-broadcast use case *is* phones, and `/m` proves the appetite — but `/m` only
+does receipts") are now done, and **B9** shipped with them because it had to.
+
+- ✨ **Remote access over Tailscale** (`server/remote.js`, `npm run remote-setup`). A private
+  WireGuard mesh rather than a tunnel: AIOS is never placed on the public internet, and the
+  `<host>.<tailnet>.ts.net` name is permanent. `tailscale serve` fronts :7777 with a real
+  certificate, managed from Settings → Remote or the setup script. Every shell-out is
+  `execFile` with an argv array, and the module never escalates — the two commands that need
+  root are printed for the user to run.
+- 🔒 **The certificate is the feature, not the polish.** Two things on a phone need a *secure
+  context* and silently do not exist without one: `getUserMedia` — so **voice has never worked
+  on a phone over the LAN's plain http**, and the failure mode is that `navigator.mediaDevices`
+  is `undefined` rather than a permission being denied — and a stable origin for Add to Home
+  Screen. Settings now reports `isSecureContext` and microphone availability directly, so this
+  is legible instead of mysterious, and Chat *hides* the mic button rather than offering one
+  that can only throw.
+- ✅ **B9 shipped — the auth token is no longer a free brute-force target** (`server/auth.js`).
+  `crypto.timingSafeEqual` over equal-length buffers, a per-IP failure counter with exponential
+  backoff (3 free tries, then 1s doubling to 15m), and a logged line per refusal with the
+  source classified — `local` / `tailnet` (100.64.0.0/10) / `lan` / `remote`. **The WebSocket
+  upgrade shares the same counter**, which was the part worth getting right: `api.js` reconnects
+  on close, so an unpaired client hammers `/ws`, not `/api`, and a REST-only lockout would have
+  left the socket as an unguarded oracle. A locked-out caller is refused *even holding the right
+  token*, so tripping the lockout cannot confirm a guess.
+- ✨ **The phone shell is now the hub** (`web/js/mobile/`): a tab bar over Home · Chat · Money ·
+  Tasks, with Notes, Files, Agent, Terminal and Settings behind More. Screens are lazily
+  imported, so first paint does not pay for the markdown renderer. Chat speaks the same
+  protocol the desktop does — the same transcript file, the same confirmation cards (Confirm
+  deliberately on its own row, never adjacent to Discard). Agent surfaces **approvals**, which
+  is the feature that earns the screen: a run blocked on a file write is idle until someone
+  says yes, and that no longer has to be at the desk.
+- **Terminal is a log pane and a text field, not xterm.js.** The vendored emulator is 289KB and
+  assumes a keyboard, a mouse, and a window a soft keyboard does not eat. What the job actually
+  is away from a desk is `systemctl restart`, `git pull`, `df -h`, read the answer — so ANSI is
+  stripped rather than interpreted, and the keys a phone keyboard lacks (Tab, ^C, ^D, arrows)
+  are a scrollable row. Leaving the screen kills the PTY.
+- **The QR encoder is 200 lines of ours** (`web/js/mobile/qr.js`) because the pairing link
+  *contains the pairing token*: every "just use a QR API" option works by sending that string
+  to someone else's server. Verified module-for-module against the `qrcode` reference across
+  all 8 masks (`npm run qr-check`, 40 fixtures). It shipped with the format bits written
+  LSB-first — a code with correct finders, timing and data that simply never scans — which is
+  exactly the class of bug that only a reference comparison finds.
+- 🧪 **Two new suites.** `mobile-ui.e2e.mjs` opens every screen at a 390x844 phone viewport and
+  operates the controls (74 checks) — the shell's screens are *lazy* imports, so a bad one fails
+  the first time a thumb lands on that tab, not at boot. `remote-auth.e2e.mjs` (19 checks) drives
+  the lockout over both doors. `receipts.js` became a mounted module rather than a page that
+  boots itself, keeping its iOS picker handling intact.
 
 **2026-08-30 (later) — the words now appear while you are still saying them**
 
@@ -1001,11 +1063,12 @@ llama.cpp `/props` (`n_ctx`) or Ollama `/api/show` when a model is selected and 
 `/props` in the Models app — `llamaBusy()` already reads `/slots` for routing.
 *Hook:* `server/config.js:contextBudget`, `server/llmctl.js`.
 
-**B9. ✨ Harden the auth token — S.** ✅ **Re-confirmed 2026-08-18** at `server/index.js:71` —
-`token === c.auth.token`, with **no attempt limiting** anywhere. On a LAN that is mostly fine; on a LAN with guests it is a
-brute-forcible 24-char secret with unlimited tries and no log. Use `crypto.timingSafeEqual` on
-equal-length buffers, add a per-IP failure counter with backoff, and log failures.
-*Hook:* `server/index.js:authorized`.
+**B9. ✅ Harden the auth token — DONE 2026-09-03.** Moved out of `server/index.js` into
+`server/auth.js`: `crypto.timingSafeEqual`, a per-IP failure counter with exponential backoff,
+and a logged refusal with the source classified. Forced by **remote access** — the moment the hub
+is reachable from outside the house, this path is the whole security model. The half that was not
+in the original description and mattered most: **the WebSocket upgrade shares the counter**, since
+a reconnecting client hammers `/ws` rather than `/api`. Covered by `scripts/e2e/remote-auth.e2e.mjs`.
 
 **B10. ✨ SearXNG engine auto-tuning — S.** Brave/DDG rate-limit fast and stall queries. Track
 per-engine failure rates in `webSearch` and auto-disable a persistently failing engine for a
@@ -1109,10 +1172,13 @@ instead of only the server console. **B17** makes this mostly a rendering job.
 finding a toggle means scrolling. Add a filter box that jump-scrolls to matching settings, and
 split the file per-tab so it stays maintainable. *Hook:* `web/js/apps/settings.js`.
 
-**C7. ✨ Finish the mobile pass — M.** The ≤760px breakpoint exists but the Planner week strip,
-Studio, and the Bench/Models tables overflow. One pass: swipeable Planner day columns,
-single-pane Bench/Models, bigger touch targets. The LAN-broadcast use case *is* phones, and `/m`
-proves the appetite — but `/m` only does receipts. *Hook:* `web/css/apps.css` breakpoints.
+**C7. ✅ Finish the mobile pass — DONE 2026-09-03**, by the other route. Rather than making the
+desktop shell survive a 390px viewport, `/m` grew into the full hub: a tab bar over Home · Chat ·
+Money · Tasks with Notes, Files, Agent, Terminal and Settings behind More. That is the better
+trade — a phone-first document can be opinionated about touch targets and a soft keyboard in a
+way a responsive desktop layout cannot. **Still open on the desktop side:** the ≤760px
+breakpoint remains untidy for the Planner week strip, Studio, and the Bench/Models tables, which
+now matters only for a tablet or a narrow window. *Hook:* `web/css/apps.css` breakpoints.
 
 **C8. ✨ PWA offline shell + real push — M.** `web/sw.js` is a deliberate no-op passthrough, so
 the phone view is installable but not resilient: a dropped Wi-Fi connection gives a blank page

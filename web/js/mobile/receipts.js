@@ -1,5 +1,11 @@
-// Phone view: photograph receipts, let the AIOS box read them, file them under
+// Receipt capture: photograph a receipt, let the AIOS box read it, file it under
 // Finances. Served only at /m — the desktop shell never loads this.
+//
+// This began as the whole of /m and booted itself on import. It is now a screen
+// MOUNTED by the shell (see screens/money.js), so the boot, the theming, the
+// service-worker registration and the pairing sheet all moved up to app.js — there
+// must be exactly one of each. What stayed is everything genuinely specific to
+// photographing a receipt on an iPhone, which is the hard-won part.
 //
 // The iPhone-specific photo handling (HEIC, EXIF rotation, downscaling before upload)
 // now lives in ../imageprep.js, shared with the desktop shell's attach points — the
@@ -7,13 +13,13 @@
 // receipt photographed from the desktop view used to fail. What stays here is the
 // iOS *picker* handling, which is genuinely specific to this screen: see makePicker().
 
-import { get, post, patch, setToken, uploadBlob } from '../api.js';
-import { applyPalette } from '../themes.js';
+import { get, post, patch, uploadBlob } from '../api.js';
 import { IMAGE_ACCEPT, prepareImage, isImageFile, undecodableHint } from '../imageprep.js';
+import { el, svg, toast } from './ui.js';
 
 const MAX_BATCH = 12;        // server caps attachments at 12 per message
 
-const app = document.getElementById('m-app');
+let app = null;   // set by mount()
 
 const state = {
   currency: 'JPY',
@@ -26,39 +32,13 @@ const state = {
   seq: 0,
 };
 
-// ---------- tiny DOM helper (mobile.html loads no shared UI code) ----------
+// ---------- icons ----------
 
-function el(tag, attrs = {}, ...kids) {
-  const n = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (v === null || v === undefined || v === false) continue;
-    if (k === 'class') n.className = v;
-    else if (k === 'style' && typeof v === 'object') Object.assign(n.style, v);
-    else if (k.startsWith('on') && typeof v === 'function') n.addEventListener(k.slice(2), v);
-    else if (k === 'html') n.innerHTML = v;
-    else n.setAttribute(k, v);
-  }
-  for (const c of kids.flat(Infinity)) {
-    if (c === null || c === undefined || c === false) continue;
-    n.append(typeof c === 'string' || typeof c === 'number' ? document.createTextNode(String(c)) : c);
-  }
-  return n;
-}
-
-const svg = (d, extra = '') => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-  stroke-linecap="round" stroke-linejoin="round" ${extra}>${d}</svg>`;
 const ICON_CAMERA = svg('<path d="M3 8.5A2.5 2.5 0 0 1 5.5 6h1.2a2 2 0 0 0 1.7-.95l.5-.8A2 2 0 0 1 10.6 3h2.8a2 2 0 0 1 1.7 1.25l.5.8A2 2 0 0 0 17.3 6h1.2A2.5 2.5 0 0 1 21 8.5v9A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5z"/><circle cx="12" cy="13" r="3.4"/>');
 const ICON_LIBRARY = svg('<rect x="3" y="4" width="18" height="15" rx="2.5"/><path d="M3 15.5l4.5-4.2a2 2 0 0 1 2.7 0L15 15.5"/><circle cx="15.5" cy="8.5" r="1.6"/>');
 
-let toastTimer = null;
-function toast(msg, kind = '') {
-  document.querySelector('.m-toast')?.remove();
-  const node = el('div', { class: 'm-toast' + (kind ? ' is-' + kind : '') }, msg);
-  document.body.append(node);
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => node.remove(), kind === 'err' ? 5200 : 2600);
-}
-
+// Receipts are filed in one currency at a time and JPY has no minor unit, so this
+// stays local rather than using ui.js's money() — the ledger's own formatting.
 const money = (n) => `${state.currency} ${Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
 
 // ---------- flow ----------
@@ -185,15 +165,6 @@ async function applyReceipt(item, mode) {
 
 // ---------- data ----------
 
-/** Match the desktop's palette. Without this the phone renders whatever :root
- *  defaults to (light), which looks broken next to a dark AIOS. */
-function paint(appearance) {
-  const dark = applyPalette(appearance || {});
-  // Keep the iOS status bar / theme-color in step with the resolved palette.
-  const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
-  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', bg || (dark ? '#262624' : '#efede4'));
-}
-
 async function loadContext() {
   try {
     const [sum, cats, cfg] = await Promise.all([
@@ -201,15 +172,15 @@ async function loadContext() {
       state.categories.length ? Promise.resolve(null) : get('/finance/categories'),
       state.appearance ? Promise.resolve(null) : get('/config').catch(() => null),
     ]);
-    if (cfg?.appearance) { state.appearance = cfg.appearance; paint(cfg.appearance); }
+    if (cfg?.appearance) state.appearance = cfg.appearance;
     state.currency = sum.currency || state.currency;
     state.monthSpent = sum.spent;
     if (cats) state.categories = cats.expense || [];
     state.online = true;
   } catch (e) {
     state.online = false;
-    if (/unauthor/i.test(e.message)) return renderPairing();
-    toast(e.message, 'err');
+    // A 401 already raised aios:unauthorized inside api.js; the shell owns that sheet.
+    if (!/unauthor/i.test(e.message)) toast(e.message, 'err');
   }
   render();
 }
@@ -330,10 +301,7 @@ function makePicker({ capture, multiple }) {
   return input;
 }
 
-const pickers = {
-  camera: makePicker({ capture: true }),
-  library: makePicker({ multiple: true }),
-};
+const pickers = { camera: null, library: null };
 
 function captureBar() {
   const busy = isBusy();
@@ -591,44 +559,33 @@ function mediaSrc(p) {
   return '/api' + p + (t ? (p.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(t) : '');
 }
 
-function renderPairing() {
-  app.innerHTML = '';
-  const input = el('input', {
-    type: 'text', placeholder: 'pairing token', autocapitalize: 'off',
-    autocorrect: 'off', spellcheck: 'false',
-  });
-  app.append(el('div', { class: 'm-pair' },
-    el('h2', {}, 'Pair with AIOS'),
-    el('p', {}, 'Open Settings on the desktop to copy the pairing token, or use the LAN link AIOS prints when it starts — that link carries the token for you.'),
-    input,
-    el('button', {
-      class: 'm-btn-big is-primary',
-      onclick: async () => {
-        const v = input.value.trim();
-        if (!v) return toast('Enter the token', 'err');
-        setToken(v);
-        state.online = null;
-        await loadContext();
-        if (state.online) { loadRecent(); toast('Paired', 'ok'); }
-      },
-    }, 'Connect')));
+// ---------- mount ----------
+
+/**
+ * Render receipt capture into `host`. Returns { unmount }.
+ *
+ * The file inputs are parked in <body> ONCE per mount and removed on unmount: an
+ * <input type=file> detached while its picker is open never fires `change` on iOS,
+ * and render() replaces this screen's whole subtree on every state change.
+ */
+export function mount(host) {
+  app = host;
+  if (!pickers.camera) {
+    pickers.camera = makePicker({ capture: true });
+    pickers.library = makePicker({ multiple: true });
+  }
+  render();
+  loadContext().then(() => { if (state.online) loadRecent(); });
+  return {
+    unmount() {
+      for (const k of Object.keys(pickers)) { pickers[k]?.remove(); pickers[k] = null; }
+      app = null;
+    },
+  };
 }
 
-// ---------- boot ----------
-
-document.addEventListener('aios:unauthorized', renderPairing);
-
-// Follow the OS preference for the very first frame, then switch to the user's
-// configured AIOS theme once /config comes back — otherwise the page flashes
-// light on a dark phone.
-paint({ theme: 'system' });
-matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => paint(state.appearance));
-
-// Paint the shell immediately — waiting on the first request means a blank screen
-// for as long as the LAN round trip takes.
-render();
-loadContext().then(() => { if (state.online) loadRecent(); });
-
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch(() => { });
+/** Re-fetch the month total and the recent list — the shell's pull-to-refresh. */
+export async function refresh() {
+  await loadContext();
+  if (state.online) await loadRecent();
 }

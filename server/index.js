@@ -51,6 +51,8 @@ import * as financeai from './financeai.js';
 import * as items from './items.js';
 import * as voice from './voice.js';
 import * as interview from './interview.js';
+import * as remote from './remote.js';
+import * as auth from './auth.js';
 import { gpuStats } from './gpu.js';
 
 const cfg = loadConfig();
@@ -69,19 +71,12 @@ app.disable('x-powered-by');
 app.use('/api', express.json({ limit: '60mb' }));
 
 // ---------- auth ----------
+//
+// The check itself lives in auth.js: constant-time compare, a per-IP failure counter
+// with exponential backoff, and a log line per refusal (Roadmap B9). It moved out of
+// this file when the hub became reachable from outside the LAN — see remote.js.
 
-function authorized(req) {
-  const c = loadConfig();
-  if (c.auth.required === 'never') return true;
-  const ip = req.socket?.remoteAddress || '';
-  const local = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
-  if (c.auth.required === 'lan' && local) return true;
-  const url = new URL(req.url, 'http://x');
-  const token = (req.headers?.authorization || '').replace(/^Bearer\s+/i, '') || url.searchParams.get('token') || '';
-  return token.length > 0 && token === c.auth.token;
-}
-
-app.use('/api', (req, res, next) => authorized(req) ? next() : res.status(401).json({ error: 'unauthorized' }));
+app.use('/api', auth.middleware);
 
 const h = (fn) => async (req, res) => {
   try {
@@ -116,6 +111,23 @@ app.get('/api/config/token', h((req) => {
   if (!local) throw Object.assign(new Error('token is only shown on localhost'), { status: 403 });
   return { token: loadConfig().auth.token, urls: lanUrls(true) };
 }));
+
+// ---------- remote access ----------
+// Reaching the hub from outside the house, over Tailscale. See server/remote.js for
+// why the HTTPS half matters (the phone microphone does not exist without it).
+
+app.get('/api/remote/status', h(async (req) => {
+  const s = await remote.status({ fresh: req.query.fresh !== undefined });
+  // The pairing links carry the token, so they are localhost-only for the same reason
+  // /api/config/token is: anyone already holding the token learns nothing, and anyone
+  // who is not must not be handed one.
+  const local = auth.classify(req.socket?.remoteAddress || '') === 'local';
+  return { ...s, source: req.authSource || null, pairing: local ? remote.pairingUrls(s, loadConfig().auth.token) : [] };
+}));
+app.post('/api/remote/serve', h(async (req) => (
+  req.body?.on === false ? remote.disableServe() : remote.enableServe()
+)));
+app.get('/api/remote/lockouts', h(() => auth.lockoutReport()));
 app.get('/api/models', h(() => listModels()));
 app.get('/api/services', h(() => probeServices()));
 
@@ -746,7 +758,16 @@ learn.setPublisher(publish);
 
 server.on('upgrade', (req, socket, head) => {
   if (!req.url.startsWith('/ws')) return socket.destroy();
-  if (!authorized(req)) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); return socket.destroy(); }
+  // Same check as REST, so the lockout counts a socket that keeps retrying with a bad
+  // token. A reconnecting client is the loop that would otherwise brute-force for free:
+  // api.js retries on close, so an unauthorised phone hammers this path, not /api.
+  const a = auth.check(req);
+  if (!a.ok) {
+    socket.write(a.reason === 'locked out'
+      ? `HTTP/1.1 429 Too Many Requests\r\nRetry-After: ${a.retryAfter}\r\n\r\n`
+      : 'HTTP/1.1 401 Unauthorized\r\n\r\n');
+    return socket.destroy();
+  }
   wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
 });
 
@@ -865,7 +886,7 @@ mcp.startEnabled();
 try { receipts.backfillFingerprints(); }
 catch (e) { console.error('[receipts] could not index existing scans:', e.message); }
 
-server.listen(cfg.server.port, cfg.server.host, () => {
+server.listen(cfg.server.port, cfg.server.host, async () => {
   const urls = lanUrls(true);
   console.log(`
   ╭──────────────────────────────────────────────────────╮
@@ -878,6 +899,20 @@ ${urls.slice(1).map(u => `  On your LAN  :  ${u}`).join('\n') || '  (no LAN inte
   LAN links include the pairing token (auth mode: ${cfg.auth.required}).
   Data lives in ${DATA}
 `);
+
+  // Away-from-home reachability, printed after the banner so the LAN links appear
+  // immediately — probing tailscaled forks a process and must not delay boot.
+  try {
+    const s = await remote.status({ fresh: true });
+    if (s.serve.on) {
+      const pair = remote.pairingUrls(s, loadConfig().auth.token)[0];
+      console.log(`  Away from home :  ${pair?.url || s.url}   (Tailscale, HTTPS — mic + install work)\n`);
+    } else if (s.loggedIn) {
+      console.log(`  Away from home :  ${s.url}  — HTTPS is off; Settings → Remote, or \`npm run remote-setup\`\n`);
+    } else if (s.hint) {
+      console.log(`  Away from home :  not set up — ${s.hint}${s.hintCmd ? `  →  ${s.hintCmd}` : ''}\n`);
+    }
+  } catch { /* remote access is optional; never let it break boot */ }
 });
 
 // MCP servers are our child processes; leaving them running would orphan them.

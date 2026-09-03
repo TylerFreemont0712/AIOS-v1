@@ -1,7 +1,7 @@
 {
   "name": "aios",
   "version": "0.1.0",
-  "description": "AIOS \u2014 a personal AI operating hub: desktop shell, agentic coding, projects, Obsidian second brain, mindmaps, local + cloud models, LAN broadcast.",
+  "description": "AIOS — a personal AI operating hub: desktop shell, agentic coding, projects, Obsidian second brain, mindmaps, local + cloud models, LAN broadcast.",
   "type": "module",
   "main": "server/index.js",
   "engines": {
@@ -19,7 +19,9 @@
     "voice": "node scripts/voice-setup.mjs",
     "seed-wiki": "node scripts/seed-wiki.mjs",
     "voice-bench": "node scripts/voice-bench.mjs",
-    "receipt-bench": "node scripts/receipt-bench.mjs"
+    "receipt-bench": "node scripts/receipt-bench.mjs",
+    "remote-setup": "node scripts/remote-setup.mjs",
+    "qr-check": "node scripts/qr-check.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.112.4",

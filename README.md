@@ -15,7 +15,8 @@ npm start         # serves http://localhost:7777 and your LAN IP
 ```
 
 The console prints your addresses. The LAN link includes a pairing token —
-open it on any other computer/tablet on your network and it just works.
+open it on any other computer/tablet on your network and it just works. Phones get a
+purpose-built shell at `/m`; `npm run remote-setup` extends that to anywhere you are.
 
 ---
 
@@ -538,16 +539,62 @@ graph. AI-generated notes land in a configurable `AI Wiki/` folder with frontmat
 marking their provenance, densely wikilinked so they weave into your graph.
 "Ask vault" retrieves your most relevant notes and answers with `[[citations]]`.
 
+## On your phone, and away from home
+
+`/m` is the whole hub in a phone-shaped document — a tab bar over **Home · Chat ·
+Money · Tasks**, with **Notes, Files, Agent, Terminal** and **Settings** behind More.
+A phone user-agent hitting `/` is redirected there (`?desktop=1` opts out). It shares
+nothing with the desktop shell but `theme.css`, `api.js`, `themes.js` and
+`imageprep.js`, so it can be opinionated about touch targets and the soft keyboard
+without moving a desktop pixel.
+
+The screen worth calling out is **Agent**: a run blocked on a file write is idle until
+someone approves it, and approving from a train turns a two-hour gap into two minutes.
+
+### Reaching it from outside the house
+
+```
+npm run remote-setup      # checks, configures, and tells you what needs sudo
+```
+
+The transport is **Tailscale** — a private WireGuard mesh, so AIOS is never placed on
+the public internet the way a port-forward or a tunnel would. Your machine keeps a
+permanent `<host>.<tailnet>.ts.net` name, and `tailscale serve` fronts port 7777 with a
+real certificate. Install the Tailscale app on your phone, sign into the same account,
+and open the link the setup script prints.
+
+**The certificate is the point, not the polish.** Two things on a phone need a *secure
+context* and silently do not exist without one:
+
+- **The microphone.** `getUserMedia` is not *denied* over plain http — it is **absent**,
+  so voice has never worked on a phone over the LAN. Chat hides the mic button rather
+  than offering one that can only throw.
+- **Add to Home Screen.** The PWA is pinned to an origin, so a stable HTTPS name is what
+  makes the install stick.
+
+Settings → Remote shows both live (`isSecureContext`, microphone availability), turns
+HTTPS on and off, and offers a **QR code** for pairing another device. That code is
+generated on the box: the pairing link contains the token, so handing it to a QR web
+service would be handing away access.
+
 ## LAN broadcast & security
 
-- The server binds `0.0.0.0`; startup prints `http://<your-ip>:7777/?token=…` links.
+- The server binds `0.0.0.0`; startup prints `http://<your-ip>:7777/?token=…` links,
+  and — once Tailscale is set up — the away-from-home address too.
 - Default auth mode **Token for LAN**: localhost is open, any other device must
   present the pairing token (the `?token=` link stores it in that browser).
   Settings → Network can switch to *Token always* or *Open*, reveal the token
   (localhost-only endpoint), or rotate it.
-- Treat the token like a password: anyone on your LAN with it gets your terminal.
-  Don't port-forward AIOS to the internet as-is — put it behind a VPN (Tailscale
-  works great) or a reverse proxy with real auth + TLS.
+- **Guessing the token is rate-limited.** `server/auth.js` compares with
+  `crypto.timingSafeEqual`, counts failures per IP with exponential backoff (three free
+  tries, then 1s doubling to 15 minutes), and logs every refusal with the source
+  classified as `local` / `tailnet` / `lan` / `remote`. The **WebSocket upgrade shares
+  that counter** — the browser reconnects automatically on close, so an unpaired client
+  hammers `/ws` rather than `/api`. While locked out, even the *correct* token is
+  refused, so tripping the lockout cannot be used to confirm a guess.
+- Treat the token like a password: anyone holding it gets your terminal. Don't
+  port-forward AIOS to the internet as-is — `npm run remote-setup` puts it on your
+  tailnet instead, where it is reachable only by devices signed into your own account.
 - **The agent cannot be pointed back at this machine.** `fetch_url`, `crawl_site` and
   Research's PDF reader take their URL from the model, and the model takes its ideas
   from the page it just read — so every fetch resolves the hostname first and refuses
@@ -561,7 +608,9 @@ marking their provenance, densely wikilinked so they weave into your graph.
 
 ```
 server/            zero-build Node (ESM), no framework beyond express + ws
-  index.js         HTTP + static + REST + WebSocket hub + auth
+  index.js         HTTP + static + REST + WebSocket hub
+  auth.js          the door: constant-time token compare, per-IP lockout, refusal log
+  remote.js        away-from-home access over Tailscale (+ `tailscale serve` HTTPS)
   config.js        data/config.json, defaults, token
   llm.js           provider abstraction: one event stream over 3 wire protocols
   agent.js         session store + agentic tool loop + approval gate + self-check + memory
@@ -595,7 +644,11 @@ web/               no build step — vanilla ES modules
   js/voice.js      mic capture, silence detection, spectrum, streaming playback
   js/voicemode.js  the hands-free conversation overlay (HUD + transcript)
   js/voiceviz.js   the canvas avatar: radial spectrum, rings, state colour
-  js/mobile/       the phone view at /m (receipt capture) · js/imageprep.js shared intake
+  js/mobile/       the phone shell at /m — app.js (router + tabs), ui.js (primitives),
+                   md.js, qr.js (local QR, because the pairing link holds the token),
+                   receipts.js (capture), screens/*.js (home, chat, money, tasks,
+                   notes, files, agent, terminal, settings)
+  js/imageprep.js  shared photo intake (HEIC decode, EXIF rotate, downscale)
   vendor/          self-contained bundles (CodeMirror 6, marked+DOMPurify+hljs, xterm)
 skills/            coding playbooks (markdown) injected into the agent by stack
 Roadmap.md         idea bucket for future features
@@ -603,6 +656,7 @@ data/              your stuff (gitignored): config, chats, agent sessions, resea
                    uploads, comfy renders, and four SQLite stores: learn, bench,
                    finance, plus per-project .aios/ memory
 scripts/           build-vendor.mjs · check.mjs · audit.mjs · toolcheck.mjs · e2e.mjs
+                   remote-setup.mjs (`npm run remote-setup`) · qr-check.mjs (+fixtures)
                    searxng.mjs · voice-setup.mjs (`npm run voice`)
                    voice/worker.py (the long-lived speech process)
                    gguf/split_omni_gguf.py (single-file omni GGUF → text + mmproj)
