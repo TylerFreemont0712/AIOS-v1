@@ -787,3 +787,114 @@ html, body {
 .m-btn.is-danger { color: var(--err); }
 .m-btn.is-ghost { background: none; border-color: transparent; }
 .m-actions .m-btn { flex: 1; }
+
+/* ---------- Money · Main (stacked figures) ----------
+   Deliberately NOT the three-across grid Home uses. This screen exists to be read
+   at arm's length, so each figure gets a full-width row: label small above, number
+   large, and the context that makes it mean something on the line beneath. */
+
+.m-bignums { display: flex; flex-direction: column; gap: 2px; }
+.m-bignum {
+  padding: 13px 14px; background: var(--surface-2); border-radius: 12px;
+  border-left: 3px solid var(--border-strong);
+}
+.m-bignum.is-in { border-left-color: var(--ok); }
+.m-bignum.is-out { border-left-color: color-mix(in srgb, var(--accent) 70%, transparent); }
+.m-bignum-l {
+  font-size: 10.5px; font-weight: 650; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--muted);
+}
+.m-bignum-v {
+  font-size: 27px; font-weight: 660; letter-spacing: -.02em; line-height: 1.15;
+  font-variant-numeric: tabular-nums; margin-top: 3px;
+}
+.m-bignum.is-in .m-bignum-v { color: var(--ok); }
+.m-bignum-v.is-pending { color: var(--warn); }
+.m-bignum-s { font-size: 11.5px; color: var(--faint); margin-top: 4px; line-height: 1.45; }
+.m-note.m-faint { color: var(--faint); font-size: 11px; }
+.m-boxrow-v.is-faint { color: var(--faint); }
+
+/* progress + comparison bars */
+.m-bar {
+  height: 7px; border-radius: 4px; background: var(--surface-3);
+  overflow: hidden; margin-top: 7px;
+}
+.m-bar-fill {
+  height: 100%; border-radius: 4px; background: var(--accent);
+  transition: width .3s ease-out;
+}
+.m-bar-fill.is-in { background: var(--ok); }
+.m-bar-fill.is-ok { background: var(--ok); }
+.m-bar-fill.is-over { background: var(--err); }
+.m-bars { display: flex; flex-direction: column; gap: 11px; }
+.m-barrow-top { display: flex; align-items: baseline; gap: 10px; font-size: 12.5px; }
+.m-barrow-l { flex: 1; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.m-barrow-v { flex: none; color: var(--muted); font-variant-numeric: tabular-nums; }
+.m-barrow-v.is-in { color: var(--ok); }
+.m-barrow-v.is-out { color: var(--err); }
+.m-goal-row { display: flex; align-items: baseline; gap: 8px; }
+.m-goal-now { font-size: 22px; font-weight: 660; font-variant-numeric: tabular-nums; }
+.m-goal-of { font-size: 12.5px; color: var(--muted); }
+.m-row-amt.is-pending { color: var(--warn); }
+
+/* ---------- Money · templates ----------
+   First thing on the Log tab, and sized like it: the whole point is that logging a
+   repeat is one tap, so the target is a card rather than a chip. */
+
+.m-tpls { display: flex; flex-direction: column; gap: 7px; }
+.m-tpl {
+  display: flex; align-items: stretch; gap: 0;
+  background: var(--surface-2); border-radius: 12px; overflow: hidden;
+  border-left: 3px solid var(--border-strong);
+}
+.m-tpl.is-in { border-left-color: var(--ok); }
+.m-tpl.is-out { border-left-color: color-mix(in srgb, var(--accent) 70%, transparent); }
+.m-tpl-main {
+  flex: 1; min-width: 0; text-align: left; padding: 13px 14px;
+  border: 0; background: none; color: var(--text); font-family: inherit; cursor: pointer;
+}
+.m-tpl-main:active { background: var(--surface-3); }
+.m-tpl-name { font-size: 16px; font-weight: 600; line-height: 1.25; }
+.m-tpl-meta { font-size: 11.5px; color: var(--muted); margin-top: 3px; font-variant-numeric: tabular-nums; }
+.m-tpl-edit {
+  flex: none; width: 46px; border: 0; border-left: 1px solid var(--border);
+  background: none; color: var(--faint); cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.m-tpl-edit:active { background: var(--surface-3); color: var(--text); }
+.m-tpl-edit svg { width: 17px; height: 17px; }
+.m-tpl-total {
+  font-size: 19px; font-weight: 650; font-variant-numeric: tabular-nums;
+  color: var(--accent); min-height: 24px; margin: 2px 0 6px;
+}
+
+/* currency sits beside the amount rather than on its own row — it is a modifier of
+   the number, and a full-width select for three letters wastes the screen */
+.m-cur {
+  flex: none; width: auto; min-width: 78px; padding-right: 6px !important;
+  font-weight: 600; font-variant-numeric: normal;
+}
+.m-conv {
+  font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums;
+  min-height: 16px; margin-top: -4px;
+}
+
+/* ---------- checkbox-style toggle ---------- */
+
+.m-toggle {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  padding: 11px 12px; min-height: 46px;
+  border: 0; border-radius: 11px; background: var(--surface-2);
+  color: var(--text); font-family: inherit; font-size: 14px; cursor: pointer;
+  -webkit-appearance: none;
+}
+.m-toggle:active { background: var(--surface-3); }
+.m-toggle-box {
+  flex: none; width: 22px; height: 22px; border-radius: 6px;
+  border: 1.5px solid var(--border-strong); background: none; color: transparent;
+  display: flex; align-items: center; justify-content: center;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.m-toggle-box svg { width: 14px; height: 14px; }
+.m-toggle.is-on .m-toggle-box { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.m-toggle-l { flex: 1; }

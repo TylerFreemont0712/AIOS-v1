@@ -172,6 +172,9 @@ await evalJs(`(() => {
 
 const tapTab = (name) => `[...document.querySelectorAll('.m-tab')].find(b => b.getAttribute('aria-label') === '${name}')?.click()`;
 const screenIs = (id) => evalJs(`!!document.querySelector('.m-screen[data-screen=${id}]')`);
+// The view switcher inside a screen (Money's Main/Log/Recent/Capture), as opposed to
+// the tab bar — matched on the top-level .m-seg so a nested one cannot be hit.
+const segClick = (label) => `[...document.querySelectorAll('.m-seg > .m-seg-b')].find(b => b.textContent === '${label}')?.click()`;
 
 await shot('01-home');
 ok(await evalJs(`!!document.querySelector('.m-hero-greet')`), 'home greets by time of day');
@@ -214,30 +217,151 @@ await step('close the sheet', `document.querySelector('.m-sheet-wrap')?.click()`
 await step('open the model picker', `document.querySelector('.m-head-btn[aria-label=Model]')?.click()`, 800);
 await step('close the model picker', `document.querySelector('.m-sheet-wrap')?.click()`, 500);
 
-await step('open Money', tapTab('Money'), 1800);
+await step('open Money', tapTab('Money'), 2000);
 ok(await screenIs('money'), 'money screen mounted');
-ok(await evalJs(`!!document.querySelector('.m-capture')`), 'capture view mounted inside Money');
-await shot('03-money-capture');
 
-await step('Money → Recent', `[...document.querySelectorAll('.m-seg-b')].find(b => b.textContent === 'Recent')?.click()`, 1600);
-ok(await evalJs(`!!document.querySelector('.m-stats')`), 'recent shows the month summary');
-await shot('04-money-recent');
+// Money opens on Main — the figures, not a form. Stacked rather than the three-across
+// row Home uses, so they can be read at arm's length.
+ok(await evalJs(`document.querySelectorAll('.m-bignum').length >= 3`),
+  'Main leads with the month, stacked full-width');
+const segOrder = await evalJs(`[...document.querySelectorAll('.m-seg > .m-seg-b')].map(b => b.textContent).join(' > ')`);
+ok(segOrder === 'Main > Log > Recent > Capture', `tabs read ${segOrder}`);
+await shot('03-money-main');
 
-await step('Money → Log', `[...document.querySelectorAll('.m-seg-b')].find(b => b.textContent === 'Log')?.click()`, 1600);
-ok(await evalJs(`!!document.querySelector('.m-amount')`), 'log view has an amount field');
-await step('toggle Log to Income', `[...document.querySelectorAll('.m-seg-sm .m-seg-b')].find(b => b.textContent === 'Income')?.click()`, 400);
+// ---------------------------------------------------------------- templates
+//
+// The whole reason Log leads with templates: a repeating stream should be one tap and
+// one number. Build one the way the phone does, then use it.
+
+await step('Money → Log', segClick('Log'), 1800);
+ok(await evalJs(`[...document.querySelectorAll('.m-section-title')].some(t => t.textContent === 'Templates')`),
+  'Log leads with Templates, not the blank form');
+await shot('04-money-log-empty');
+
+await step('open the new-template sheet', `document.querySelector('.m-head-btn[aria-label="New template"]')?.click()`, 900);
+ok(await evalJs(`!!document.querySelector('.m-sheet')`), 'template editor opened');
+
+// An hourly, USD, income template — every axis the user asked for at once.
+await step('fill in an hourly USD income template', `(() => {
+  const sheet = document.querySelector('.m-sheet');
+  const field = (label) => [...sheet.querySelectorAll('.m-field')]
+    .find(f => f.querySelector('.m-field-l')?.textContent.startsWith(label));
+  field('Name').querySelector('input').value = 'Micro1';
+  // Per hour, on the unit row (the second segmented control in the sheet).
+  const segs = sheet.querySelectorAll('.m-seg-sm');
+  [...segs[1].children].find(b => b.textContent === 'Per hour')?.click();
+  const rate = [...sheet.querySelectorAll('.m-field')]
+    .find(f => f.querySelector('.m-field-l')?.textContent.startsWith('Rate'));
+  rate.querySelector('select.m-cur').value = 'USD';
+  rate.querySelector('input').value = '65';
+  field('Payer').querySelector('input').value = 'Micro1';
+})()`, 500);
+
+await step('save the template', `[...document.querySelectorAll('.m-sheet .m-btn')].find(b => b.textContent === 'Save')?.click()`, 2000);
+const presets = await evalJs(`fetch('/api/finance/presets').then(r => r.json())`);
+ok(Array.isArray(presets) && presets.length === 1, `template was created (${presets?.length})`);
+const tpl = presets?.[0] || {};
+ok(tpl.currency === 'USD' && tpl.payUnit === 'hour' && tpl.kind === 'income' && tpl.amount === 65,
+  `and kept every axis: ${tpl.currency} ${tpl.amount}${tpl.payUnit === 'hour' ? '/hr' : ''} ${tpl.kind}`);
+ok(await evalJs(`!!document.querySelector('.m-tpl')`), 'and shows as a card on Log');
+await shot('05-money-log-templates');
+
+// ---------------------------------------------------------------- using it
+//
+// An hourly template asks for hours and nothing else, and shows the total it is about
+// to log — including the base-currency conversion, since "$65/hr" means little at a
+// glance against a yen ledger.
+
+await step('tap the template', `document.querySelector('.m-tpl-main')?.click()`, 900);
+ok(await evalJs(`!!document.querySelector('.m-sheet')`), 'the template asks for hours');
+ok(await evalJs(`[...document.querySelectorAll('.m-sheet .m-field-l')].some(l => l.textContent === 'hours')`),
+  'and asks for hours specifically, because the rate is per hour');
+
+await step('enter 3.5 hours', `(() => {
+  const i = document.querySelector('.m-sheet .m-amount');
+  i.value = '3.5';
+  i.dispatchEvent(new Event('input', { bubbles: true }));
+})()`, 500);
+const total = await evalJs(`document.querySelector('.m-tpl-total')?.textContent || ''`);
+ok(/227\.5/.test(total), `the total is worked out live: ${JSON.stringify(total)}`);
+ok(/JPY/.test(total), `and converted to the ledger's currency: ${JSON.stringify(total)}`);
+await shot('06-money-template-hours');
+
+await step('log the hours', `[...document.querySelectorAll('.m-sheet .m-btn')].find(b => b.textContent === 'Log it')?.click()`, 2200);
+const afterTpl = await evalJs(`fetch('/api/finance/txns?limit=5').then(r => r.json())`);
+const hourRow = (afterTpl?.items || []).find(t => t.unit === 'hour');
+ok(!!hourRow, 'the hours landed in the ledger');
+ok(hourRow?.units === 3.5 && hourRow?.currency === 'USD' && hourRow?.amount === 227.5,
+  `with hours, currency and total intact (${hourRow?.units}h, ${hourRow?.currency} ${hourRow?.amount})`);
+// The conversion is the server's job, and it is what makes a USD row comparable.
+ok(hourRow?.amountBase > hourRow?.amount,
+  `and a base-currency figure alongside it (${hourRow?.amountBase} ${tpl.currency === 'USD' ? 'JPY' : ''})`);
+
+// ---------------------------------------------------------------- by hand
+
+await step('Money → Log again', segClick('Log'), 1800);
+ok(await evalJs(`!!document.querySelector('.m-amount')`), 'the manual form is still there, below');
+ok(await evalJs(`!!document.querySelector('.m-form select.m-cur')`), 'with a currency picker of its own');
+
+await step('switch the manual form to Income', `(() => {
+  const form = document.querySelector('.m-form');
+  [...form.querySelectorAll('.m-seg-sm .m-seg-b')].find(b => b.textContent === 'Income')?.click();
+})()`, 500);
 // The label has to follow the toggle — a frozen "Merchant" over a payer field is a
 // small lie that makes the form untrustworthy.
-const payerLabel = await evalJs(`[...document.querySelectorAll('.m-field-l')].some(l => l.textContent === 'Payer')`);
-ok(payerLabel === true, 'Merchant relabels to Payer for income');
-await shot('05-money-log');
+ok(await evalJs(`[...document.querySelectorAll('.m-form .m-field-l')].some(l => l.textContent === 'Payer')`),
+  'Merchant relabels to Payer for income');
+// Hours are income-only: an expense with hours attached is a different idea.
+ok(await evalJs(`(() => {
+  const f = [...document.querySelectorAll('.m-form .m-field')]
+    .find(x => x.querySelector('.m-field-l')?.textContent.startsWith('Hours'));
+  return !!f && getComputedStyle(f).display !== 'none';
+})()`), 'and an hours field appears for income');
 
-await step('log a transaction', `(() => {
-  document.querySelector('.m-amount').value = '1234';
-  [...document.querySelectorAll('.m-btn-big')].find(b => b.textContent === 'Log it')?.click();
-})()`, 1800);
-const logged = await evalJs(`fetch('/api/finance/txns?limit=5').then(r => r.json()).then(j => j.items.length)`);
-ok(logged >= 1, `transaction landed in the ledger (${logged} row${logged === 1 ? '' : 's'})`);
+await step('log income in USD with hours', `(() => {
+  const form = document.querySelector('.m-form');
+  form.querySelector('select.m-cur').value = 'USD';
+  const amt = form.querySelector('.m-amount');
+  amt.value = '120';
+  amt.dispatchEvent(new Event('input', { bubbles: true }));
+  const hours = [...form.querySelectorAll('.m-field')]
+    .find(x => x.querySelector('.m-field-l')?.textContent.startsWith('Hours'))?.querySelector('input');
+  if (hours) hours.value = '2';
+})()`, 500);
+const conv = await evalJs(`document.querySelector('.m-conv')?.textContent || ''`);
+ok(/JPY/.test(conv), `a foreign amount shows its conversion live: ${JSON.stringify(conv)}`);
+
+await step('submit it', `[...document.querySelectorAll('.m-btn-big')].find(b => b.textContent === 'Log it')?.click()`, 2200);
+const all = await evalJs(`fetch('/api/finance/txns?limit=10').then(r => r.json())`);
+const manual = (all?.items || []).find(t => t.amount === 120 && t.currency === 'USD');
+ok(!!manual, 'the manual USD income landed');
+ok(manual?.units === 2 && manual?.unit === 'hour', `with its hours (${manual?.units}${manual?.unit === 'hour' ? 'h' : ''})`);
+
+// ---------------------------------------------------------------- the rest
+
+await step('Money → Recent', segClick('Recent'), 1800);
+ok(await evalJs(`!!document.querySelector('.m-stats')`), 'Recent shows the month summary');
+ok(await evalJs(`document.querySelectorAll('.m-row').length >= 2`), 'and lists what was logged');
+await shot('07-money-recent');
+
+await step('Money → Capture', segClick('Capture'), 1800);
+ok(await evalJs(`!!document.querySelector('.m-capture')`), 'Capture still mounts the receipt screen');
+await shot('08-money-capture');
+
+await step('back to Main', segClick('Main'), 2000);
+ok(await evalJs(`document.querySelectorAll('.m-bignum').length >= 3`), 'Main still renders after a round trip');
+// Two income rows are in now, so the earned figure must have moved off zero.
+const earned = await evalJs(`[...document.querySelectorAll('.m-bignum')]
+  .find(b => b.querySelector('.m-bignum-l')?.textContent === 'Earned')
+  ?.querySelector('.m-bignum-v')?.textContent || ''`);
+ok(/[1-9]/.test(earned), `and the month reflects what was logged (Earned ${JSON.stringify(earned)})`);
+// A percentage that reads "10000%" is glaring in a screenshot and invisible to every
+// assertion above it — savingsRate and the goal pcts arrive already scaled.
+const pcts = await evalJs(`[...document.querySelectorAll('.m-bignum-s, .m-note')]
+  .map(e => e.textContent).filter(t => /%/.test(t))`);
+ok((pcts || []).every(t => (t.match(/(\d+)%/) || [0, 0])[1] <= 999),
+  `percentages are not double-scaled (${JSON.stringify(pcts)})`);
+await shot('09-money-main-filled');
 
 await step('open Tasks', tapTab('Tasks'), 1600);
 ok(await screenIs('tasks'), 'tasks screen mounted');
