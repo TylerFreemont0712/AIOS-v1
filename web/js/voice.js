@@ -38,6 +38,32 @@ const SILENCE_MS = 1500;
 // What the streaming recogniser is trained on. Asked of the AudioContext so the
 // browser resamples the microphone natively instead of anything here doing it badly.
 const TARGET_RATE = 16000;
+// How much audio from BEFORE speech was confirmed still gets sent.
+//
+// A streaming zipformer fed room tone does not sit quiet — it decodes it into words.
+// Measured against this box's multilingual model: text came back on 6 of 6 speechless
+// clips INCLUDING pure digital silence ("SELAMAT 您我们", "こ嗯嗯"), and because the
+// endpointer fires on that silence too, each phantom was COMMITTED as a finished
+// segment and then sat in front of the real sentence — a 2s lead-in reliably turned
+// "I SPENT 3200 YEN…" into "SELAMAT СВОЁ I SPENT 3200 YEN…".
+//
+// The committing is the mechanism, and it is why holding audio back fixes this while
+// a bounded pre-roll costs nothing: silence that is streamed CONTINUOUSLY gives the
+// endpointer long quiet runs to fire on, whereas a pre-roll is released in one burst
+// immediately followed by speech, so no endpoint ever lands on silence. Measured:
+// 400ms through 3000ms of leading silence or room tone, released that way, produced
+// zero stray words across four runs each.
+//
+// The length is therefore set by the OTHER edge — how late `spoke` is. It is not set
+// the moment you start talking: the gate needs 150ms of sustained level, and a soft
+// word-initial vowel crosses, dips, and restarts that timer. Measured in a real
+// browser against "I spent three thousand…": speech at 2103ms, `spoke` at 2777ms —
+// 674ms late. A 400ms pre-roll could not reach back that far and ate the "I",
+// transcribing "'S SPENT 3200…". That is a far worse bug than the phantom it was
+// fixing, because nothing on screen says a word went missing.
+//
+// 1200ms is ~1.8x the measured latency and still inside the range measured clean.
+const PREROLL_MS = 1200;
 
 const SPEECH_MODES = ['auto', 'ask', 'off'];
 const DEFAULT_PREFS = { speech: 'ask', handsFree: true, dictateSend: false, cues: true, silenceMs: 0, voice: '', speed: 0 };
@@ -327,16 +353,27 @@ export class Recorder {
   async _shipPartial() {
     if (this._inFlight || this.state !== 'recording') return;
 
-    // Streaming sends PCM from the first block, before `spoke` is set: the recogniser
-    // needs the leading audio to decode the first word, and its own endpointer wants
-    // the silence around the speech. The container path still waits for speech,
+    // Nothing is sent until the meter confirms speech — see PREROLL_MS. Streaming
+    // used to ship PCM from the very first block on the grounds that the recogniser
+    // needs the leading audio and its endpointer wants the surrounding silence. The
+    // first half is true and is why a pre-roll is kept rather than discarded; the
+    // second half was a mistake, because a zipformer decodes room tone into words and
+    // the endpoint it then fires COMMITS them in front of the real sentence.
+    //
+    // Trailing silence is unaffected: once `spoke` is set every block goes, which is
+    // what the endpointer actually needs. The container path waits for speech too,
     // because re-decoding silence with whisper is pure cost.
+    //
     // PCM when the tap is producing it, containers otherwise — decided per pass, not
     // once at startup. A tap that opens but delivers nothing (a suspended
     // AudioContext, a muted device) would otherwise silently kill live text
     // altogether, which is worse than the slower engine it replaced.
     let body, mime, rate = 0;
-    const pcm = this.streaming && this._tap ? this._drainPcm() : null;
+    let pcm = null;
+    if (this.streaming && this._tap) {
+      if (this.spoke) pcm = this._drainPcm();
+      else this._holdPreroll();
+    }
     if (pcm?.length) {
       body = pcm.buffer; mime = 'audio/pcm'; rate = this.captureRate;
     } else {
@@ -424,6 +461,22 @@ export class Recorder {
    * are avoidable, because the AudioContext is asked for 16kHz up front and sherpa
    * resamples anything else in C++. The rate travels with the bytes.
    */
+  /**
+   * Before speech: keep the tail, throw the rest away, send nothing.
+   *
+   * The buffer would otherwise grow for as long as the microphone sits open waiting
+   * for someone to talk — nine seconds of it in hands-free mode, all of which would
+   * then be shipped in one burst the moment speech started, and all of which the
+   * recogniser would read as words.
+   *
+   * One block is always kept even if it alone exceeds the window, so the shift loop
+   * cannot spin on an empty array.
+   */
+  _holdPreroll() {
+    const cap = Math.round((this.captureRate || TARGET_RATE) * PREROLL_MS / 1000);
+    while (this._pcmN > cap && this._pcm.length > 1) this._pcmN -= this._pcm.shift().length;
+  }
+
   _drainPcm() {
     if (!this._pcmN) return null;
     const flat = new Float32Array(this._pcmN);
@@ -458,7 +511,13 @@ export class Recorder {
     this.streamId = '';
     // Drained NOW, synchronously: release() clears the buffer and closes the context
     // on the next line, so anything read later is already gone.
-    const last = this.streaming && this._tap ? this._drainPcm() : null;
+    //
+    // Still gated on `spoke`. A recording that ended because nobody said anything
+    // ('nospeech', or a stop button pressed by mistake) holds nothing but the
+    // pre-roll, and sending it here would hand the recogniser a last mouthful of room
+    // tone to turn into words — the phantom line this whole gate exists to stop,
+    // arriving at the one moment it is guaranteed to be the only thing on screen.
+    const last = this.spoke && this.streaming && this._tap ? this._drainPcm() : null;
     const rate = this.captureRate;
     const token = localStorage.getItem('aios.token') || '';
     const auth = token ? { authorization: 'Bearer ' + token } : {};

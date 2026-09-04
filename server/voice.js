@@ -460,6 +460,30 @@ export async function partialTranscribe(id, buffer, { mime = '', rate = 0 } = {}
  * sentence finish, which is a better signal than a fixed silence timer because it is
  * measured against what was actually decoded rather than against loudness alone.
  */
+/** RMS of a mono int16 LE buffer, 0..1. ~3200 samples per 200ms chunk — trivial. */
+function pcmRms(buf) {
+  const n = buf.length >> 1;
+  if (!n) return 0;
+  let sum = 0;
+  for (let i = 0; i < n; i++) { const v = buf.readInt16LE(i << 1) / 32768; sum += v * v; }
+  return Math.sqrt(sum / n);
+}
+
+// Below this, a chunk arriving BEFORE any speech in the stream is not fed to the
+// recogniser at all.
+//
+// A backstop, not the main gate. The browser holds audio back until its own adaptive
+// noise floor confirms speech (voice.js PREROLL_MS), which is the better test because
+// only it knows the room. This exists because the phone caches its bundle hard, so a
+// client that predates that fix keeps streaming room tone, and a zipformer turns room
+// tone into words — measured here on 6 of 6 speechless clips, digital silence included.
+//
+// Deliberately far below the browser's own floor (0.014 minimum): the cost of guessing
+// wrong is clipping the start of a quiet talker, so the margin runs the other way.
+// Measured on this box: the quietest 200ms chunk of ordinary speech is 0.022 RMS, and
+// a quiet room is 0.002-0.013. 0.006 sits between them with 3.6x of headroom.
+const LEAD_SILENCE_RMS = 0.006;
+
 async function streamFeed(id, buffer, rate = 0) {
   // 16k is what the old client sent and what it never named; anything outside the
   // range a microphone can plausibly run at is a mangled query string, not a device.
@@ -467,7 +491,7 @@ async function streamFeed(id, buffer, rate = 0) {
   let s = streams.get(id);
   if (!s) {
     if (streams.size >= MAX_STREAMS) throw bad('too many live recordings', 429);
-    s = { chunks: [], bytes: 0, mime: 'audio/pcm', at: Date.now(), closed: false, live: true, rate: sr };
+    s = { chunks: [], bytes: 0, mime: 'audio/pcm', at: Date.now(), closed: false, live: true, rate: sr, heard: false };
     streams.set(id, s);
     // The same merchants that go into whisper's prompt, as contextual bias for the
     // transducer — opt-in, because on this ledger it measured as noise (see
@@ -483,6 +507,16 @@ async function streamFeed(id, buffer, rate = 0) {
   s.at = Date.now();
   if (s.bytes > MAX_STREAM_BYTES) { streams.delete(id); throw bad('recording too long', 413); }
   if (s.closed) return { text: '', stale: true };
+
+  // Leading silence never reaches the recogniser. Once anything speech-shaped has
+  // arrived, EVERYTHING goes through from then on — including the trailing silence,
+  // which is not incidental: the endpointer fires on it, and gating it would break
+  // sentence segmentation to fix a problem that only exists before the first word.
+  if (!s.heard) {
+    if (pcmRms(buffer) < LEAD_SILENCE_RMS) return { text: '', leading: true, bytes: s.bytes, live: true, rate: sr };
+    s.heard = true;
+  }
+
   const r = await call('stream.feed', { stream: id, rate: sr, pcm: buffer.toString('base64') }, STT_TIMEOUT_MS);
   if (s.closed) return { text: '', stale: true };
   return {
@@ -517,6 +551,11 @@ export async function endPartial(id) {
   if (s) s.closed = true;                 // in-flight decodes check this and bail
   streams.delete(id);
   if (!(s?.live && worker)) return { ended: !!s, text: '' };
+  // Nothing speech-shaped ever reached the recogniser, so there is no tail to flush —
+  // and flushing anyway is not harmless: `stream.end` pads with silence before
+  // decoding, which on an empty stream is just handing a zipformer half a second of
+  // nothing and asking what it heard. It answers.
+  if (!s.heard) return { ended: true, text: '' };
   try {
     // Short, and swallowed: the recording has already stopped and whisper's real
     // pass is on its way. A tail that does not arrive costs one moment of a
