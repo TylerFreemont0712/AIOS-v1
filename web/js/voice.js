@@ -42,28 +42,51 @@ const TARGET_RATE = 16000;
 //
 // A streaming zipformer fed room tone does not sit quiet — it decodes it into words.
 // Measured against this box's multilingual model: text came back on 6 of 6 speechless
-// clips INCLUDING pure digital silence ("SELAMAT 您我们", "こ嗯嗯"), and because the
-// endpointer fires on that silence too, each phantom was COMMITTED as a finished
-// segment and then sat in front of the real sentence — a 2s lead-in reliably turned
-// "I SPENT 3200 YEN…" into "SELAMAT СВОЁ I SPENT 3200 YEN…".
+// clips INCLUDING pure digital silence ("SELAMAT 您我们", "こ嗯嗯"). The endpointer
+// fires on that silence too, and an endpoint COMMITS its segment, so the phantom was
+// not transient — it sat in front of the real sentence, turning "I SPENT 3200 YEN…"
+// into "SELAMAT СВОЁ I SPENT 3200 YEN…".
 //
-// The committing is the mechanism, and it is why holding audio back fixes this while
-// a bounded pre-roll costs nothing: silence that is streamed CONTINUOUSLY gives the
-// endpointer long quiet runs to fire on, whereas a pre-roll is released in one burst
-// immediately followed by speech, so no endpoint ever lands on silence. Measured:
-// 400ms through 3000ms of leading silence or room tone, released that way, produced
-// zero stray words across four runs each.
+// So audio is held until the meter confirms speech. The length of what is still sent
+// is set by two constraints pulling opposite ways, and BOTH were mis-measured once:
 //
-// The length is therefore set by the OTHER edge — how late `spoke` is. It is not set
-// the moment you start talking: the gate needs 150ms of sustained level, and a soft
-// word-initial vowel crosses, dips, and restarts that timer. Measured in a real
-// browser against "I spent three thousand…": speech at 2103ms, `spoke` at 2777ms —
-// 674ms late. A 400ms pre-roll could not reach back that far and ate the "I",
-// transcribing "'S SPENT 3200…". That is a far worse bug than the phantom it was
-// fixing, because nothing on screen says a word went missing.
+// 1. Too long and the phantom survives. The first sweep fed leading silence in
+//    uniform 200ms chunks and found no strays out to 3000ms — but that is not what
+//    the browser does. It releases the whole held window as ONE burst when the gate
+//    opens, and re-measured that way the phantom scales with length x room level:
 //
-// 1200ms is ~1.8x the measured latency and still inside the range measured clean.
-const PREROLL_MS = 1200;
+//      room tone   400ms  600ms  800ms  1200ms  2000ms   (stray words / 4 runs)
+//      0.004 RMS       0      0      4       5       4
+//      0.008 RMS       0      2      4       4       4   <- "SELAMAT I SPENT 3200…"
+//      0.013 RMS       4      4      4       4       4
+//
+//    At short margins, 6 runs each, silence through 0.020 RMS: 250ms and below was
+//    clean at EVERY level. 300ms strayed at 0.020, 400ms at 0.013.
+//
+// 2. Too short and the first word is eaten. `spoke` is not set when you start
+//    talking: the gate wants 150ms sustained, and a soft word-initial vowel crosses,
+//    dips, and restarts that timer. Measured in a real browser on "I spent three
+//    thousand…": speech at 2103ms, `spoke` at 2777ms — 674ms late. A fixed 400ms
+//    window could not reach back that far and transcribed "'S SPENT 3200…". That is
+//    the worse bug of the two, because nothing on screen says a word went missing.
+//
+// A fixed window ending at "now" cannot satisfy both — 250ms is required by (1) and
+// ~700ms by (2). The way out is to stop measuring from now: the window is cut from
+// where speech ACTUALLY began (the anchor recorded in _meter()), so the pre-speech
+// audio is always ~250ms however late the confirmation lands.
+const ONSET_MARGIN_MS = 250;
+// How long the level must sit below the gate before a recorded onset is forgotten.
+// Longer than a dip inside a phrase — otherwise the pause between "I" and "spent"
+// moves the anchor onto the second word — and short enough that a keyboard tap a
+// second ago cannot anchor the window back to itself.
+const ONSET_FORGET_MS = 350;
+// Bound on the held buffer when there is no anchor to cut to. Not normally reachable:
+// `spoke` requires a gate crossing and a crossing records an anchor.
+const PREROLL_CAP_MS = 400;
+// Absolute ceiling on the hold. Only bites if an anchor goes stale without being
+// forgotten; it must stay well clear of the ~700ms the confirmation can lag by, or it
+// would clip the first word exactly the way a short fixed window did.
+const MAX_HOLD_MS = 3000;
 
 const SPEECH_MODES = ['auto', 'ask', 'off'];
 const DEFAULT_PREFS = { speech: 'ask', handsFree: true, dictateSend: false, cues: true, silenceMs: 0, voice: '', speed: 0 };
@@ -182,6 +205,8 @@ export class Recorder {
     });
     this._pcm = [];          // float32 blocks at the context rate, awaiting a ship
     this._pcmN = 0;
+    this._pcmTotal = 0;      // every sample ever tapped — the clock the onset is in
+    this._onsetSamples = 0;  // _pcmTotal when this talk-spurt first crossed the gate
     this._tap = null;
     this.captureRate = TARGET_RATE;   // settled once the context exists
     this.streamId = onPartial ? `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}` : '';
@@ -316,11 +341,22 @@ export class Recorder {
         if (rms > gate) {
           quietSince = 0;
           if (!loudSince) loudSince = now;
+          // WHERE the talk-spurt began, in samples — the anchor the pre-roll is cut
+          // to. Recorded on the FIRST crossing and deliberately not moved by the
+          // confirmation 150ms later, because those are different instants: a soft
+          // word-initial vowel ("I spent…") crosses, dips below, and restarts the
+          // sustain timer, so `spoke` can land most of a second after the sentence
+          // actually started. Anchoring on confirmation would cut the first word off.
+          if (!this._onsetSamples) this._onsetSamples = this._pcmTotal;
           // 150ms above the gate before it counts, so a keyboard tap is not "speech"
           if (!this.spoke && now - loudSince > 150) this.spoke = true;
         } else {
           loudSince = 0;
           if (!quietSince) quietSince = now;
+          // Let a stale anchor go, but only after a gap longer than the dip inside a
+          // phrase — otherwise the pause between "I" and "spent" moves the anchor to
+          // the second word, which is the thing this whole mechanism exists to avoid.
+          if (!this.spoke && now - quietSince > ONSET_FORGET_MS) this._onsetSamples = 0;
         }
 
         if (this.handsFree && age > 400) {
@@ -353,7 +389,7 @@ export class Recorder {
   async _shipPartial() {
     if (this._inFlight || this.state !== 'recording') return;
 
-    // Nothing is sent until the meter confirms speech — see PREROLL_MS. Streaming
+    // Nothing is sent until the meter confirms speech — see ONSET_MARGIN_MS. Streaming
     // used to ship PCM from the very first block on the grounds that the recogniser
     // needs the leading audio and its endpointer wants the surrounding silence. The
     // first half is true and is why a pre-roll is kept rather than discarded; the
@@ -436,6 +472,7 @@ export class Recorder {
       if (this.state !== 'recording') return;
       this._pcm.push(e.data);
       this._pcmN += e.data.length;
+      this._pcmTotal += e.data.length;
     };
     // Web Audio pulls the graph BACKWARDS from the destination, so a node with
     // nothing downstream is never rendered and its process() is never called — the
@@ -462,19 +499,49 @@ export class Recorder {
    * resamples anything else in C++. The rate travels with the bytes.
    */
   /**
-   * Before speech: keep the tail, throw the rest away, send nothing.
+   * Before speech: keep only what sits just before the onset, and send nothing.
    *
-   * The buffer would otherwise grow for as long as the microphone sits open waiting
-   * for someone to talk — nine seconds of it in hands-free mode, all of which would
-   * then be shipped in one burst the moment speech started, and all of which the
-   * recogniser would read as words.
+   * Cut from the ANCHOR rather than from now. The buffer would otherwise hold a fixed
+   * window ending at this instant, and since the gate can confirm most of a second
+   * after the sentence began, a window long enough to still contain the first word is
+   * also long enough to carry a phantom — measured, the two constraints have no
+   * overlap. Cutting to `_onsetSamples - ONSET_MARGIN_MS` satisfies both: the pre-
+   * speech audio handed to the recogniser is always ~250ms no matter how late the
+   * confirmation, and the first word is always inside it.
    *
-   * One block is always kept even if it alone exceeds the window, so the shift loop
-   * cannot spin on an empty array.
+   * Sample counts, not timestamps: the tap's clock and Date.now() drift apart, and
+   * this has to be exact to a couple of blocks at the point it matters.
    */
   _holdPreroll() {
-    const cap = Math.round((this.captureRate || TARGET_RATE) * PREROLL_MS / 1000);
-    while (this._pcmN > cap && this._pcm.length > 1) this._pcmN -= this._pcm.shift().length;
+    if (!this._pcmN) return;
+    const rate = this.captureRate || TARGET_RATE;
+    const ms = (n) => Math.round(rate * n / 1000);
+    // Absolute index of the first sample worth keeping.
+    //
+    // The anchor WINS when there is one. Writing this as a max() against the fallback
+    // was the first attempt and it silently defeated the whole mechanism: the onset is
+    // routinely further back than the fallback window, so the max() picked the
+    // fallback every time and the cut landed ~100ms INSIDE the speech. It still looked
+    // like it worked — the buffer was the expected size — and the first word came out
+    // as "'S". The fallback is for having no anchor at all, nothing else.
+    const want = this._onsetSamples
+      ? this._onsetSamples - ms(ONSET_MARGIN_MS)
+      : this._pcmTotal - ms(PREROLL_CAP_MS);
+    // An absolute ceiling on the hold, so a stale anchor cannot pin the buffer open.
+    const bounded = Math.max(want, this._pcmTotal - ms(MAX_HOLD_MS));
+    let drop = bounded - (this._pcmTotal - this._pcmN);
+    if (drop <= 0) return;
+    while (drop > 0 && this._pcm.length && this._pcm[0].length <= drop) {
+      const b = this._pcm.shift();
+      drop -= b.length;
+      this._pcmN -= b.length;
+    }
+    // Part of a block: 128 samples is 8ms, which is worth being right about when the
+    // whole margin is 250.
+    if (drop > 0 && this._pcm.length) {
+      this._pcm[0] = this._pcm[0].subarray(drop);
+      this._pcmN -= drop;
+    }
   }
 
   _drainPcm() {

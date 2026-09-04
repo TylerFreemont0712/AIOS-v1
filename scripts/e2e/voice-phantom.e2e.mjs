@@ -191,17 +191,33 @@ const RUN = (sec) => `(async () => {
 const RUN_UNTIL_DONE = () => `(async () => {
   const V = await import('/js/voice.js');
   const partials = [];
+  const t0 = performance.now();
+  const marks = { firstLoud: 0, shipAt: 0, heldMs: 0 };
   const rec = new V.Recorder({
     handsFree: true, silenceMs: 1200, maxSec: 14, noSpeechSec: 13,
     streaming: true, streamMs: 200,
     onPartial: (t) => partials.push(t),
+    onLevel: (l) => { if (l > 0.06 && !marks.firstLoud) marks.firstLoud = performance.now() - t0; },
   });
+  // How far back the first shipped burst reaches. The gate can confirm ~700ms after
+  // speech starts, so this MUST reach back past the onset — a window measured from
+  // "now" instead of from the anchor cuts into the first word and reads as "'S".
+  const origDrain = rec._drainPcm.bind(rec);
+  rec._drainPcm = function () {
+    const had = this._pcmN;
+    const out = origDrain();
+    if (!marks.shipAt && out && out.length) {
+      marks.shipAt = performance.now() - t0;
+      marks.heldMs = (had / (this.captureRate || 16000)) * 1000;
+    }
+    return out;
+  };
   await rec.start();
   await rec.done;
   await new Promise(r => setTimeout(r, 1400));
   const spoke = rec.spoke;
   rec.release();
-  return { partials, spoke };
+  return { partials, spoke, marks };
 })()`;
 
 // ---------------------------------------------------------------- 1. a hot, quiet mic
@@ -241,10 +257,20 @@ const spokenWav = Buffer.from(await (await fetch(BASE + '/voice/speak', {
 })).arrayBuffer());
 {
   // Lead-in, the sentence, then a gap — and the whole thing loops, so the recorder
-  // always meets silence before speech no matter where it starts.
+  // always meets quiet before speech no matter where it starts.
+  //
+  // ROOM TONE, not digital zeros. Zeros are the easy case and passed even while the
+  // reported bug was live: the phantom scales with pre-roll length x room LEVEL, and
+  // 0.008 RMS is an ordinary quiet room on a laptop mic — the level at which
+  // "SELAMAT I SPENT 3200…" was reproduced.
   const rate = spokenWav.readUInt32LE(24);
-  const lead = Buffer.alloc(rate * 2 * 2);
-  const tail = Buffer.alloc(rate * 2 * 3);
+  const toneBuf = (sec, rms) => {
+    const nn = Math.round(sec * rate), b = Buffer.alloc(nn * 2);
+    for (let i = 0; i < nn; i++) b.writeInt16LE(Math.round((Math.random() * 2 - 1) * rms * 32768), i * 2);
+    return b;
+  };
+  const lead = toneBuf(2, 0.008);
+  const tail = toneBuf(3, 0.008);
   const body = Buffer.concat([lead, spokenWav.subarray(44), tail]);
   const out = Buffer.concat([spokenWav.subarray(0, 44), body]);
   out.writeUInt32LE(out.length - 8, 4);
@@ -272,6 +298,22 @@ ok(/LAWSON/i.test(best), `real speech still transcribes: ${JSON.stringify(best)}
 // The first word is the one a too-eager gate eats, so it is asserted by name.
 ok(/\bI\b/i.test(best) && /SPENT/i.test(best),
   `the first words survived the gate: ${JSON.stringify(best.slice(0, 40))}`);
+
+// The invariant behind that, asserted directly so a regression names itself rather
+// than showing up as a mangled first word. A version that took max() against the
+// no-anchor fallback looked perfectly healthy — right buffer size, right timings —
+// and still cut ~100ms into the speech.
+{
+  const m = said?.marks || {};
+  const reach = m.shipAt - m.heldMs;             // where the first burst starts
+  const lead = m.firstLoud - reach;              // how much sits before the speech
+  ok(m.firstLoud > 0 && reach < m.firstLoud,
+    `the first burst reaches back past the onset (starts ${Math.round(lead)}ms before it)`);
+  // Short as well as sufficient: the phantom scales with how much room tone rides
+  // along, and 250ms was the largest margin clean at every level measured.
+  ok(lead > 0 && lead < 400,
+    `and only just — ${Math.round(lead)}ms of lead, so little room tone rides along`);
+}
 
 // ---------------------------------------------------------------- 4. the pre-roll size
 //
