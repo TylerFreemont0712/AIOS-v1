@@ -35,9 +35,16 @@ async function tsc(args, timeout = TIMEOUT) {
     const { stdout } = await run('tailscale', args, { timeout, encoding: 'utf8' });
     return { ok: true, out: stdout.trim(), err: '' };
   } catch (e) {
-    // ENOENT means not installed; a non-zero exit means installed but unhappy, and
-    // its stderr is the actionable half ("Logged out.", "needs login", …).
-    return { ok: false, out: (e.stdout || '').trim(), err: (e.stderr || e.message || '').trim(), code: e.code };
+    // ENOENT means not installed; a non-zero exit means installed but unhappy.
+    //
+    // The actionable half can be on EITHER stream, and the important cases are on
+    // stdout: `tailscale serve` answers "Serve is not enabled on your tailnet. To
+    // enable, visit: <link>" on stdout with a non-zero exit, and reading only stderr
+    // reduced that to "Command failed: tailscale serve --bg --https=443 7777" — a
+    // one-click fix rendered as an opaque failure.
+    const out = (e.stdout || '').trim();
+    const err = (e.stderr || '').trim();
+    return { ok: false, out, err: err || out || (e.message || '').trim(), code: e.code };
   }
 }
 
@@ -176,6 +183,15 @@ export async function enableServe() {
   invalidate();
   if (!r.ok) {
     const err = r.err || 'tailscale serve failed';
+    // Serve itself is off for the tailnet. Tailscale prints a one-click link with the
+    // node id in it, so pass THAT through rather than a generic instruction — it is
+    // the difference between one tap and hunting through the admin console.
+    const link = (err.match(/https:\/\/login\.tailscale\.com\/\S+/) || [])[0];
+    if (/serve is not enabled/i.test(err)) {
+      throw Object.assign(new Error(
+        `Serve is not enabled on your tailnet — enable it once here: ${link || 'https://login.tailscale.com/admin/settings/features'}`
+      ), { status: 400, link });
+    }
     if (/HTTPS.*(not enabled|disabled)|cert.*not.*enabled|EnableHTTPS/i.test(err)) {
       throw Object.assign(new Error(
         'Tailscale needs HTTPS certificates enabled for your tailnet. Open the admin console → DNS → enable HTTPS Certificates, then try again.'
