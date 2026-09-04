@@ -128,8 +128,41 @@ function presentedToken(req) {
  * and the REST path share one implementation — they used to be two, and only the
  * REST one would have gained the lockout.
  */
+/**
+ * The address to judge this request by.
+ *
+ * `tailscale serve` is a reverse proxy: it terminates TLS on the tailnet name and
+ * forwards to 127.0.0.1:7777. So from here EVERY remote request looks like loopback —
+ * and loopback is the one source that skips the token in `lan` mode. Turning HTTPS on
+ * therefore handed the whole API to any device on the tailnet with no token at all,
+ * which was confirmed live: `curl https://<host>.ts.net/api/status` returned 200.
+ *
+ * The forwarded address is only believed when the connection genuinely came from the
+ * proxy — i.e. the socket peer is loopback. Anywhere else the header is attacker-
+ * controlled and is ignored outright, which is the whole trick to trusting one safely.
+ *
+ * The RIGHTMOST entry is taken, not the leftmost. Proxies append, so the last hop is
+ * the one our trusted proxy wrote; the leftmost is whatever the client claimed and is
+ * exactly what a spoofer would set.
+ */
+export function clientIp(req) {
+  const sock = req.socket?.remoteAddress || '';
+  if (!LOOPBACK.has(String(sock)) && v4(sock) !== '127.0.0.1') return sock;
+  const xff = String(req.headers?.['x-forwarded-for'] || '').trim();
+  if (!xff) return sock;
+  const hops = xff.split(',').map(s => s.trim()).filter(Boolean);
+  return hops.length ? hops[hops.length - 1] : sock;
+}
+
+/** True when this request reached us through a local reverse proxy. */
+export const viaProxy = (req) => {
+  const sock = req.socket?.remoteAddress || '';
+  const local = LOOPBACK.has(String(sock)) || v4(sock) === '127.0.0.1';
+  return local && !!String(req.headers?.['x-forwarded-for'] || '').trim();
+};
+
 export function check(req) {
-  const ip = req.socket?.remoteAddress || '';
+  const ip = clientIp(req);
   const source = classify(ip);
   const c = loadConfig();
 

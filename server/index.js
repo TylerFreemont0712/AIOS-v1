@@ -105,10 +105,15 @@ app.put('/api/config', h(req => {
   return out;
 }));
 app.get('/api/config/token', h((req) => {
-  // only reveal the pairing token to localhost callers
-  const ip = req.socket?.remoteAddress || '';
-  const local = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
-  if (!local) throw Object.assign(new Error('token is only shown on localhost'), { status: 403 });
+  // Only reveal the pairing token to a caller genuinely ON this machine.
+  //
+  // `auth.clientIp`, not the raw socket address: `tailscale serve` terminates TLS and
+  // forwards from 127.0.0.1, so reading the socket here would have handed the token to
+  // anything on the tailnet that asked. Same trap as the auth bypass, one route over,
+  // and worse — this one is the token itself.
+  if (auth.classify(auth.clientIp(req)) !== 'local') {
+    throw Object.assign(new Error('token is only shown on localhost'), { status: 403 });
+  }
   return { token: loadConfig().auth.token, urls: lanUrls(true) };
 }));
 
@@ -121,13 +126,24 @@ app.get('/api/remote/status', h(async (req) => {
   // The pairing links carry the token, so they are localhost-only for the same reason
   // /api/config/token is: anyone already holding the token learns nothing, and anyone
   // who is not must not be handed one.
-  const local = auth.classify(req.socket?.remoteAddress || '') === 'local';
+  const local = auth.classify(auth.clientIp(req)) === 'local';
   return { ...s, source: req.authSource || null, pairing: local ? remote.pairingUrls(s, loadConfig().auth.token) : [] };
 }));
 app.post('/api/remote/serve', h(async (req) => (
   req.body?.on === false ? remote.disableServe() : remote.enableServe()
 )));
 app.get('/api/remote/lockouts', h(() => auth.lockoutReport()));
+// How the caller actually reached us. Exists because `tailscale serve` makes every
+// remote request look like loopback, and "am I being treated as local?" is otherwise
+// unanswerable from the device that needs to know.
+app.get('/api/remote/whoami', h((req) => ({
+  ip: auth.clientIp(req),
+  socket: req.socket?.remoteAddress || '',
+  source: auth.classify(auth.clientIp(req)),
+  viaProxy: auth.viaProxy(req),
+  proto: req.headers['x-forwarded-proto'] || 'http',
+  secure: (req.headers['x-forwarded-proto'] || '') === 'https',
+})));
 app.get('/api/models', h(() => listModels()));
 app.get('/api/services', h(() => probeServices()));
 

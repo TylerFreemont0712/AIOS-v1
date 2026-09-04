@@ -127,6 +127,60 @@ const wsBad = await wsTry('nope-not-it');
 ok(wsBad === 401, `the WebSocket refuses a bad token (got ${wsBad})`);
 ok(await wsTry(null) === 401, 'the WebSocket refuses no token');
 
+// ---------------------------------------------------------------- behind a proxy
+//
+// THE BUG THIS SECTION EXISTS FOR. `tailscale serve` terminates TLS on the tailnet
+// name and forwards to 127.0.0.1:7777, so once HTTPS was switched on every remote
+// request arrived looking like loopback — and loopback is the one source that skips
+// the token. Confirmed live the moment it was enabled: `curl https://<host>.ts.net/
+// api/status` returned 200 with no credentials at all, on a box with a shell, an
+// agent that writes files, an inbox and a ledger behind it.
+//
+// The fix believes X-Forwarded-For ONLY when the connection genuinely came from the
+// proxy (socket peer is loopback), and takes the RIGHTMOST hop — the one the trusted
+// proxy wrote, not the leftmost one a client can invent. Both halves are asserted.
+
+const asProxy = (fwd, token, p = '/api/status') => fetch(BASE + p, {
+  headers: { 'x-forwarded-for': fwd, ...(token ? { authorization: 'Bearer ' + token } : {}) },
+});
+
+// A tailnet client arriving through the local proxy is NOT local.
+ok((await asProxy('100.64.0.5', null)).status === 401,
+  'a proxied tailnet caller is refused without a token (the HTTPS bypass)');
+ok((await asProxy('100.64.0.5', TOKEN)).status === 200, 'and accepted with one');
+// A LAN client through the proxy is likewise not local.
+ok((await asProxy('192.168.1.50', null)).status === 401, 'a proxied LAN caller is refused without a token');
+// Multiple hops: the LAST is the proxy's, the first is whatever the client claimed.
+ok((await asProxy('127.0.0.1, 100.64.0.9', null)).status === 401,
+  'a forged leading hop does not make a proxied caller local');
+
+// The token itself must not travel back out through the proxy.
+ok((await asProxy('100.64.0.5', TOKEN, '/api/config/token')).status === 403,
+  '/api/config/token refuses a proxied caller even holding the token');
+const rs0 = await (await asProxy('100.64.0.5', TOKEN, '/api/remote/status')).json();
+ok(Array.isArray(rs0.pairing) && rs0.pairing.length === 0,
+  'remote status hands a proxied caller no pairing links (they carry the token)');
+
+// And the header is worthless from anywhere that is not the proxy. Reached over a LAN
+// address so the socket peer is genuinely not loopback.
+const lanIp = Object.values(os.networkInterfaces()).flat()
+  .find(a => a && a.family === 'IPv4' && !a.internal)?.address;
+if (lanIp) {
+  const spoof = await fetch(`http://${lanIp}:${PORT}/api/status`, { headers: { 'x-forwarded-for': '127.0.0.1' } });
+  ok(spoof.status === 401, `X-Forwarded-For from a non-proxy source is ignored (via ${lanIp})`);
+  const spoofTok = await fetch(`http://${lanIp}:${PORT}/api/config/token`, { headers: { 'x-forwarded-for': '127.0.0.1', authorization: 'Bearer ' + TOKEN } });
+  ok(spoofTok.status === 403, 'and cannot talk the token out of /api/config/token');
+} else {
+  console.log('  (no LAN address on this box — spoofing check skipped)');
+}
+
+// whoami is what makes any of this diagnosable from the device that needs to know.
+const who = await (await asProxy('100.64.0.5', TOKEN, '/api/remote/whoami')).json();
+ok(who.source === 'tailnet' && who.viaProxy === true && who.ip === '100.64.0.5',
+  `whoami reports the real caller through a proxy (${who.source}, ip ${who.ip})`);
+const whoLocal = await (await call(TOKEN, '/api/remote/whoami')).json();
+ok(whoLocal.source === 'local' && whoLocal.viaProxy === false, 'and still says local when it is');
+
 // ---------------------------------------------------------------- remote status
 
 const rs = await (await call(TOKEN, '/api/remote/status')).json();
