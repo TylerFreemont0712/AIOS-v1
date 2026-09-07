@@ -105,19 +105,47 @@ export async function listModels() {
   await Promise.allSettled(jobs);
 
   try {
-    const { listLocalModels, servingAlias, modelAlias } = await import('./llmctl.js');
+    const { listLocalModels, servingAlias, modelAlias, presetFor } = await import('./llmctl.js');
     if (managedId) {
       const current = servingAlias();
       // stable per-gguf refs — same list no matter what is loaded right now
       for (const m of listLocalModels().reverse()) {
         const alias = modelAlias(m.file);
+        const tags = presetFor(m.file, m.sizeGB).tags || [];
         out.unshift({
           ref: `local:${alias}`, provider: 'local', model: alias,
+          // `kind` is what keeps a receipt reader out of the chat picker. A dedicated OCR
+          // transcriber is not a small chat model: ask one a question and dots.ocr answers
+          // "OCR" in two tokens, while HunyuanOCR returns the page back at you. Listing them
+          // side by side invites picking one by accident, and the result reads as a broken
+          // model rather than the wrong tool — so the pickers filter on this, and the OCR
+          // choice lives in Settings where it is deliberate.
+          kind: tags.includes('ocr') ? 'ocr' : 'chat',
+          vision: tags.includes('vision'),
           label: `${m.file.replace(/\.gguf$/i, '')} (${m.sizeGB}GB local${alias === current ? ' · serving' : ''})`,
         });
       }
     }
   } catch { /* llmctl unavailable — plain model list */ }
+
+  // One shape, whoever produced the entry.
+  //
+  // Providers each built their own object and only agreed on `label`; the phone's picker
+  // asked for `name`/`id`, which no provider has ever set. So every row on the phone
+  // rendered with an empty title and the word "local" underneath — a model list you
+  // cannot read, which is exactly how it was reported. Normalising at the boundary fixes
+  // both pickers at once and stops the next client having to guess.
+  for (const m of out) {
+    m.kind ||= 'chat';
+    if (!m.name) {
+      // Local labels read "gemma4-e4b-iq4xs-turbo-text (4.74GB local · serving)" — the
+      // name is worth showing large and the qualifier small, so split rather than truncate.
+      const split = String(m.label || m.model || '').match(/^(.*?)\s*\(([^()]*)\)\s*$/);
+      m.name = split ? split[1] : (m.label || m.model || m.ref);
+      m.detail = m.detail || (split ? split[2] : m.provider);
+    }
+    m.detail ||= m.provider;
+  }
   return out;
 }
 

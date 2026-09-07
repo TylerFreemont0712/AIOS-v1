@@ -112,8 +112,23 @@ export async function ensureServing(alias, { waitBusyMs = 180_000 } = {}) {
   const m = findByAlias(alias);
   if (!m) throw err(`no local model answers to "${alias}" — check the Models app`, 404);
   const t0 = Date.now();
-  while (llmStatus().running && await llamaBusy()) {
-    if (Date.now() - t0 > waitBusyMs) throw err('llama-server has been busy for 3 minutes — try again, or stop the running generation', 503);
+  let everAnswered = false;         // did /slots tell us the truth even once?
+  while (llmStatus().running) {
+    const { busy, certain } = await llamaBusy();
+    if (certain) everAnswered = true;
+    if (!busy) break;
+    if (Date.now() - t0 > waitBusyMs) {
+      // Three minutes of "busy" is one of two very different situations, and they need
+      // opposite responses. If /slots answered even once, a generation is genuinely in
+      // flight and killing it would lose somebody's reply — refuse, and say so.
+      if (everAnswered) throw err('llama-server has been busy for 3 minutes — try again, or stop the running generation', 503);
+      // If it never answered, the server is wedged rather than busy, and a wedged one
+      // never recovers on its own: every swap would fail until someone restarted it by
+      // hand. Measured 2026-09-05 — three hours of exactly this, during which no local
+      // model could be selected at all and every receipt scan failed. Take the GPU back.
+      console.warn(`[llm] /slots has not answered in ${Math.round((Date.now() - t0) / 1000)}s — treating llama-server as wedged, restarting it for "${alias}"`);
+      break;
+    }
     await sleep(2000);
   }
   await startModel(m.path);   // waits for /health; first request pays the load time

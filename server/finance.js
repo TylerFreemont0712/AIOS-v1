@@ -156,19 +156,45 @@ export async function modelOptions() {
     return out;
   }
 
-  // Best vision model by measured quality, falling back to the smallest (which
-  // will at least load alongside everything else on an 8GB card).
-  const ranked = out.vision.slice().sort((a, b) => {
+  // Reading the paper and talking about it are different jobs, and this used to
+  // recommend one model for both.
+  //
+  // The old advice was "use the best vision model for all three, so a scan never has to
+  // swap mid-job" — swap cost, which is real. But a general VLM asked to transcribe does
+  // not transcribe: it writes about the receipt. Measured over 23 archive scans, Gemma 4
+  // returned "### 🇯🇵 日本語原文 … **[Item List - Partial Transcription]**" — every total
+  // right, every product name gone. Saving one model swap is not worth losing the lines,
+  // so the reader is now picked from the DEDICATED transcribers (preset tag `ocr`) and the
+  // text jobs from everything else.
+  const isReader = (e) => (llmctl.presetFor(e.file, e.sizeGB).tags || []).includes('ocr');
+  const byScore = (a, b) => {
     const sa = scoreOf(a.ref)?.overall ?? -1, sb = scoreOf(b.ref)?.overall ?? -1;
-    return sb - sa || a.sizeGB - b.sizeGB;
-  });
-  const pick = ranked[0];
-  const s = scoreOf(pick.ref);
+    return sb - sa || a.sizeGB - b.sizeGB;         // ties go to the smaller model
+  };
+
+  const readers = out.vision.filter(isReader).sort(byScore);
+  // Structuring, naming and write-ups are text jobs. Smallest-that-scores-well wins:
+  // the reader and the text model cannot both be resident on one card, so every scan
+  // pays a load for each — and a 2GB model loads in seconds where a 5GB one does not.
+  const texts = out.local.filter(e => !isReader(e)).sort(byScore);
+
+  if (!readers.length) {
+    out.note = 'No dedicated OCR model is installed. Receipt reading works best with a '
+      + 'transcriber (tagged `ocr` in its preset) rather than a general vision model, which '
+      + 'tends to summarise the receipt instead of transcribing it.';
+    return out;
+  }
+
+  const reader = readers[0];
+  const text = texts[0] || reader;
+  const rs = scoreOf(reader.ref);
   out.recommended = {
-    ocrModel: pick.ref, itemModel: pick.ref, recapModel: pick.ref,
-    why: `${pick.file} is the ${out.vision.length > 1 ? 'best-scoring ' : ''}vision-capable model on this machine`
-      + (s ? ` (bench ${s.overall}, ${s.tokS} tok/s)` : '')
-      + '. Using it for all three keeps llama.cpp on one model, so a receipt scan never has to swap mid-job.',
+    ocrModel: reader.ref,
+    ocrTextModel: text.ref, itemModel: text.ref, recapModel: text.ref,
+    why: `${reader.file} transcribes the paper`
+      + (rs ? ` (bench ${rs.overall}, ${rs.tokS} tok/s)` : '')
+      + `, and ${text.file} turns that into fields. Two jobs, two models: a reader that `
+      + 'answers questions transcribes badly, and a transcriber cannot tell you what it read.',
   };
   return out;
 }

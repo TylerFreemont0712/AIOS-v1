@@ -84,10 +84,47 @@ async function runQueue(items) {
  * a 12-megapixel HEIC that decoded fine the first time. On a phone on a flaky LAN this
  * is the difference between one tap and photographing the receipt again.
  */
+// Keep the screen awake while the box is reading.
+//
+// A scan is minutes of GPU on this machine, and for all of it the phone sits on a fetch
+// with nothing to show. iOS locks the screen after 30s by default, suspends the tab and
+// kills the request — which arrives here as Safari's bare `TypeError: Load failed` and is
+// shown on the card verbatim. That is the "load error" this screen gets reported for, and
+// it is not a network fault at all: /scan lands its row before it asks the model anything,
+// so the box carries on reading and files the receipt whether or not anyone is listening.
+//
+// The Wake Lock API is the fix. It is absent on older Safari and rejects outright when the
+// document is hidden, so every call is guarded and the feature simply does not exist where
+// it cannot — a screen that sleeps is the old behaviour, not a new failure.
+let wakeLock = null;
+let wakeHolders = 0;
+
+async function keepAwake() {
+  wakeHolders++;
+  if (wakeLock || !navigator.wakeLock) return;
+  try { wakeLock = await navigator.wakeLock.request('screen'); }
+  catch { wakeLock = null; }                     // denied, hidden or unsupported: carry on
+}
+
+function letSleep() {
+  wakeHolders = Math.max(0, wakeHolders - 1);    // several photos can be reading at once
+  if (wakeHolders || !wakeLock) return;
+  try { wakeLock.release(); } catch { /* already released by the browser */ }
+  wakeLock = null;
+}
+
+// The browser drops the lock whenever the tab is hidden, and does not give it back on its
+// own — so coming back to a scan that is still running needs a fresh one.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !wakeHolders || wakeLock) return;
+  navigator.wakeLock?.request('screen').then(l => { wakeLock = l; }, () => { });
+});
+
 async function processOne(item) {
   const set = (status, extra = {}) => { Object.assign(item, { status, ...extra }); render(); };
   item.error = '';
   item.attempts = (item.attempts || 0) + 1;
+  await keepAwake();
   try {
     // The box already made a row for this photo. Re-read THAT one — a second
     // /scan on the same upload would leave two receipts to reconcile by hand.
@@ -116,7 +153,18 @@ async function processOne(item) {
     set('reading');
     land(item, await post('/finance/receipts/scan', { uploadId: item.uploadId }), set);
   } catch (e) {
-    set('failed', { error: e.message });
+    // A dropped connection is not a failed scan. The upload is already on the box and
+    // /scan has already filed its row, so the reading is still happening and will be
+    // there shortly — telling the user "Load failed" invites them to photograph a
+    // receipt the box is in the middle of reading.
+    const dropped = (e instanceof TypeError) || /load failed|networkerror|network error|connection/i.test(e.message || '');
+    set('failed', {
+      error: dropped && item.uploadId
+        ? 'the phone lost the connection while the box was reading — it is probably still working, so give it a minute and reopen this screen before trying again'
+        : e.message,
+    });
+  } finally {
+    letSleep();
   }
 }
 

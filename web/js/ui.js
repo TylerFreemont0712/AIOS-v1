@@ -188,7 +188,13 @@ export async function fetchModels(force = false) {
 
 /**
  * A pill that shows the current model and opens a chooser.
- * opts: { value, onchange(ref), storageKey }
+ * opts: { value, onchange(ref), storageKey, kinds }
+ *
+ * `kinds` is what this picker is allowed to offer, and it defaults to chat models only.
+ * A dedicated OCR transcriber is not a small chat model — ask dots.ocr a question and it
+ * answers "OCR" in two tokens — so listing the receipt readers beside the chat models
+ * only ever produces a confusing failure. The receipt reader has its own picker in
+ * Settings (`kinds: ['ocr']`), which is the single place it can be changed.
  */
 export function modelPicker(opts = {}) {
   let value = opts.value || (opts.storageKey && localStorage.getItem('aios.model.' + opts.storageKey)) || '';
@@ -200,7 +206,8 @@ export function modelPicker(opts = {}) {
 
   pill.addEventListener('click', async (e) => {
     e.stopPropagation();
-    const models = await fetchModels();
+    const kinds = opts.kinds || ['chat'];
+    const models = (await fetchModels()).filter(m => kinds.includes(m.kind || 'chat'));
     const items = [];
     if (!models.length) items.push({ label: 'No models — configure a provider in Settings', onclick: () => window.aios?.open('settings', { tab: 'providers' }) });
     const byProv = {};

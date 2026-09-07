@@ -461,18 +461,38 @@ export default async function chatScreen({ host, params, ui, go }) {
   const modelLabel = () => (S.model || '').split(':').pop() || 'no model';
 
   function openModels() {
-    sheet('Model', (body, close) => {
-      if (!S.models.length) return body.append(empty('No models available', 'Start a local model, or add an API key in Settings.'));
-      body.append(el('div', { class: 'm-menu' }, ...S.models.map(m => {
-        const ref = m.ref || `${m.provider}:${m.id}`;
+    sheet('Model', async (body, close) => {
+      // Fetch on demand if the list has not landed yet.
+      //
+      // The action is registered before the boot fetch resolves, and /api/models probes
+      // every configured provider — seconds, on a cold cache. Tapping Model in that window
+      // (which is exactly when you tap it: the screen has just opened) used to render
+      // "No models available" and then sit there, because the sheet is built once and
+      // never revisited. A list that is merely late is not a list that is empty.
+      if (!S.models.length) {
+        body.append(loading('Finding models…'));
+        try {
+          const m = await get('/models');
+          S.models = Array.isArray(m) ? m : (m.models || []);
+        } catch (e) {
+          return fill(body, empty('Could not load models', e.message));
+        }
+        fill(body);
+      }
+      // Receipt readers are not chat models — see `kind` in server/llm.js. They live in
+      // Settings, deliberately out of reach of a one-tap picker.
+      const usable = S.models.filter(m => m.kind !== 'ocr');
+      if (!usable.length) return body.append(empty('No models available', 'Start a local model, or add an API key in Settings.'));
+      body.append(el('div', { class: 'm-menu' }, ...usable.map(m => {
+        const ref = m.ref || `${m.provider}:${m.model}`;
         return el('button', { class: 'm-menu-row' + (ref === S.model ? ' is-on' : ''), onclick: () => {
           S.model = ref;
           ui.setTitle(document.querySelector('.m-title')?.textContent || 'Chat', modelLabel());
           close();
         } },
           el('div', { class: 'm-grow' },
-            el('div', { class: 'm-menu-t' }, m.name || m.id),
-            el('div', { class: 'm-menu-d' }, m.provider || '')));
+            el('div', { class: 'm-menu-t' }, m.name || m.model || ref),
+            el('div', { class: 'm-menu-d' }, m.detail || m.provider || '')));
       })));
     });
   }

@@ -680,10 +680,15 @@ alone, and a bare word filters by group (`npm run toolcheck -- vault`).
 ## Starting it
 
 **Simplest — a desktop shortcut.** `scripts/aios.desktop` (installed to your app
-menu and `~/Desktop`) runs `scripts/aios-launch.sh`: it starts the server only if
-it isn't already up, waits for it, then opens your browser — with a desktop
-notification either way. Right-click the icon for **Open in browser** (no start) and
-**Stop AIOS server**. To (re)install after moving the project:
+menu and `~/Desktop`) runs `scripts/aios-launch.sh`. A double-click is a **restart
+button**: it kills whatever is on :7777 (by port owner, not by pidfile), starts a
+fresh server so code changes take effect, waits until *that* process is the one
+holding the port, opens your browser — and then resets the Tailscale HTTPS
+front-end in front of it, so away-from-home access comes back with the hub rather
+than needing a separate trip to Settings. Every step reports itself with a desktop
+notification. Right-click for **Start** (never kills), **Open in browser** (no
+start), **Reset remote access only**, and **Stop**. To (re)install after moving the
+project:
 
 ```
 desktop-file-install --dir=$HOME/.local/share/applications scripts/aios.desktop
@@ -695,6 +700,18 @@ The launcher forces brew's `node` onto PATH (desktop launchers start with a bare
 one) and daemonizes the server (PID in `aios.pid`, logs in `aios.log`), so it keeps
 running after you close the launcher. The paths inside `aios.desktop` and
 `aios-launch.sh` are absolute — edit them if the project moves.
+
+The Tailscale step never escalates and never fails the restart. `tailscale up` and
+`tailscale serve` run as the operator (`sudo tailscale set --operator=$USER`, once);
+anything needing root is reported with the exact command rather than run, and a
+Tailscale that is missing, logged out or wedged just means the hub comes up on
+localhost and the LAN as usual. It finishes by checking that `https://<host>.ts.net/`
+really answers — deliberately **not** an `/api` route, because only `/api` is behind
+the token and a request arriving through `serve` is classified `tailnet`, not
+loopback: probing it would 401 *and* burn a failed attempt against this machine's own
+tailnet IP on every restart, and the per-IP backoff refuses a locked-out caller even
+with the right token. `AIOS_NO_TUNNEL=1` skips the whole step; `AIOS_NO_OPEN=1` skips
+the browser.
 
 **Always-on — a systemd user service.** Start on login, restart on crash:
 

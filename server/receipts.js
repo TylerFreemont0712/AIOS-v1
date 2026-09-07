@@ -734,6 +734,40 @@ function structureModel() {
  * failures come back as `{ error }` rather than thrown, because a failed attempt is a
  * result the loop has to compare against the others, not an emergency.
  */
+/**
+ * The shop name off the top of the transcription, for when stage 2 did not take it.
+ *
+ * The name is the first thing printed on a receipt and the transcriber reads it fine —
+ * every 阪急OASIS scan in this archive opens `# 阪急OASIS` / `高槻川西店` — yet the
+ * structurer returns an empty merchant on roughly half of them (bench: shop 20%, against
+ * 93% of line amounts found). Recovering it from text already in hand beats another model
+ * call, and it is deterministic, which the structurer is not.
+ *
+ * An empty merchant is not merely a missing label, which is what makes this worth doing:
+ * `learnFix` files a correction with `merchant: ''` GLOBALLY, at every shop. That is how a
+ * price correction for one shop's mince escaped and started rewriting other receipts.
+ *
+ * Conservative on purpose — it only ever replaces an empty value, and it skips anything
+ * that is a document title, a phone number, a date, money, or a summary line. A branch
+ * name ("高槻川西店") is an acceptable answer: it is a real shop and a stable key, which
+ * "" is not.
+ */
+const MERCHANT_TITLE = /^(領収証|領収書|レシート|お買上明細|お買い上げ明細|明細書|receipt|tax invoice|invoice)$/i;
+
+export function merchantFromTranscription(raw) {
+  for (const line of String(raw || '').split('\n').slice(0, 8)) {
+    const s = line.replace(/^[#>*\s|—–-]+/, '').replace(/[|*_`\s]+$/, '').trim();
+    if (s.length < 2 || s.length > 40) continue;
+    if (MERCHANT_TITLE.test(s) || looksLikeSummary(s)) continue;
+    if (/[¥￥$€£]/.test(s)) continue;                                  // a money line
+    if (/^[\d\s()+.:/\-]+$/.test(s)) continue;                          // phone, barcode, rule
+    if (/\d{4}\s*年|\d{1,2}\s*月\s*\d{1,2}\s*日|\d{1,2}:\d{2}/.test(s)) continue;   // date or time
+    if (!/[A-Za-z\u3040-\u30ff\u4e00-\u9fff]/.test(s)) continue;        // must carry a word
+    return s;
+  }
+  return '';
+}
+
 async function readOnce({ meta, modelRef, cfg, prompt, signal, textModelRef }) {
   // A dedicated OCR model reads the paper far better than it answers questions about it,
   // so when one is selected the work is split: it transcribes, then a text model turns
@@ -765,6 +799,14 @@ async function readOnce({ meta, modelRef, cfg, prompt, signal, textModelRef }) {
         console.warn('[receipts] structuring failed on the first pass — retrying');
         out = await structure(raw, cfg, textModel, signal);
         parsed = normalize(extractJSON(out.text, { require: ['total', 'merchant', 'items'] }), cfg);
+      }
+      // The transcription has the shop name even when the structuring pass loses it.
+      if (parsed && !parsed.merchant) {
+        const fromPaper = merchantFromTranscription(raw);
+        if (fromPaper) {
+          parsed.merchant = fromPaper;
+          console.log(`[receipts] took the shop name off the transcription: ${fromPaper}`);
+        }
       }
       return {
         parsed, raw, model: `${modelRef} → ${textModel}`,
@@ -877,7 +919,15 @@ function tilePolicy() {
  */
 function planAngle(last, used) {
   const p = last?.parsed;
-  const illegible = !p || !p.merchant || !p.items?.length;
+  // AND, not OR — the two cases above are "nothing legible" versus "legible but wrong",
+  // and a missing shop name on its own is neither. Plenty of receipts here read every
+  // line correctly and simply have no shop name printed where the model can find it:
+  // one in this archive came back with 19 items and a matching total under a null
+  // merchant, and `||` sent that upright, perfectly-read photo round the whole rotation
+  // ladder — two extra passes of 25-40s GPU each, and a rotateStored that can leave the
+  // picture the user reviews against turned the wrong way. Turning the paper only helps
+  // when the paper was not read at all.
+  const illegible = !p || (!p.merchant && !p.items?.length);
   if (!illegible) return null;                       // read fine; the angle is not the problem
   return [180, 90, 270].find(a => !used.includes(a)) ?? null;
 }
@@ -1089,10 +1139,25 @@ const SUMMARY_KEYWORD = new RegExp([
 const stripNoise = (s) => s
   .replace(/no\.?|#|[¥￥$€£]/gi, '')                       // "No.28822", "#4", currency marks
   .replace(/[\d.,\s:：．・()（）%％*×x/\\-]/gi, '')
-  .replace(/点|個|品|枚|本|items?|pcs?|qty|税|込|抜|等|円/gi, '');
+  // 外/内/対象/軽(減) belong to the tax vocabulary the line above already matched on.
+  // Without them `消費税等外税（8%） ¥305` — printed verbatim on these receipts — keeps a
+  // residual 外 and reads as a product, taking ¥305 of tax into the ledger as a purchase.
+  .replace(/点|個|品|枚|本|items?|pcs?|qty|税|込|抜|等|円|外|内|対象|軽減|軽|計/gi, '');
+
+/**
+ * A bare count line: `2点`, `4点`, `* 4点 068`.
+ *
+ * `点数` is in the keyword list but a naked number-plus-点 is not, and this archive has
+ * three of them — each carrying the amount of the REAL product line printed beside it, so
+ * each one is both a phantom purchase and a stolen price. Anchored on the leading digits,
+ * which is what keeps `*ｱﾎﾞｶﾄﾞ1個標 2点` and `*ﾏ・ﾏ・ﾂﾁｸﾞﾏｶﾛﾆ 2点` — real products that
+ * merely END in a count — out of it.
+ */
+const COUNT_LINE = /^[\s*＊•・]*\d+\s*点[\s\d¥￥,.\-]*$/;
 
 function looksLikeSummary(s) {
   const t = String(s || '').trim();
+  if (COUNT_LINE.test(t)) return true;
   const m = SUMMARY_KEYWORD.exec(t);
   if (!m) return false;
   return stripNoise(t.slice(m[0].length)) === '';
@@ -1100,7 +1165,14 @@ function looksLikeSummary(s) {
 
 /** Placeholder names a model reaches for when it cannot read the line. Useless in a
  *  catalogue, and a signal the reading is untrustworthy rather than a real product. */
-const PLACEHOLDER_NAME = /^(?:product|item|unknown|n\/?a|unnamed|goods|misc(?:ellaneous)?|商品|品物|不明)$/i;
+//
+// Anchored-exact matched none of the names the model actually reaches for when it cannot
+// read a line: `Product Code`, `Grade (Item)`, `(Item/Service)`, `(Service/Item)` — all
+// present in this archive, all carrying real money. So a placeholder word may now be
+// wrapped in brackets and paired with a generic qualifier.
+const PLACEHOLDER_WORD = 'product|item|service|goods|grade|code|description|unknown|n\\/?a|unnamed|misc(?:ellaneous)?|商品|品物|品名|不明';
+const PLACEHOLDER_NAME = new RegExp(
+  `^[\\s(（\\[]*(?:${PLACEHOLDER_WORD})(?:[\\s/／・·()（）\\]\\[-]+(?:${PLACEHOLDER_WORD}))?[\\s)）\\]]*$`, 'i');
 
 /**
  * Do the line items add up?
@@ -1151,9 +1223,20 @@ function reconcile(items, { subtotal, tax, total }) {
  */
 export function looksLikeCode(name) {
   const s = String(name || '').trim();
-  if (s.length < 3 || s.length > 20) return false;
+  if (s.length < 3 || s.length > 28) return false;
   if (/[\p{L}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(s)) return false;
-  return /^[#*]?\d[\d\s#*\-./]*\d$/.test(s) && (s.match(/\d/g) || []).length >= 3;
+  // A transcriber that cannot name a line often keeps the price next to the code:
+  // `4514603217216 ¥158`. The currency mark alone used to defeat this, so two real
+  // barcode lines reached the reviewer named "Product Code" with no warning at all.
+  //
+  // Stripping the amount is only safe if what remains is long enough to be a barcode
+  // rather than a numeric product — `1000 ¥298` is a price, not a code — hence the
+  // six-digit floor, which a JAN (8 or 13) clears and a shelf price does not.
+  const priced = s.match(/^(.*?)\s*[¥￥$€£]\s*[\d,.]+$/);
+  const core = priced ? priced[1].trim() : s;
+  if (priced && (core.match(/\d/g) || []).length < 6) return false;
+  if (core.length < 3 || core.length > 20) return false;
+  return /^[#*]?\d[\d\s#*\-./]*\d$/.test(core) && (core.match(/\d/g) || []).length >= 3;
 }
 
 function annotate(lines, total) {
@@ -1168,6 +1251,12 @@ function annotate(lines, total) {
     // and that correction is exactly what the catalogue learns from.
     if (looksLikeCode(it.name)) {
       warn.push(`“${it.name}” looks like an item code rather than a product — check the photo for the name`);
+    } else if (it.unnamed) {
+      // The reader could not name this line at all. Say so plainly: an unnamed line
+      // carrying money is the shape a phantom takes, and it is the reviewer — not the
+      // arithmetic check — who can tell a real purchase from a summary row wearing a
+      // product's clothes. The sum cannot: a subtotal equals the lines it replaced.
+      warn.push(`the reader could not name this line — check the photo before logging ${it.amount}`);
     }
     let probe = null;
     try { probe = items.priceProbe(it.printed || it.name); } catch { /* no history yet */ }
@@ -1318,8 +1407,15 @@ function normalize(obj, cfg, { trust = false } = {}) {
     let name = String(it?.name ?? it?.printed ?? '').trim().slice(0, 120);
     // "Product"/"商品" tells us nothing and would pollute the catalogue. The printed
     // text is always more useful than a placeholder, even untidied.
-    if (PLACEHOLDER_NAME.test(name) && printed) name = printed;
+    // Remember that the model had no name for this line, even after substitution.
+    // Swapping in the printed text usually helps, but not when the printed text is the
+    // same placeholder — `(Item/Service)` naming `(Service/Item)`, both carrying ¥797,
+    // which is the subtotal. Losing that signal meant the line reached the reviewer
+    // looking like an ordinary product.
+    const unnamed = PLACEHOLDER_NAME.test(name);
+    if (unnamed && printed) name = printed;
     const line = { printed, name, qty: Math.max(1, Math.trunc(Number(it?.qty) || 1)), amount: numOrNull(it?.amount) };
+    if (unnamed) line.unnamed = true;
     // Sticky: the editor sets this when a human touches the name or the printed text, and
     // apply() uses it to file the line under THEIR name instead of the model's guess. It
     // has to survive re-normalisation, and it must never be inferrable by comparing keys —
@@ -1693,11 +1789,34 @@ function learnFromEdit(aiParsed, userParsed) {
   // model line gets a second chance against the user's unclaimed lines, paired on the
   // money — a line carrying the same amount at the same shop is the same purchase under a
   // corrected name, not a phantom.
-  const byKey = new Map(userParsed.items.map(it => [fixKey(it.printed || it.name), it]));
+  //
+  // A printed name is NOT a unique key, and assuming it was is how this loop learned to
+  // corrupt correct money. This very archive has `*国産豚肉 ﾐﾝﾁ` printed THREE times on
+  // one receipt at 264, 299 and 273 — the same mince, weighed three times — and
+  // `*輸入豚肉 ﾛｰｽ しゃぶ` twice at 199 and 185. A Map built from those keeps only the
+  // last line per name, so a model line matched the wrong user line and the difference
+  // between two genuinely different lines was filed as a correction: "when you read 299,
+  // they meant 273". It reached hits=8, above AUTO_FIX_AFTER, with merchant='' — i.e.
+  // applied at every shop — and the replay guard could not catch it because the value it
+  // checks against IS the correct reading. Every future scan of that receipt would have
+  // been silently short by ¥26, and the arithmetic check would have blamed the total.
+  //
+  // So: keep every line under its key, and when a name is ambiguous let the money break
+  // the tie — an identical name carrying an identical amount is the same line, and there
+  // is nothing to learn from it. Only if no amount matches do we fall back to order.
+  const byKey = new Map();
+  for (const it of userParsed.items) {
+    const k = fixKey(it.printed || it.name);
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(it);
+  }
+  const dupKey = new Set([...byKey].filter(([, v]) => v.length > 1).map(([k]) => k));
   const claimed = new Set();
   const pairs = aiParsed.items.map((ai) => {
-    const mine = byKey.get(fixKey(ai.printed || ai.name));
-    if (mine && !claimed.has(mine)) { claimed.add(mine); return [ai, mine]; }
+    const queue = byKey.get(fixKey(ai.printed || ai.name)) || [];
+    const mine = queue.find(it => !claimed.has(it) && Number(it.amount) === Number(ai.amount))
+      || queue.find(it => !claimed.has(it));
+    if (mine) { claimed.add(mine); return [ai, mine]; }
     return [ai, null];
   });
   const spare = userParsed.items.filter(it => !claimed.has(it));
@@ -1709,16 +1828,20 @@ function learnFromEdit(aiParsed, userParsed) {
 
   for (const [ai, mine] of pairs) {
     const raw = ai.printed || ai.name;
+    // When one name appears on several lines, which line the user edited is not
+    // recoverable from a diff — the pairing above is a best guess, and `amount`/`drop`
+    // are exactly the two lessons a wrong guess turns into corrupted money. A rename is
+    // safe (every printing of that name shares it), so it still learns.
+    const ambiguous = dupKey.has(fixKey(raw));
     if (!mine) {                                        // genuinely gone: the user deleted it
-      learnFix({ merchant, kind: 'drop', raw, aiValue: String(ai.amount) });
-      n++;
+      if (!ambiguous) { learnFix({ merchant, kind: 'drop', raw, aiValue: String(ai.amount) }); n++; }
       continue;
     }
     if (mine.name && ai.name && mine.name !== ai.name) {
       learnFix({ merchant, kind: 'rename', raw, aiValue: ai.name, userValue: mine.name });
       n++;
     }
-    if (Number(mine.amount) !== Number(ai.amount)) {
+    if (!ambiguous && Number(mine.amount) !== Number(ai.amount)) {
       learnFix({ merchant, kind: 'amount', raw, aiValue: String(ai.amount), userValue: String(mine.amount) });
       n++;
     }

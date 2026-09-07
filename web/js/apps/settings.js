@@ -1094,23 +1094,28 @@ export default {
         ui.panel.append(recBox);
 
         const JOBS = [
-          ['ocrModel', 'Reading receipts', 'Turns a photograph into merchant, date and line items. This one must be vision-capable — a text-only model cannot see the image.', true],
-          ['itemModel', 'Naming products', 'Decides that "明治おいしい牛乳" is Milk. Wants strict JSON and comfortable Japanese.'],
-          ['recapModel', 'Monthly write-ups', 'Writes the short account of each month you read back later. Wants readable prose.'],
+          ['ocrModel', 'Reading receipts', 'Transcribes the photograph, line by line. A dedicated OCR model: a chat model asked to do this writes an essay about the receipt instead of copying it.', 'ocr'],
+          ['ocrTextModel', 'Structuring the reading', 'Turns that transcription into merchant, date and line items. Text only — and the smaller the better, because the reader and this one cannot both be resident on an 8GB card, so every scan pays a load for each.', 'chat'],
+          ['itemModel', 'Naming products', 'Decides that "明治おいしい牛乳" is Milk. Wants strict JSON and comfortable Japanese.', 'chat'],
+          ['recapModel', 'Monthly write-ups', 'Writes the short account of each month you read back later. Wants readable prose.', 'chat'],
         ];
 
         let visionRefs = new Set();
         const pickers = {};
-        for (const [key, name, sub, needsVision] of JOBS) {
+        for (const [key, name, sub, kind] of JOBS) {
           const warn = el('div', { class: 'set-sub', style: { color: 'var(--warn)', marginTop: '4px' } });
           const sync = (ref) => {
-            warn.textContent = needsVision && ref
+            warn.textContent = kind === 'ocr' && ref
               && visionRefs.size && ref.startsWith('local:') && !visionRefs.has(ref)
               ? 'This local model has no projector paired with it, so it cannot read images. Pair one in Settings → Models, or pick a vision model.'
               : '';
           };
           const p = modelPicker({
             value: fin[key] || '', allowEmpty: true, placeholder: 'chat default',
+            // Reading the paper is the one job that wants a dedicated transcriber, and the
+            // only one where a chat model quietly does something else — it summarises the
+            // receipt instead of transcribing it, which reads as "the OCR got worse".
+            kinds: [kind],
             onchange: async (ref) => { await save({ finance: { [key]: ref } }); sync(ref); },
           });
           pickers[key] = { picker: p, sync };
@@ -1137,7 +1142,7 @@ export default {
               return;
             }
             const r = o.recommended;
-            const already = [...JOBS].every(([k]) => (fin[k] || '') === r[k]);
+            const already = [...JOBS].every(([k]) => (fin[k] || '') === (r[k] || ''));
             recBox.append(
               el('div', { class: 'set-name' }, already ? 'Recommended setup — in use' : 'Recommended setup'),
               el('div', { class: 'set-sub' }, r.why),
@@ -1145,10 +1150,14 @@ export default {
                 el('button', {
                   class: 'btn sm primary',
                   onclick: async () => {
-                    if (await save({ finance: { ocrModel: r.ocrModel, itemModel: r.itemModel, recapModel: r.recapModel } },
-                      'finance models set')) renderPanel();
+                    if (await save({
+                      finance: {
+                        ocrModel: r.ocrModel, ocrTextModel: r.ocrTextModel,
+                        itemModel: r.itemModel, recapModel: r.recapModel,
+                      },
+                    }, 'finance models set')) renderPanel();
                   },
-                }, icon('sparkle'), `Use ${prettyModel(r.ocrModel)} for all three`)));
+                }, icon('sparkle'), `Use ${prettyModel(r.ocrModel)} + ${prettyModel(r.ocrTextModel)}`)));
           } catch (e) {
             recBox.innerHTML = '';
             recBox.append(el('div', { class: 'set-sub' }, `could not check models: ${e.message}`));

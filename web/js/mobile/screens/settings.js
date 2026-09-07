@@ -23,6 +23,7 @@ export default async function settingsScreen({ host, ui, state }) {
   const remoteBox = el('section', { class: 'm-section' });
   const themeBox = el('section', { class: 'm-section' });
   const modelBox = el('section', { class: 'm-section' });
+  const ocrBox = el('section', { class: 'm-section' });
   const deviceBox = el('section', { class: 'm-section' });
   const aboutBox = el('section', { class: 'm-section' });
 
@@ -149,8 +150,8 @@ export default async function settingsScreen({ host, ui, state }) {
       !models.length
         ? el('div', { class: 'm-boxcard' }, el('p', { class: 'm-note' },
           'No models reachable. Start the local llama-server, or add an API key from the desktop.'))
-        : el('div', { class: 'm-menu' }, ...models.slice(0, 12).map(m => {
-          const ref = m.ref || `${m.provider}:${m.id}`;
+        : el('div', { class: 'm-menu' }, ...models.filter(m => m.kind !== 'ocr').slice(0, 12).map(m => {
+          const ref = m.ref || `${m.provider}:${m.model}`;
           return el('button', {
             class: 'm-menu-row' + (ref === cur ? ' is-on' : ''),
             onclick: async () => {
@@ -163,9 +164,72 @@ export default async function settingsScreen({ host, ui, state }) {
             },
           },
             el('div', { class: 'm-grow' },
-              el('div', { class: 'm-menu-t' }, m.name || m.id),
-              el('div', { class: 'm-menu-d' }, m.provider || '')));
+              el('div', { class: 'm-menu-t' }, m.name || m.model || ref),
+              el('div', { class: 'm-menu-d' }, m.detail || m.provider || '')));
         })),
+    );
+  }
+
+  // ---------- reading receipts ----------
+  //
+  // Deliberately NOT the one-tap list the chat model gets above.
+  //
+  // This is the one model choice that quietly changes what the app *produces* rather than
+  // how it sounds. A dedicated transcriber returns the paper line by line; a general chat
+  // model asked the same thing writes an essay about the receipt — "### 🇯🇵 日本語原文 …
+  // **[Item List - Partial Transcription]**" — with every total right and every product
+  // name gone. That reads as the scanner getting worse, not as a setting being wrong, so
+  // it is worth being hard to change by accident: the picker offers transcribers only,
+  // and it asks before it switches.
+  function renderOcr(cfg, models) {
+    const readers = models.filter(m => m.kind === 'ocr');
+    const cur = cfg?.finance?.ocrModel || '';
+    const reading = readers.find(m => m.ref === cur);
+    const structurer = cfg?.finance?.ocrTextModel || '';
+
+    const choose = () => sheet('Receipt reader', (body, close) => {
+      if (!readers.length) {
+        return body.append(empty('No transcribers installed',
+          'Receipt reading needs a model tagged `ocr` with a projector beside it.'));
+      }
+      body.append(el('div', { class: 'm-menu' }, ...readers.map(m => el('button', {
+        class: 'm-menu-row' + (m.ref === cur ? ' is-on' : ''),
+        onclick: async () => {
+          if (m.ref === cur) return close();
+          if (!await confirmSheet('Change the receipt reader?',
+            `Receipts will be read by ${m.name}. The current one, ${reading?.name || cur || 'none'}, has been measured against your own archive — only change this if you are testing a reader.`,
+            { ok: 'Change reader' })) return;
+          try {
+            await put('/config', { finance: { ocrModel: m.ref } });
+            cfg.finance = { ...(cfg.finance || {}), ocrModel: m.ref };
+            close();
+            renderOcr(cfg, models);
+            toast('Receipt reader set', 'ok');
+          } catch (e) { toast(e.message, 'err'); }
+        },
+      },
+        el('div', { class: 'm-grow' },
+          el('div', { class: 'm-menu-t' }, m.name || m.model),
+          el('div', { class: 'm-menu-d' }, m.detail || 'local'))))));
+    });
+
+    fill(ocrBox,
+      el('h2', { class: 'm-section-title' }, 'Reading receipts'),
+      // Stacked rather than the label/value rows the other cards use: these values are
+      // model filenames, and `gemma4-e4b-iq4xs-turbo-text` right-aligned on a 390px phone
+      // runs straight off the screen — the same clipping the tailnet name suffers above.
+      el('div', { class: 'm-boxcard' },
+        el('div', { class: 'm-menu-t' + (reading ? '' : ' is-warn') },
+          reading?.name || (cur ? cur.split(':').pop() : 'not set')),
+        el('div', { class: 'm-menu-d' }, 'reads the paper' + (reading?.detail ? ` · ${reading.detail}` : '')),
+        el('div', { class: 'm-menu-t', style: { marginTop: '12px' } },
+          structurer ? structurer.split(':').pop() : 'chat default'),
+        el('div', { class: 'm-menu-d' }, 'turns the transcription into lines'),
+        el('p', { class: 'm-note' },
+          'Two jobs, two models: a reader that answers questions transcribes badly, and a '
+          + 'transcriber cannot tell you what it read.'),
+        el('div', { class: 'm-actions' },
+          el('button', { class: 'm-btn is-ghost', onclick: choose }, 'Change reader'))),
     );
   }
 
@@ -224,11 +288,11 @@ export default async function settingsScreen({ host, ui, state }) {
     const models = Array.isArray(modelsRaw) ? modelsRaw : (modelsRaw.models || []);
     const status = statusR.status === 'fulfilled' ? statusR.value : null;
 
-    fill(scroll, remoteBox, themeBox, modelBox, deviceBox, aboutBox);
+    fill(scroll, remoteBox, themeBox, modelBox, ocrBox, deviceBox, aboutBox);
     pullToRefresh(scroll, load);
 
     renderRemote(remote);
-    if (cfg) { renderTheme(cfg); renderModels(cfg, models); }
+    if (cfg) { renderTheme(cfg); renderModels(cfg, models); renderOcr(cfg, models); }
     renderDevice(remote);
     renderAbout(status);
   }

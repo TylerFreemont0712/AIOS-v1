@@ -428,23 +428,124 @@ export function llamaLog(lines = 120) {
   } catch { return '(no log yet)'; }
 }
 
-/** Is llama mid-generation right now? Routing must never yank a model out from under
- *  an in-flight request. Unknown (endpoint missing) counts as busy — safer. */
+/**
+ * Is llama mid-generation right now? Routing must never yank a model out from under
+ * an in-flight request.
+ *
+ * Returns `{ busy, certain }`, and the second field is load-bearing. This used to
+ * return a bare boolean where "I could not tell" collapsed into "busy" — safe for a
+ * second, catastrophic for an hour. Measured 2026-09-05: a llama-server sat for 3h16m
+ * with /health answering in 0.3ms while /slots never answered at all (every probe
+ * created a task that never completed — the log filled with `stop: cancel task`, two
+ * per routing decision, for three hours). Because unknown meant busy, EVERY model swap
+ * was refused for that whole time: each receipt scan waited out the full three minutes
+ * and then failed with "llama-server has been busy", naming an in-flight generation
+ * that did not exist. A wedged server is not a busy one, and unlike a busy one it never
+ * gets better on its own. The caller needs to be able to tell those apart.
+ */
 export async function llamaBusy() {
   const cfg = loadConfig().llm || {};
+  const port = cfg.port || 8080;
   try {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 1500);
-    const r = await fetch(`http://127.0.0.1:${cfg.port || 8080}/slots`, { signal: ctl.signal }).finally(() => clearTimeout(t));
-    if (!r.ok) return true;
+    const r = await fetch(`http://127.0.0.1:${port}/slots`, { signal: ctl.signal }).finally(() => clearTimeout(t));
+    if (!r.ok) return { busy: true, certain: false };
     const slots = await r.json();
-    return Array.isArray(slots) ? slots.some(s => s.is_processing) : true;
-  } catch { return !(await healthy(cfg.port || 8080)) ? false : true; }
+    if (!Array.isArray(slots)) return { busy: true, certain: false };
+    return { busy: slots.some(s => s.is_processing), certain: true };
+  } catch {
+    // Not answering /health either: it is down, which is emphatically not busy.
+    if (!(await healthy(port))) return { busy: false, certain: true };
+    return { busy: true, certain: false };
+  }
+}
+
+/**
+ * Model swaps run one at a time, in the order they were asked for.
+ *
+ * Every boot begins by killing whatever llama-server is running, so two boots in
+ * flight at once kill each other's server and neither survives. Caught live on
+ * 2026-09-05 with one receipt scan racing one chat send, in llama.log:
+ *
+ *   12:39:56.884 starting "model:hunyuanocr-q8_0" -> couldn't bind socket, port 8080
+ *   12:39:58.338 starting "model:hunyuanocr-q8_0" -> model loaded ... listening
+ *                        ...0.4s later:               cleaning up before exit
+ *
+ * The OCR model loads in two seconds and was killed 400ms after it came up, by the
+ * competing boot's stopLlama(). The scan saw "did not become healthy", fell back to a
+ * text-only chat model that cannot see an image at all, and the receipt failed — nine
+ * minutes later, because each of its three attempts also waited out the busy check.
+ * From the phone that is simply a photo that never reads.
+ *
+ * A queue rather than a lock: the second caller still gets its model, just after the
+ * first is up. Serializing here rather than in router.js covers every entrance —
+ * startModel, startProfile, resumeAfterGpu and the /api/llm routes all land in boot().
+ */
+let bootChain = Promise.resolve();
+function serializeBoot(fn) {
+  const next = bootChain.then(fn, fn);         // a rejection must not poison the queue
+  bootChain = next.then(() => { }, () => { });
+  return next;
+}
+
+// …and the queue alone is not enough, because it is per-process. `npm run receipt-bench`
+// (scripts/receipt-bench.mjs imports server/receipts.js and calls readReceipt directly),
+// `npm run audit` and the e2e scripts each drive the SAME llama-server from their own node
+// process with their own queue — so a bench run against the live hub is the identical
+// fatal race, and was caught being exactly that: two boots 22ms apart, one per process.
+// A lock file is the only thing both sides can see.
+//
+// Stale locks are how this pattern usually fails, so the holder writes its pid and the
+// time, and a lock is stolen when its owner is gone or it has outlived the longest
+// legitimate boot. Stealing beats blocking: a lock left by a crashed bench must never be
+// able to stop this machine from loading a model.
+const LOCK = path.join(DIR, 'boot.lock');
+const LOCK_CEILING_MS = 300_000;               // a cold 27B load is minutes, not seconds
+
+function lockIsLive() {
+  try {
+    const { pid, at } = JSON.parse(fs.readFileSync(LOCK, 'utf8'));
+    if (!(Date.now() - at < LOCK_CEILING_MS)) return false;   // also false for a bad `at`
+    return pid !== process.pid && alive(pid);
+  } catch { return false; }                    // absent or unreadable: nobody holds it
+}
+
+async function withBootLock(fn) {
+  const t0 = Date.now();
+  for (;;) {
+    try {
+      fs.mkdirSync(DIR, { recursive: true });
+      const fd = fs.openSync(LOCK, 'wx');      // create-or-fail: the atomic bit
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
+      fs.closeSync(fd);
+      break;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;        // a real fs problem is not ours to paper over
+      if (!lockIsLive() || Date.now() - t0 > LOCK_CEILING_MS) {
+        try { fs.unlinkSync(LOCK); } catch { /* someone else got there first */ }
+        continue;
+      }
+      await sleep(400);
+    }
+  }
+  try { return await fn(); }
+  finally { try { fs.unlinkSync(LOCK); } catch { /* already stolen; nothing to undo */ } }
 }
 
 /** Shared spawn+wait: kill whatever runs, start detached, wait for /health. */
-async function boot({ model, alias, args, label, budget }) {
+const boot = (opts) => serializeBoot(() => withBootLock(() => bootNow(opts)));
+
+async function bootNow({ model, alias, args, label, budget }) {
   const cfg = loadConfig().llm || {};
+  // Re-check now that it is our turn. While this call sat in the queue, the boot ahead
+  // of it may have started exactly the model we want — two requests for the same model
+  // arriving together is the common case, not the rare one. Without this they cost the
+  // same 30s load twice, the second one killing a perfectly good server to do it.
+  const cur = llmStatus();
+  if (cur.running && cur.profile === label && await healthy(cfg.port || 8080)) {
+    return { ok: true, profile: label, already: true };
+  }
   if (!fs.existsSync(cfg.binary)) throw err(`llama-server binary not found at ${cfg.binary}`, 500);
   if (!fs.existsSync(model)) throw err(`model file missing: ${model} — is the download finished?`, 500);
 
