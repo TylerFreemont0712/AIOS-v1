@@ -146,6 +146,32 @@ three runtime dependencies, **88 tools**, 17 registered apps. On a provider abst
 
 ### Recently shipped
 
+**2026-10-25 — the model is on demand, the Discord push is gone, and the GitHub tab sees every project**
+
+- ✨ **On-demand model lifecycle** (`server/llmctl.js`). Nothing loads llama-server at boot or on a
+  schedule any more; the first request that needs a model does (`router.ensureServing`), and a
+  watcher unloads it after `llm.idleUnloadMin` quiet minutes (default 12; Settings → Providers).
+  "Quiet" is measured from llama-server's own `/slots`, so a five-minute reply is never unloaded
+  under, and only a server AIOS started is ever stopped. Background jobs never wake it: the mail
+  auto-scan triages by rules when no model is up (verdicts are marked `heuristic` and re-judged
+  later), finishing a Studio render only releases the GPU (`resumeAfterGpu({ lazy })`), and the
+  GitHub "Suggested next" card waits for a click instead of loading a model when the tab opens.
+  `scripts/e2e/ondemand.e2e.mjs`, 17 checks against a fake llama-server.
+- 🧹 **Removed the scheduled Discord push.** Every mail auto-scan used to ping Discord. The webhook
+  stays for the Test button and the agent's `notify` tool; nothing fires on a timer.
+- ✨ **GitHub → Local** (`server/gitwork.js`, `server/repos.js`, `web/js/apps/gitlocal.js`),
+  modelled on the Git workspace in WorkHub. Every registered project, **newest change first**
+  ("changed" = the newer of the last commit and the newest uncommitted edit), then a per-repo
+  workspace: staged vs unstaged with per-file and **per-hunk** staging, a commit that takes only
+  what is staged and refuses if the staging moved after review (digest of the index tree), history
+  with a lane graph, branches (create / switch / compare / delete — unmerged work needs a second,
+  explicit confirmation), stashes addressed by commit id, and push / pull previews that list the
+  exact commits and files before anything is sent. `scripts/e2e/gitwork.e2e.mjs`, 80 checks.
+  *Gotcha worth keeping:* `git --literal-pathspecs stash --include-untracked` stashes untracked
+  files but leaves them in the work tree (the internal `git clean` inherits the flag); the runner
+  opts out for stash and quotes paths as `:(literal)…` instead. `git diff-tree --first-parent` is
+  silently ignored, so a merge is diffed as `<first-parent> <merge>`.
+
 **2026-09-03 — the hub leaves the house: Tailscale, a hardened door, and a phone shell that is the whole thing**
 
 `/m` did receipts and nothing else, and the hub was reachable only from the LAN. Both halves

@@ -353,6 +353,15 @@ export async function streamChat({ modelRef, system, messages, tools, onEvent, s
   if (String(modelRef || '').startsWith('local:')) {
     const { resolveLocal } = await import('./router.js');
     modelRef = await resolveLocal(modelRef.slice(6));
+  } else if (String(modelRef || '').startsWith('custom_')) {
+    // A ref that names the managed llama-server's own provider directly (the picker lists
+    // these while it is up) takes the same on-demand path. Otherwise it would be the one
+    // kind of ref that breaks when the idle watcher unloads the model.
+    const [{ localProviderId, resolveLocal }, { findByAlias }] = await Promise.all([import('./router.js'), import('./llmctl.js')]);
+    const i = modelRef.indexOf(':');
+    if (i > 0 && modelRef.slice(0, i) === localProviderId() && findByAlias(modelRef.slice(i + 1))) {
+      modelRef = await resolveLocal(modelRef.slice(i + 1));
+    }
   }
   const { providerId, model } = resolveModelRef(modelRef);
   const p = providerFor(providerId);

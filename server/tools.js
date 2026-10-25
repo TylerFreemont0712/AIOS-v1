@@ -630,7 +630,7 @@ export const TOOL_DEFS = [
   },
   {
     name: 'comfy_generate', write: true, group: 'apps',
-    description: 'Generate images on the local ComfyUI (SDXL-Lightning txt2img). AIOS frees the GPU automatically (swaps the LLM to a tiny CPU profile) — expect the swap on first use. Blocks until the render finishes; results appear in the Studio app.',
+    description: 'Generate images on the local ComfyUI (SDXL-Lightning txt2img). AIOS stops llama.cpp to free the GPU during rendering, then restores the previous model. Blocks until the render finishes; results appear in the Studio app.',
     parameters: {
       type: 'object',
       properties: {
@@ -1913,7 +1913,7 @@ const impls = {
     const jobs = comfy.listJobs().slice(0, 3);
     const lines = [
       s.up ? `ComfyUI up at ${s.url} — ${s.vramFreeMB}MB VRAM free of ${s.vramTotalMB}MB` : `ComfyUI NOT running at ${s.url} (${s.error || ''}) — the user must start it`,
-      s.llm?.running ? `llama.cpp profile: ${s.llm.profile}${s.llm.profile === 'big' ? ' (GPU held — generation will auto-swap to tiny)' : ''}` : s.llm?.foreign ? 'llama.cpp running unmanaged (will be replaced on first swap)' : 'llama.cpp stopped',
+      s.llm?.running ? `llama.cpp profile: ${s.llm.profile} (AIOS stops it while ComfyUI renders, then restores it)` : s.llm?.foreign ? 'llama.cpp running unmanaged (will be replaced on first swap)' : 'llama.cpp stopped',
       s.gpu ? `GPU: ${s.gpu.name} — ${s.gpu.freeMB}MB free / ${s.gpu.totalMB}MB` : 'no NVIDIA GPU visible',
       jobs.length ? `Recent: ${jobs.map(j => `${j.id}:${j.status}`).join(', ')}` : 'no renders yet',
     ];

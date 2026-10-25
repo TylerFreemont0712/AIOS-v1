@@ -15,7 +15,7 @@
 import os from 'node:os';
 import { loadConfig, updateConfig } from './config.js';
 import { leaderboard } from './bench.js';
-import { listLocalModels, listMmproj, llmStatus, startModel, servingAlias, modelAlias, modelArgsFor, presetFor, paramsB, fitContext, findByAlias, llamaBusy } from './llmctl.js';
+import { listLocalModels, listMmproj, llmStatus, startModel, servingAlias, modelAlias, modelArgsFor, presetFor, paramsB, fitContext, findByAlias, llamaBusy, touch, unloadInFlight } from './llmctl.js';
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -108,6 +108,8 @@ export async function legacyAutoRef() {
  *  in-flight generation (bounded) rather than killing it — this is what makes every
  *  local model safely selectable from any picker with zero manual serve/unserve. */
 export async function ensureServing(alias, { waitBusyMs = 180_000 } = {}) {
+  touch();                      // a request is the only thing that keeps the model loaded
+  await unloadInFlight();       // an idle unload mid-flight: let it finish, then boot fresh
   if (servingAlias() === alias) return;
   const m = findByAlias(alias);
   if (!m) throw err(`no local model answers to "${alias}" — check the Models app`, 404);
@@ -132,6 +134,20 @@ export async function ensureServing(alias, { waitBusyMs = 180_000 } = {}) {
     await sleep(2000);
   }
   await startModel(m.path);   // waits for /health; first request pays the load time
+}
+
+/** Would calling this model right now have to load it first? True only for a ref served
+ *  by the managed llama-server that is not the model currently up. Background jobs ask
+ *  this so a schedule never becomes the reason a 6GB model loads. */
+export function needsBoot(ref) {
+  const s = String(ref || '');
+  let alias = '';
+  if (s.startsWith('local:')) alias = s.slice(6);
+  else if (s.startsWith('custom_')) {
+    const i = s.indexOf(':');
+    if (i > 0 && s.slice(0, i) === localProviderId() && findByAlias(s.slice(i + 1))) alias = s.slice(i + 1);
+  }
+  return !!alias && servingAlias() !== alias;
 }
 
 /** local:<alias> → serve it (if needed) and rewrite to the concrete provider ref. */

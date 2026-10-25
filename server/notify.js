@@ -1,5 +1,6 @@
 // Outbound notifications. Discord webhook for now; add channels here (ntfy,
-// Telegram, …) and they become available to mail triage and future alerts.
+// Telegram, …). Nothing here fires on a schedule — a push only happens when the user
+// tests the webhook or the agent's `notify` tool is called for something that matters.
 
 import { loadConfig } from './config.js';
 
@@ -23,12 +24,7 @@ export async function sendDiscord(content) {
   } finally { clearTimeout(t); }
 }
 
-/** Best-effort variant for background flows — never throws. */
-export async function notifyDiscord(content) {
-  try { await sendDiscord(content); return true; } catch { return false; }
-}
-
 export function notifyStatus() {
   const n = loadConfig().notify || {};
-  return { discord: !!n.discordWebhook, onImportantMail: n.onImportantMail !== false };
+  return { discord: !!n.discordWebhook };
 }

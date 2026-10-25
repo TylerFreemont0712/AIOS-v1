@@ -1,7 +1,8 @@
 // Inbox triage: a minimal zero-dependency IMAP client (node:tls) fetches recent
 // message headers + a body peek READ-ONLY (EXAMINE + BODY.PEEK — nothing gets
 // marked seen), then one LLM call classifies what actually matters. Important
-// messages surface as notifications on the Home screen and (optionally) Discord.
+// messages surface as notifications on the Home screen. (They used to also ping
+// Discord on every scheduled scan; that push was removed as noise.)
 //
 // This is not a general IMAP library — it speaks just enough of RFC 3501 for
 // "list my recent mail" against mainstream servers (Gmail/Outlook/Fastmail need
@@ -12,7 +13,6 @@ import path from 'node:path';
 import tls from 'node:tls';
 import { DATA, loadConfig } from './config.js';
 import { streamChat, listModels } from './llm.js';
-import { notifyDiscord } from './notify.js';
 import { now, readJSON, writeJSON, extractJSON } from './util.js';
 
 const FILE = path.join(DATA, 'mail', 'state.json');
@@ -486,7 +486,7 @@ async function resolveModel(modelRef, mc, cfg) {
 }
 
 /** Fetch + triage. Only newly-seen messages spend model tokens. */
-export async function scanMail({ modelRef = '' } = {}) {
+export async function scanMail({ modelRef = '', background = false } = {}) {
   const cfg = loadConfig();
   const mc = cfg.mail || {};
   if (!mc.host || !mc.user || !mc.password) throw Object.assign(new Error('Mail is not configured — add IMAP details in Settings → Mail & Alerts.'), { status: 400 });
@@ -507,9 +507,18 @@ export async function scanMail({ modelRef = '' } = {}) {
     // to the heuristic for just that batch and the error is REPORTED, not swallowed.
     let verdicts = new Map();
     const triage = { via: 'cache', error: '' };
-    const ref = await resolveModel(modelRef, mc, cfg);
+    let ref = await resolveModel(modelRef, mc, cfg);
+    // A scheduled scan must never be the reason the model loads: the user did not ask for
+    // anything, and the load costs 6GB of VRAM and half a minute of GPU. When the model is
+    // not already up, triage by rules this pass — those verdicts are marked 'heuristic', so
+    // the next scan with a model loaded (or a manual "Scan now") re-judges them with the AI.
+    let deferred = false;
+    if (background && ref) {
+      const { needsBoot } = await import('./router.js');
+      if (needsBoot(ref)) { ref = ''; deferred = true; }
+    }
     if (fresh.length) {
-      if (!ref) triage.error = 'no model configured or reachable';
+      if (!ref) triage.error = deferred ? '' : 'no model configured or reachable';
       else {
         for (let i = 0; i < Math.min(fresh.length, 48); i += 8) {
           const batch = fresh.slice(i, i + 8);
@@ -534,13 +543,6 @@ export async function scanMail({ modelRef = '' } = {}) {
       return { ...m, important: !!v.important, urgency: v.urgency || 'normal', category: v.category || 'other', reason: v.reason || '', via: v.via || 'heuristic', tv: v.tv || TRIAGE_VERSION };
     });
 
-    // Discord pings only for genuinely new arrivals — not re-triaged old mail.
-    // Sender rules apply: muted senders never ping, starred senders always do.
-    const newImportant = merged.filter(m => {
-      if (m.seen || known.has(m.id) || state.dismissed.includes(m.id)) return false;
-      const rule = senderRuleFor(state, m.from)?.rule;
-      return rule === 'star' || (m.important && rule !== 'block');
-    });
     state.scannedAt = now();
     state.account = mc.user;
     state.error = '';
@@ -549,10 +551,6 @@ export async function scanMail({ modelRef = '' } = {}) {
     state.dismissed = state.dismissed.filter(id => merged.some(m => m.id === id)).slice(-200);
     saveState(state);
 
-    if (newImportant.length && cfg.notify?.onImportantMail !== false && cfg.notify?.discordWebhook) {
-      const lines = newImportant.slice(0, 6).map(m => `• **${m.from.replace(/<[^>]*>/g, '').trim() || m.from}** — ${m.subject}${m.reason ? ` _(${m.reason})_` : ''}`);
-      notifyDiscord(`📧 ${newImportant.length} important email${newImportant.length > 1 ? 's' : ''}:\n${lines.join('\n')}`);
-    }
     return { scanned: fetched.length, fresh: fresh.length, important: merged.filter(m => m.important).length, classifiedBy: triage.via, triageError: triage.error };
   } catch (e) {
     state.error = e.message;
@@ -691,7 +689,7 @@ export function startAutoScan() {
     if (!mc.enabled || !(mc.scanIntervalMin > 0) || scanning) return;
     const last = Date.parse(loadState().scannedAt || 0) || 0;
     if (Date.now() - last < mc.scanIntervalMin * 60_000) return;
-    scanMail().catch(() => { });   // errors land in state.error
+    scanMail({ background: true }).catch(() => { });   // errors land in state.error
   }, 60_000);
   timer.unref?.();
 }

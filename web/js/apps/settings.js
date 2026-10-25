@@ -779,10 +779,18 @@ export default {
           }, p)));
           ui.panel.append(row(
             el('span', { class: 'row' }, el('span', { class: 'pdot ' + (ls?.running ? 'up' : ls?.foreign ? 'warn' : 'off') }), 'Active profile'),
-            ls?.running ? `${ls.profile} on :${ls.port}${ls.gpu ? ` · GPU ${ls.gpu.freeMB}MB free` : ''}`
+            ls?.running ? `${ls.profile} on :${ls.port}${ls.gpu ? ` · GPU ${ls.gpu.freeMB}MB free` : ''}${ls.idleLeftSec != null ? ` · unloads in ${Math.max(1, Math.ceil(ls.idleLeftSec / 60))} min if idle` : ''}`
               : ls?.foreign ? 'running unmanaged (started outside AIOS — switching a profile takes it over)'
-                : 'stopped — pick a profile to start it',
+                : 'stopped — it loads by itself the first time something needs a model',
             profSeg));
+          const idleIn = el('input', { class: 'input', type: 'number', min: 0, max: 240, value: ls?.idleUnloadMin ?? 12, style: { width: '80px' } });
+          idleIn.addEventListener('change', async () => {
+            const v = Math.max(0, Math.min(240, Math.round(+idleIn.value || 0)));
+            idleIn.value = v;
+            if (await save({ llm: { idleUnloadMin: v } }, v ? `model will unload after ${v} idle min` : 'model stays loaded')) refreshStatus();
+          });
+          ui.panel.append(row('Unload when idle (minutes)',
+            'The model loads on demand and is stopped after this long with nothing running, freeing the GPU for Studio and games. 0 keeps it loaded.', idleIn));
           ui.panel.append(row('Launcher app',
             'Open the desktop GUI for Whisper, MusicGen, and manual llama.cpp tuning. AIOS manages the text model itself, so use the launcher\'s llama tab only when experimenting.',
             el('button', {
@@ -973,7 +981,7 @@ export default {
 
       if (S.tab === 'mail') {
         ui.panel.append(el('h2', {}, 'Mail & Alerts'),
-          el('div', { class: 'desc' }, 'AIOS reads your inbox over IMAP (read-only — nothing gets marked as seen), and the AI flags what actually needs you. Important mail shows on Home and can ping Discord. Gmail/Outlook with 2FA need an app password.'));
+          el('div', { class: 'desc' }, 'AIOS reads your inbox over IMAP (read-only — nothing gets marked as seen), and the AI flags what actually needs you. Important mail shows on Home. Gmail/Outlook with 2FA need an app password.'));
 
         const m = c.mail || {};
         const host = el('input', { class: 'input', value: m.host || '', placeholder: 'imap.gmail.com', style: { width: '190px' } });
@@ -1014,8 +1022,8 @@ export default {
           },
         }, 'Test');
         ui.panel.append(row('Webhook URL', 'Server settings → Integrations → Webhooks → copy URL', el('div', { class: 'row' }, hook, hookBtn, hookTest)));
-        ui.panel.append(row('Ping on important mail', 'Send a Discord digest when a scan finds new important messages',
-          switchBtn(c.notify?.onImportantMail !== false, async (next) => { if (await save({ notify: { onImportantMail: next } })) renderPanel(); })));
+        ui.panel.append(el('div', { class: 'set-sub', style: { marginTop: '6px' } },
+          'Nothing is pushed on a schedule. The webhook is only used by the Test button and by the agent\'s notify tool when it has something you need to know now.'));
 
         // ---- sender rules: the inbox's learned ratings ----
         ui.panel.append(el('div', { class: 'lbl', style: { marginTop: '22px' } }, 'SENDER RULES'),

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { DATA, loadConfig } from './config.js';
 import { id as genId, now, readJSON, writeJSON } from './util.js';
+import { summarize } from './repos.js';
 
 const FILE = path.join(DATA, 'projects.json');
 
@@ -14,13 +15,48 @@ const persist = (list) => writeJSON(FILE, list);
 
 export function getProject(id) { return load().find(p => p.id === id) || null; }
 
+/** The plain registry, untouched — what the repo overview is built from. */
+export const rawList = () => load();
+
+/**
+ * Projects with their git chip, favourites first and then by when each one last CHANGED
+ * (newest of the last commit and the newest uncommitted edit), not when it was last opened:
+ * the project you were working in an hour ago belongs above the one you clicked yesterday.
+ */
 export async function listProjects() {
   const list = load();
-  await Promise.all(list.map(async p => {
-    p.exists = fs.existsSync(p.path);
-    p.git = p.exists ? await gitInfo(p.path) : null;
+  const sums = new Map();
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(4, list.length) }, async () => {
+    while (i < list.length) { const p = list[i++]; sums.set(p.id, await summarize(p.path)); }
   }));
-  return list.sort((a, b) => (b.favorite - a.favorite) || (b.lastOpenedAt || '').localeCompare(a.lastOpenedAt || ''));
+  for (const p of list) {
+    const s = sums.get(p.id) || {};
+    p.exists = fs.existsSync(p.path);
+    p.git = p.exists && s.repo
+      ? { branch: s.branch, dirty: s.dirty, lastCommit: s.lastCommit ? `${s.lastCommit.short} ${s.lastCommit.subject}` : '', ahead: s.ahead, behind: s.behind, hasRemote: !!s.remote }
+      : null;
+    p.activityAt = s.activityAt ? new Date(s.activityAt).toISOString() : null;
+  }
+  return list.sort((a, b) => (b.favorite - a.favorite) || (b.activityAt || '').localeCompare(a.activityAt || '') || (b.lastOpenedAt || '').localeCompare(a.lastOpenedAt || ''));
+}
+
+/**
+ * Register several folders at once — only ones inside the projects root, so this bulk
+ * endpoint cannot be used to pull arbitrary directories into the file APIs' reach.
+ * Each item is { path, name? }. Already-registered paths are returned as they are.
+ */
+export function registerMany(items) {
+  const root = fs.realpathSync(path.resolve(loadConfig().projectsRoot));
+  const out = [];
+  for (const it of Array.isArray(items) ? items.slice(0, 100) : []) {
+    const abs = path.resolve(String(it?.path || ''));
+    let real;
+    try { real = fs.realpathSync(abs); } catch { continue; }
+    if (real !== root && !real.startsWith(root + path.sep)) continue;
+    try { out.push(registerProject({ path: abs, name: it.name ? String(it.name).slice(0, 80) : undefined })); } catch { }
+  }
+  return out;
 }
 
 export function registerProject({ path: p, name }) {
@@ -66,18 +102,4 @@ export function allowedRoots() {
   const v = loadConfig().vault.path;
   if (v) roots.set('vault', v);
   return roots;
-}
-
-function gitInfo(dir) {
-  const run = (args) => new Promise(res => execFile('git', ['-C', dir, ...args], { timeout: 3000 }, (e, out) => res(e ? null : out.trim())));
-  return (async () => {
-    if (!fs.existsSync(path.join(dir, '.git'))) return null;
-    const [branch, status, last] = await Promise.all([
-      run(['rev-parse', '--abbrev-ref', 'HEAD']),
-      run(['status', '--porcelain']),
-      run(['log', '-1', '--format=%h %s', '--no-show-signature']),
-    ]);
-    if (branch === null) return null;
-    return { branch, dirty: status ? status.split('\n').filter(Boolean).length : 0, lastCommit: last || '' };
-  })();
 }

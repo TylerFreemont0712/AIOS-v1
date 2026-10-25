@@ -36,10 +36,10 @@ purpose-built shell at `/m`; `npm run remote-setup` extends that to anywhere you
 | **Interview** | Practice interviews out loud, and the answers worth keeping. Voice mode's **Mode** button puts the AI on either side of the table — it interviews you and probes the weak half of every answer, or it answers *your* questions the way a strong candidate would. Press **Keep** on any turn and it lands here as a flashcard: question first, answer hidden until you ask for it, with **Listen** and **Practise** (which reopens hands-free and asks you that exact question again) |
 | **Finances** | A real ledger: earnings, expenses, budgets, goals, recurring entries and presets across five tabs sharing one period selector; multi-currency, CSV export — plus **receipt capture** (photograph it, a local vision model reads it, you review, it posts) and **item price tracking** that tells you which shop is actually cheaper per unit. Every scan **scores its own confidence** and re-reads itself (turning the photo when nothing was legible) until it is convincing or has had three goes; the same purchase **cannot be logged twice**; and what you correct is remembered per shop, so the next receipt from there arrives already fixed |
 | **Studio** | ComfyUI cockpit: text→image, image→image and 4× upscale, Animagine + Lightning-LoRA sampling plans, pixel-space hi-res, an LLM prompt generator — and AIOS owns the ComfyUI/llama lifecycle so the 8GB card never double-books |
-| **Models & Bench** | The llama-launcher, absorbed: per-model presets (context, offload, KV quant, flash-attn, vision projector), live GPU/VRAM, log pane, VRAM-fit hints — plus a **deterministic** benchmark scoring every local model per category with TTFT and tok/s (no LLM judge) |
+| **Models & Bench** | The llama-launcher, absorbed — and **on demand**: nothing loads a model at boot or on a schedule, the first request that needs one does, and it unloads after `llm.idleUnloadMin` quiet minutes (default 12, never mid-generation). Per-model presets (context, offload, KV quant, flash-attn, vision projector), live GPU/VRAM, log pane, VRAM-fit hints — plus a **deterministic** benchmark scoring every local model per category with TTFT and tok/s (no LLM judge) |
 | **Planner** | Calendar, recurring events, birthdays, reminders and tasks, folded into Home's next-three-days |
-| **Mail** | Read-only IMAP triage with sender ratings and a mini-Gmail viewer; important mail can ping Discord |
-| **GitHub** | Profile, contribution heatmap, repos, PRs, issues; publish a local project or clone one |
+| **Mail** | Read-only IMAP triage with sender ratings and a mini-Gmail viewer; important mail shows on Home (no scheduled pushes) |
+| **GitHub** | **Local**: every project folder on this machine, newest change first, with a full git workspace per repo — staged/unstaged changes, per-file and per-hunk staging, a diff viewer, reviewed commits, history with a branch graph, branches (switch / compare / safe delete), stashes, and fetch / pull / push with a preview of exactly which commits move. Plus your profile, contribution heatmap, repos, PRs and issues; publish a local project or clone one |
 | **Settings** | Providers, **tools** (enable/disable each agent tool, web-search backend), **9 themes** (light/dark/system + Matrix/Nord/Dracula/Rosé Pine/Synthwave/Solarized) with accent & wallpaper, vault paths, agent defaults & self-check, **voice** (speech model, voice, rate, and whether replies are spoken at all), network & security |
 
 Shell niceties: **Ctrl+K** command palette (apps, project switching, vault search,
@@ -619,7 +619,11 @@ server/            zero-build Node (ESM), no framework beyond express + ws
   skills.js        coding playbooks: stack detection + prompt packing + skill tool
   research.js      deep-research loop (plan→search→read→reflect→synthesize)
   chat.js          plain streaming chat sessions
-  projects.js      project registry + git info
+  projects.js      project registry (sorted by latest change) + bulk register
+  repos.js         every project's git state at a glance, newest change first; folder discovery
+  gitwork.js       the git workspace: status, diffs, (hunk) staging, commit, log, branches,
+                   stashes, fetch/pull/push with previews — one writer per repo
+  gitrun.js        the only place that spawns git: argv only, validated paths and refs
   files.js         explorer/editor APIs (root-scoped)
   vault.js         Obsidian index, search, graph, daily, AI wiki growth
   wiki.js          typed notes, autolinking, Home MOC, packed-memory recall
@@ -629,7 +633,7 @@ server/            zero-build Node (ESM), no framework beyond express + ws
                    → posted once (duplicate-guarded) → corrections learned per shop
   items.js         brand-free product catalogue + price history (+ itemsai.js)
   uploads.js       attachment intake: byte-sniffing + ffmpeg transcode (HEIC → JPEG)
-  llmctl.js        AIOS owns llama-server: profiles, presets, mmproj, hot model swaps
+  llmctl.js        AIOS owns llama-server: profiles, presets, mmproj, hot model swaps, idle unload
   bench.js         deterministic per-category model benchmark (bench.db)
   router.js        local: refs → serve on demand · LLM auto-setup for new ggufs
   comfy.js         ComfyUI connector + workflow templates + VRAM guard

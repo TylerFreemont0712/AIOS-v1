@@ -11,8 +11,8 @@
 // look at daily comes before anything you configure once.
 
 import { el, icon, toast, modal, confirmBox, menu, debounce } from '../ui.js';
-import { get, post, patch, put, del, uploadFile, mediaUrl } from '../api.js';
-import { IMAGE_ACCEPT } from '../imageprep.js';
+import { get, post, patch, put, del, uploadFile, uploadBlob, mediaUrl } from '../api.js';
+import { IMAGE_ACCEPT, prepareImage } from '../imageprep.js';
 import {
   groupedBars, donut, legend, areaLine, rankedBars, meter, calendarHeat, sparkbars,
   pricePoints, palette, fmtNum,
@@ -2713,7 +2713,14 @@ export default {
         if (!file) return;
         try {
           toast('Uploading…');
-          const up = await uploadFile(file);
+          // Same 2048 the phone's receipt flow uses, and for the same reason: on a receipt
+          // the small print IS the payload, and uploadFile's default 1600 resizes product
+          // names away while leaving the total perfectly legible. Prepared here rather than
+          // through uploadFile so chat attachments keep the smaller, faster default.
+          const prepped = await prepareImage(file, { force: true, longEdge: 2048 });
+          const up = prepped
+            ? await uploadBlob(prepped.blob, prepped.name, prepped.blob.type || '')
+            : await uploadFile(file);
           toast('Reading the receipt — a few seconds…');
           const rec = await post('/finance/receipts/scan', { uploadId: up.id });
           if (rec.status !== 'parsed') toast(rec.error || 'Could not read that receipt', 'err');

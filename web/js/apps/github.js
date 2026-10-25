@@ -6,8 +6,11 @@ import { el, icon, toast, modal, confirmBox, timeAgo } from '../ui.js';
 import { get, post, wsSend, sub } from '../api.js';
 import { state, on } from '../state.js';
 import { openApp } from '../wm.js';
+import { createLocal } from './gitlocal.js';
 
-const TABS = [['overview', 'Overview'], ['repos', 'Repositories'], ['prs', 'Pull Requests'], ['issues', 'Issues']];
+// "Local" is every project folder on this machine and works with no GitHub login at all;
+// the rest need the connection. It leads because it is the one you open most.
+const TABS = [['local', 'Local'], ['overview', 'Overview'], ['repos', 'On GitHub'], ['prs', 'Pull Requests'], ['issues', 'Issues']];
 const LANG_COLORS = {
   JavaScript: '#f1e05a', TypeScript: '#3178c6', Python: '#3572A5', Rust: '#dea584', Go: '#00ADD8',
   C: '#555555', 'C++': '#f34b7d', 'C#': '#178600', Java: '#b07219', HTML: '#e34c26', CSS: '#663399',
@@ -18,18 +21,21 @@ export default {
   id: 'github', title: 'GitHub', icon: 'github', width: 1080, height: 700,
 
   mount(body, opts, win) {
-    const S = win.ghState = { tab: 'overview', status: undefined, cache: {}, filter: '', offs: [] };
+    let saved = '';
+    try { saved = localStorage.getItem('aios.gh.tab') || ''; } catch { }
+    const S = win.ghState = { tab: TABS.some(([v]) => v === saved) ? saved : 'local', status: undefined, cache: {}, filter: '', offs: [] };
+    S.local = createLocal({ publish: (project) => publishFlow(false, project) });
     const ui = {};
     body.classList.add('col');
 
     ui.seg = el('div', { class: 'seg' }, ...TABS.map(([v, label]) => el('button', {
       class: 'seg-btn' + (S.tab === v ? ' on' : ''), dataset: { tab: v },
-      onclick: () => { S.tab = v; for (const b of ui.seg.children) b.classList.toggle('on', b.dataset.tab === v); render(); },
+      onclick: () => { S.tab = v; try { localStorage.setItem('aios.gh.tab', v); } catch { } for (const b of ui.seg.children) b.classList.toggle('on', b.dataset.tab === v); render(); },
     }, label)));
 
     const refreshBtn = el('button', {
       class: 'btn sm ghost', title: 'Refresh',
-      onclick: () => { S.cache = {}; S.status = undefined; render(); },
+      onclick: () => { S.cache = {}; S.status = undefined; if (S.tab === 'local') S.local.refresh(); else render(); },
     }, icon('refresh'));
 
     ui.head = el('div', { class: 'pane-head' },
@@ -71,6 +77,17 @@ export default {
     const spin = () => el('div', { class: 'empty', style: { minHeight: '120px' } }, el('span', { class: 'spinner' }));
 
     async function render() {
+      if (S.tab === 'local') {
+        // Local needs no GitHub login. The header still shows who you are when it's connected.
+        ui.content.className = 'gh-content fill';
+        ui.content.innerHTML = '';
+        ui.content.append(S.local.root);
+        S.local.show();
+        ensureStatus();
+        return;
+      }
+      S.local.hide();
+      ui.content.className = 'gh-content';
       ui.content.innerHTML = '';
       ui.content.append(spin());
       const st = await ensureStatus();
@@ -172,7 +189,7 @@ export default {
 
     // ---- AI "suggested next" — streams in like a chat answer ----
 
-    function suggestCard() {
+    function suggestCard(manual = false) {
       const node = el('div', { class: 'gh-card gh-suggest' },
         el('div', { class: 'gh-card-head' }, icon('sparkle'), 'Suggested next'));
       const bodyEl = el('div', { class: 'gh-suggest-text' }, el('span', { class: 'spinner' }));
@@ -189,13 +206,19 @@ export default {
         } else if (ev.type === 'done') {
           bodyEl.textContent = ev.text;
           S.sugUnsub?.(); S.sugUnsub = null;
+        } else if (ev.type === 'idle') {
+          // the model isn't loaded, and opening this tab shouldn't be what loads it
+          S.sugUnsub?.(); S.sugUnsub = null;
+          bodyEl.innerHTML = '';
+          bodyEl.append(el('div', { class: 'muted small' }, 'The local model is off, so no suggestion was generated.'),
+            el('button', { class: 'btn sm', style: { marginTop: '6px' }, onclick: () => { node.replaceWith(suggestCard(true)); } }, icon('sparkle'), 'Suggest next steps'));
         } else if (ev.type === 'error') {
           // no model / API hiccup — the card quietly steps aside
           node.remove();
           S.sugUnsub?.(); S.sugUnsub = null;
         }
       });
-      wsSend({ t: 'github.suggest', reqId, projectId: state.project?.id });
+      wsSend({ t: 'github.suggest', reqId, projectId: state.project?.id, manual });
       return node;
     }
 
@@ -238,11 +261,11 @@ export default {
       } catch (e) { toast(e.message, 'err'); }
     }
 
-    async function publishFlow(pushOnly) {
-      if (!state.project) return;
+    async function publishFlow(pushOnly, project = state.project) {
+      if (!project) return;
       if (pushOnly) { return syncFlow('push'); }
       const f = {
-        name: el('input', { class: 'input', value: state.project.name.replace(/[^A-Za-z0-9._-]+/g, '-') }),
+        name: el('input', { class: 'input', value: project.name.replace(/[^A-Za-z0-9._-]+/g, '-') }),
         desc: el('input', { class: 'input', placeholder: 'description (optional)' }),
         priv: el('input', { type: 'checkbox' }),
       };
@@ -259,12 +282,12 @@ export default {
             label: 'Create & push', kind: 'primary',
             onpick: async (close) => {
               try {
-                const r = await post(`/projects/${state.project.id}/git/publish`, {
+                const r = await post(`/projects/${project.id}/git/publish`, {
                   name: f.name.value.trim(), description: f.desc.value.trim(), isPrivate: f.priv.checked,
                 });
                 toast(`published → ${r.url}`, 'ok');
                 close('done');
-                S.cache = {}; render();
+                S.cache = {}; if (S.tab === 'local') S.local.refresh(); else render();
               } catch (e) { toast(e.message, 'err'); }
               return false;
             },
@@ -379,10 +402,14 @@ export default {
     }
 
     render();
-    this.reopen = (w, o) => { if (o?.tab) { S.tab = o.tab; for (const b of ui.seg.children) b.classList.toggle('on', b.dataset.tab === o.tab); render(); } };
+    this.reopen = (w, o) => {
+      if (o?.tab) { S.tab = o.tab; for (const b of ui.seg.children) b.classList.toggle('on', b.dataset.tab === o.tab); render(); }
+      if (o?.repo) { S.tab = 'local'; for (const b of ui.seg.children) b.classList.toggle('on', b.dataset.tab === 'local'); render().then(() => S.local.open(o.repo)); }
+    };
   },
 
   unmount(win) {
+    win.ghState?.local?.dispose();
     win.ghState?.sugUnsub?.();
     win.ghState?.offs?.forEach(off => off());
   },

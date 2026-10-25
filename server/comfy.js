@@ -1,7 +1,7 @@
 // ComfyUI connector: submit template workflows to the local instance, stream
 // progress over the AIOS WebSocket, save outputs under data/comfy/, and play
-// nice with the 8GB GPU — swapping the LLM to the tiny CPU profile before
-// generating (autoSwap) and freeing Comfy's VRAM afterwards (autoFree).
+// nice with the 8GB GPU — stopping llama.cpp before generating (autoSwap) and
+// restoring its previous model afterwards, then freeing Comfy's VRAM (autoFree).
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -546,7 +546,9 @@ async function run(job) {
     if (weSuspended) {
       try {
         await api('/free', { method: 'POST', body: { unload_models: true, free_memory: true }, timeoutMs: 8000 }).catch(() => { });
-        const back = await llmctl.resumeAfterGpu({ fallback: 'big' });
+        // lazy: just release the claim — the next chat/agent request loads a model
+        // itself, so a render never leaves a 6GB model resident for nobody
+        const back = await llmctl.resumeAfterGpu({ fallback: 'big', lazy: true });
         emit(job.id, { type: 'llm', restored: back.profile || back.resumed || false });
       } catch (e) {
         console.error('[comfy] could not restart llama.cpp after the job:', e.message);

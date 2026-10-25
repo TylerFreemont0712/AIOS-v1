@@ -512,6 +512,21 @@ export function cropToContent(buf, { pad = 0.03, maxArea = 0.8 } = {}) {
  * overlap is what the stitcher upstream aligns on, so it has to be several lines deep,
  * not a few pixels.
  */
+// minAspect stays at 2, tested 2026-09-07.
+//
+// Ten of the 26 archive photos land at aspect 1.53-1.98 after cropToContent, just under
+// this threshold, so they are never banded — and the reader's failure signature (totals
+// 100%, dates 90%, itemF1 0.32) looks exactly like small text lost to resizing. Lowering
+// this to 1.6 to catch them was measured over 10 receipts and did NOT pay:
+//
+//     minAspect 1.6 : score 65  ¥found 90%  itemF1 0.31  invented 30  missed 29
+//     minAspect 2.0 : score 66  ¥found 82%  itemF1 0.32  invented 24  missed 29
+//
+// `missed` did not move at all, which is the point: banding recovered no product line it
+// had been losing. It found more true AMOUNTS (¥found +8) but hung them on six more
+// invented lines — money the ledger never spent. Caveat for whoever revisits this: only
+// 2 of those 10 receipts were actually below 2.0, so the test was underpowered rather
+// than conclusive. To settle it, bench the ten sub-2.0 photos specifically.
 export function sliceTall(buf, { max = 3, overlap = 0.14, minHeight = 1200, minAspect = 2 } = {}) {
   const bin = ffmpegBin();
   if (!bin || max < 2) return null;

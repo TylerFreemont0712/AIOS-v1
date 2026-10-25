@@ -41,6 +41,8 @@ import * as planner from './planner.js';
 import * as weather from './weather.js';
 import * as git from './git.js';
 import * as github from './github.js';
+import * as gitwork from './gitwork.js';
+import * as repos from './repos.js';
 import * as comfy from './comfy.js';
 import * as llmctl from './llmctl.js';
 import * as bench from './bench.js';
@@ -193,11 +195,77 @@ const projRoot = (id) => {
   if (!p) throw Object.assign(new Error('unknown project'), { status: 404 });
   return p.path;
 };
+// any write through the project git routes (commit, push, pull, publish…) makes the cached
+// summary behind the repo list stale — drop it when the request finishes
+app.use('/api/projects/:id/git', (req, res, next) => {
+  if (req.method !== 'GET') res.on('finish', () => { try { repos.invalidate(projRoot(req.params.id)); } catch { } });
+  next();
+});
 app.get('/api/projects/:id/git', h(req => git.gitInfo(projRoot(req.params.id))));
 app.get('/api/projects/:id/git/diff', h(req => git.workingDiff(projRoot(req.params.id))));
-app.post('/api/projects/:id/git/init', h(req => git.gitInit(projRoot(req.params.id))));
-app.post('/api/projects/:id/git/message', h(req => git.commitMessage(projRoot(req.params.id), { modelRef: req.body?.modelRef })));
+app.post('/api/projects/:id/git/init', h(async req => { const r = await git.gitInit(projRoot(req.params.id)); repos.invalidate(projRoot(req.params.id)); return r; }));
+app.post('/api/projects/:id/git/message', h(req => git.commitMessage(projRoot(req.params.id), { modelRef: req.body?.modelRef, staged: !!req.body?.staged })));
 app.post('/api/projects/:id/git/commit', h(req => git.gitCommit(projRoot(req.params.id), { message: req.body?.message })));
+// ---------- git workspace (GitHub tab → Local) ----------
+//
+// Every project on this machine at a glance (newest change first), then per-repo control:
+// staged/unstaged changes, per-file and per-hunk diffs, reviewed commits, history, branches,
+// stashes, and fetch/pull/push with a look at what will move. Reads are free; writes are
+// serialised per repo in server/gitwork.js, and the destructive ones need `confirm: true`.
+
+app.get('/api/repos', h(async req => {
+  const rows = await repos.overview(projects.rawList(), { fresh: req.query.fresh === '1' });
+  return { repos: rows, totals: repos.totals(rows), root: loadConfig().projectsRoot };
+}));
+app.get('/api/repos/discover', h(() => {
+  const root = loadConfig().projectsRoot;
+  return { root, items: repos.discover(root, projects.rawList().map(p => p.path)) };
+}));
+app.post('/api/repos/register', h(req => ({ added: projects.registerMany(req.body?.items || []) })));
+
+const gw = (fn) => h(req => fn(projRoot(req.params.id), req.body || {}, req.query || {}));
+app.get('/api/projects/:id/git/status', gw(root => gitwork.status(root)));
+app.get('/api/projects/:id/git/file-diff', gw((root, b, q) => gitwork.fileDiff(root, {
+  path: String(q.path || ''), staged: q.staged === '1', commit: String(q.commit || ''), range: String(q.range || ''),
+  context: q.context, ignoreWs: q.ws === '1',
+})));
+app.post('/api/projects/:id/git/stage', gw((root, b) => gitwork.stage(root, b)));
+app.post('/api/projects/:id/git/unstage', gw((root, b) => gitwork.unstage(root, b)));
+app.post('/api/projects/:id/git/stage-hunk', gw((root, b) => gitwork.stageHunk(root, b)));
+app.post('/api/projects/:id/git/discard', gw((root, b) => gitwork.discard(root, b)));
+app.get('/api/projects/:id/git/staged-patch', gw(root => gitwork.stagedPatch(root)));
+app.post('/api/projects/:id/git/commit-staged', gw((root, b) => gitwork.commit(root, b)));
+app.get('/api/projects/:id/git/log', gw((root, b, q) => gitwork.log(root, {
+  ref: String(q.ref || ''), all: q.all === '1', limit: q.limit, skip: q.skip, path: String(q.path || ''), search: String(q.search || ''),
+})));
+app.get('/api/projects/:id/git/commit/:hash', h(req => gitwork.commitDetail(projRoot(req.params.id), req.params.hash)));
+app.get('/api/projects/:id/git/branches', gw(root => gitwork.branches(root)));
+app.post('/api/projects/:id/git/branch', gw((root, b) => gitwork.createBranch(root, b)));
+app.post('/api/projects/:id/git/checkout', gw((root, b) => gitwork.checkout(root, b)));
+app.post('/api/projects/:id/git/branch/delete', gw((root, b) => gitwork.deleteBranch(root, b)));
+app.get('/api/projects/:id/git/compare', gw((root, b, q) => gitwork.compare(root, { base: String(q.base || ''), head: String(q.head || '') })));
+app.get('/api/projects/:id/git/outgoing', gw(root => gitwork.outgoing(root)));
+app.post('/api/projects/:id/git/fetch', gw((root, b) => gitwork.fetchRemote(root, b)));
+app.post('/api/projects/:id/git/push-branch', gw((root, b) => gitwork.push(root, b)));
+app.post('/api/projects/:id/git/pull-ff', gw((root, b) => gitwork.pull(root, b)));
+app.get('/api/projects/:id/git/stashes', gw(root => gitwork.stashes(root)));
+app.get('/api/projects/:id/git/stash/:oid', h(req => gitwork.stashShow(projRoot(req.params.id), req.params.oid)));
+app.post('/api/projects/:id/git/stash', gw((root, b) => gitwork.stashSave(root, b)));
+app.post('/api/projects/:id/git/stash/apply', gw((root, b) => gitwork.stashApply(root, b)));
+app.post('/api/projects/:id/git/stash/drop', gw((root, b) => gitwork.stashDrop(root, b)));
+// plain handler: a download, not JSON
+app.get('/api/projects/:id/git/patch', async (req, res) => {
+  try {
+    const p = projects.getProject(req.params.id);
+    if (!p) throw Object.assign(new Error('unknown project'), { status: 404 });
+    const r = await gitwork.patch(p.path, String(req.query.scope || 'all'));
+    res.set({
+      'content-type': 'text/x-patch; charset=utf-8',
+      'content-disposition': `attachment; filename="${p.name.replace(/[^A-Za-z0-9._-]+/g, '-')}-${r.scope}.patch"`,
+    }).send(r.patch);
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+
 app.post('/api/projects/:id/git/publish', h(req => github.publishProject(projRoot(req.params.id), req.body || {})));
 app.post('/api/projects/:id/git/push', h(req => github.gitPush(projRoot(req.params.id))));
 app.post('/api/projects/:id/git/pull', h(req => github.gitPull(projRoot(req.params.id))));
@@ -867,7 +935,7 @@ async function route(client, m) {
     case 'vault.ask': vault.askVault({ reqId: m.reqId, question: m.question, modelRef: m.modelRef }); return;
     case 'vault.summarize': vault.summarizeNote({ reqId: m.reqId, path: m.path, modelRef: m.modelRef }); return;
     case 'vault.wiki': vault.wikiGenerate({ reqId: m.reqId, topic: m.topic, sourcePath: m.sourcePath, count: m.count, modelRef: m.modelRef }); return;
-    case 'github.suggest': github.suggest({ reqId: m.reqId, modelRef: m.modelRef, projectId: m.projectId }); return;
+    case 'github.suggest': github.suggest({ reqId: m.reqId, modelRef: m.modelRef, projectId: m.projectId, manual: !!m.manual }); return;
     case 'vault.cancel': vault.cancelAI(m.reqId); return;
 
     default: client.send({ t: 'error', message: `unknown message type: ${m.t}` });
@@ -891,6 +959,10 @@ function lanUrls(withToken = false) {
 }
 
 mail.startAutoScan();   // no-op until mail.enabled + scanIntervalMin are set
+
+// The model is on demand: nothing loads it at boot, the first request that needs one does,
+// and this stops it again after `llm.idleUnloadMin` quiet minutes. See server/llmctl.js.
+llmctl.startIdleWatch();
 
 // Connect enabled MCP servers in the background. Deliberately not awaited: these are
 // third-party processes and one of them being slow, broken, or absent must not hold up

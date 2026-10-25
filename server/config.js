@@ -36,7 +36,7 @@ const defaults = () => ({
   // set a budget) come back as a confirmation card instead of just happening. Turning
   // this off restores the old behaviour, where chat wrote to the ledger and the
   // planner directly — fast, and occasionally wrong in a way you find out about later.
-  defaults: { chatModel: '', agentModel: '', agentMode: 'edits', agentPlanMode: false, chatTools: true, chatSystem: DEFAULT_CHAT_SYSTEM, contextTokens: 32000, confirmActions: true },
+  defaults: { chatModel: 'local:spark-x2.5-4b-q8_0', agentModel: 'local:spark-x2.5-4b-q8_0', agentMode: 'edits', agentPlanMode: false, chatTools: true, chatSystem: DEFAULT_CHAT_SYSTEM, contextTokens: 32000, confirmActions: true },
   // The AI learns the user's communication style + stable facts from their chat inputs,
   // keeps a profile note in the vault, and injects a condensed version into chat/agent.
   profile: { enabled: true, everyN: 6, inject: true, notePath: 'About Me.md' },
@@ -47,45 +47,40 @@ const defaults = () => ({
   // Inbox triage over IMAP (read-only: EXAMINE + BODY.PEEK). Gmail needs an app password.
   mail: { enabled: false, host: '', port: 993, user: '', password: '', mailbox: 'INBOX', lookbackDays: 3, maxMessages: 30, scanIntervalMin: 0, model: '' },
   // Outbound notifications. The Discord webhook URL is a secret (posting rights).
-  notify: { discordWebhook: '', onImportantMail: true },
+  notify: { discordWebhook: '' },
   projectsRoot: path.resolve(ROOT, '..'),
   // Home weather widget — location set via Settings → Profile (Open-Meteo, no key).
   weather: { lat: null, lon: null, place: '', units: 'c' },
   // GitHub app. token is optional — when empty, the server borrows the gh CLI's login.
   github: { token: '' },
-  // AIOS owns the local llama.cpp server (approved 2026-07-11). 'big' is the GPU
-  // daily driver; 'tiny' is a small fast model for quick work. Freeing the card for
-  // ComfyUI is no longer a profile swap — Studio stops llama-server outright.
+  // AIOS owns the local llama.cpp server. Both profiles use the installed Spark
+  // GGUF: 'big' is the normal 32k GPU profile and 'tiny' is a short-context fallback.
+  // Freeing the card for ComfyUI stops llama-server outright.
   llm: {
     managed: true,
-    // Reasoning ("thinking") control for models that support it (e.g. the ornith
-    // reasoning model, Qwen3, DeepSeek-R1). `default` applies when a caller doesn't
-    // specify one; `byModel` overrides per model ref OR alias (e.g. { 'ornith-9b': 'high' }).
+    // On-demand lifecycle: llama-server only starts when a request needs a model, and is
+    // stopped again after this many minutes with nothing running (0 = keep it loaded).
+    idleUnloadMin: 12,
+    // Reasoning ("thinking") control for models that support it. `default` applies
+    // when a caller doesn't specify one; `byModel` overrides per model ref or alias.
     // Levels: auto | off | low | medium | high. 'auto' (the default) sends nothing and lets
     // the model's chat template decide — so normal chat is unchanged. off/low/medium/high map,
     // for local OpenAI-compatible servers, to chat_template_kwargs.enable_thinking +
     // reasoning_effort; for Ollama to `think`. Cloud endpoints ignore these entirely.
-    // 'tiny' is off by default and that is not arbitrary: Qwen3.5-2B with thinking
-    // enabled spent 900 tokens without emitting a single visible word, while the same
-    // question answered correctly in 36 tokens with thinking off. A fast small model
-    // that never finishes thinking is not a fast small model.
-    reasoning: { default: 'auto', byModel: { tiny: 'off' } },
+    reasoning: { default: 'auto', byModel: {} },
     binary: '/home/joejin/llama.cpp/build/bin/llama-server',
     // the PyQt launcher (Whisper/MusicGen/manual llama tinkering) — AIOS can open it
     launcher: '/home/joejin/ai/llama-launcher/launch_llama_server.sh',
     port: 8080,
     profiles: {
       big: {
-        model: '/home/joejin/ai/models/ornith-1.0-9b-Q5_K_M.gguf', alias: 'ornith-9b',
-        args: ['--ctx-size', '32758', '-ngl', 'auto', '--batch-size', '2048', '--ubatch-size', '512', '--threads', '8', '--parallel', '1', '--cache-reuse', '256', '--flash-attn', 'on', '--cache-type-k', 'q8_0', '--cache-type-v', 'q8_0'],
+        model: path.join(DATA, 'llm', 'models', 'Spark-X2.5-4B-Q8_0.gguf'), alias: 'spark-x2.5-4b-q8_0',
+        args: ['--ctx-size', '32768', '-ngl', 'auto', '--batch-size', '2048', '--ubatch-size', '512', '--threads', '8', '--parallel', '1', '--cache-reuse', '256', '--flash-attn', 'on', '--cache-type-k', 'q8_0', '--cache-type-v', 'q8_0', '--jinja'],
       },
       tiny: {
-        model: '/home/joejin/ai/models/Qwen3.5-2B-UD-Q8_K_XL.gguf', alias: 'tiny',
-        // GPU-resident now that Studio stops llama.cpp instead of demoting it: at
-        // 2.6GB it leaves ~5GB free, and CPU-only threw away the speed that makes a
-        // small model worth having. 32k context is what fitContext allows here.
-        args: ['--ctx-size', '32768', '-ngl', '99', '--threads', '8', '--batch-size', '2048',
-          '--ubatch-size', '512', '--flash-attn', 'on', '--cache-type-k', 'q8_0', '--cache-type-v', 'q8_0'],
+        model: path.join(DATA, 'llm', 'models', 'Spark-X2.5-4B-Q8_0.gguf'), alias: 'spark-x2.5-4b-q8_0-lowctx',
+        args: ['--ctx-size', '8192', '-ngl', 'auto', '--threads', '8', '--batch-size', '1024',
+          '--ubatch-size', '256', '--parallel', '1', '--flash-attn', 'on', '--cache-type-k', 'q8_0', '--cache-type-v', 'q8_0', '--jinja'],
       },
     },
   },
@@ -283,7 +278,6 @@ export function updateConfig(patch) {
   }
   if (patch.notify) {
     const n = patch.notify, N = c.notify;
-    if (typeof n.onImportantMail === 'boolean') N.onImportantMail = n.onImportantMail;
     if (typeof n.discordWebhook === 'string' && n.discordWebhook !== '') N.discordWebhook = n.discordWebhook;
     if (n.discordWebhook === null) N.discordWebhook = '';
   }

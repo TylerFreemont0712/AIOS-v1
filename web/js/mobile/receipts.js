@@ -139,9 +139,29 @@ async function processOne(item) {
       if (!isImageFile(item.file)) {
         throw new Error(`${item.name} is${item.file.type ? ` a ${item.file.type},` : ''} not a photo. Receipts need an image.`);
       }
-      // force: receipts are always worth downscaling, even a JPEG straight from the
-      // camera — 1600px reads perfectly and uploads in a fraction of the time.
-      const prepped = await prepareImage(item.file, { force: true });
+      // force: receipts are always worth re-encoding, even a JPEG straight from the
+      // camera. But 2048 here, not the 1600 chat attachments get — receipts are the one
+      // upload where the small print IS the payload.
+      //
+      // Measured on this archive: after cropToContent the paper is only 553-936px wide,
+      // which on 58mm thermal stock is ~10-16 px/mm — roughly 17-26px kanji. That is the
+      // reading of the failure pattern the bench keeps showing: totals 100% and dates 90%
+      // (large print) against itemF1 0.32 (small print). Product names are not being
+      // misunderstood, they are being resized away before the model looks.
+      //
+      // Worth doing only because the reader actually uses the pixels. From llama.log,
+      // prompt tokens per request: HunyuanOCR 520-2139 (varies 4x with the input), while
+      // DeepSeek-OCR sits at a fixed ~906 no matter what it is handed. A fixed-budget
+      // reader would downsample this straight back and the extra bytes would be waste.
+      //
+      // 2048 is the ceiling for free: server/uploads.js MAX_EDGE is already 2048, and at
+      // ~0.8-1.3MB the upload stays under RESIZE_ABOVE_BYTES (2MB), so the box keeps the
+      // pixels instead of re-encoding them away.
+      //
+      // NOT YET MEASURED: every photo in the archive was captured at 1600, so the bench
+      // cannot score this. It needs a receipt shot at both sizes. See freelance-task-watch
+      // style write-up in the OCR notes before claiming a number for it.
+      const prepped = await prepareImage(item.file, { force: true, longEdge: 2048 });
       if (!prepped) toast(undecodableHint(item.file), '');    // ffmpeg on the box gets a turn
       const body = prepped ? prepped.blob : item.file;
       if (!item.thumb) item.thumb = URL.createObjectURL(body);   // retries reuse the first one

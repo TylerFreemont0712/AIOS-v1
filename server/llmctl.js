@@ -1,6 +1,5 @@
-// AIOS-managed llama.cpp lifecycle (ownership approved 2026-07-11). Two profiles:
-// 'big'  — the GPU daily driver
-// 'tiny' — a small fast model for quick work and low-VRAM situations
+// AIOS-managed llama.cpp lifecycle. Both profiles use Spark-X2.5-4B:
+// 'big' is the normal 32k context, 'tiny' is an 8k low-context fallback.
 // Freeing the GPU for ComfyUI is no longer a profile swap: suspendForGpu() stops
 // llama-server outright and resumeAfterGpu() puts back whatever was serving.
 // Pidfile discipline mirrors scripts/aios-launch.sh; a llama-server started by the
@@ -75,6 +74,7 @@ export function llmStatus() {
   let profile = '';
   try { profile = fs.readFileSync(PROFILE_FILE, 'utf8').trim(); } catch { }
   const foreign = foreignPids();
+  const limitMin = idleLimitMin();
   return {
     managed: cfg.managed !== false,
     running: mine, profile: mine ? profile : '',
@@ -85,6 +85,10 @@ export function llmStatus() {
     // Set while Studio/ComfyUI holds the GPU. The UI needs this to distinguish
     // "deliberately stopped so Comfy can render" from "the LLM fell over".
     suspended: gpuSuspendedFor(),
+    // On-demand lifecycle: minutes of quiet before the model is unloaded (0 = never),
+    // and how long is left on that clock right now. Only AIOS's own server has one.
+    idleUnloadMin: limitMin,
+    idleLeftSec: mine && limitMin ? Math.max(0, Math.round((limitMin * 60_000 - (Date.now() - lastActive)) / 1000)) : null,
   };
 }
 
@@ -133,13 +137,73 @@ export async function stopLlama() {
   return { stopped: true };
 }
 
+// ---------- on-demand lifecycle: idle unload ----------
+//
+// Nothing starts llama-server on its own. It comes up when something actually needs a
+// model (router.js ensureServing, which every `local:` request passes through), and this
+// watcher stops it again after `llm.idleUnloadMin` quiet minutes (default 12, 0 = never).
+// The cost being avoided is ~6GB of VRAM held all day on an 8GB card that ComfyUI also
+// wants; the cost being paid is a 10-30s load on the first message after a quiet spell.
+//
+// "Quiet" is measured, not guessed: /slots says whether a generation is in flight (a
+// five-minute reply on this box must never be unloaded under), touch() marks the start of
+// every request, and a finished boot starts the clock fresh. It only ever stops a server
+// AIOS started — a llama-server launched from the PyQt launcher is somebody's experiment.
+let lastActive = Date.now();
+let booting = 0;                 // boots in flight — never unload underneath one
+let unloading = null;            // promise while an idle unload is stopping the server
+let idleTimer = null;
+let ticking = false;
+
+/** Note that the model was just used (or just came up) — restarts the idle clock. */
+export function touch() { lastActive = Date.now(); }
+
+/** Minutes of quiet before unloading; 0 turns the unload off. */
+export function idleLimitMin() {
+  const v = Number(loadConfig().llm?.idleUnloadMin);
+  return Number.isFinite(v) && v >= 0 ? v : 12;
+}
+
+/** Resolves once an in-progress idle unload has finished (immediately otherwise), so a
+ *  request arriving mid-unload waits for the port to free and then boots cleanly instead
+ *  of being sent to a server that is shutting down. */
+export const unloadInFlight = () => unloading || Promise.resolve();
+
+async function idleTick() {
+  const cfg = loadConfig().llm || {};
+  const limit = idleLimitMin() * 60_000;
+  if (!limit || cfg.managed === false || booting > 0 || unloading) return;
+  const pid = readPid();
+  if (!(alive(pid) && isLlama(pid))) return;
+  const { busy, certain } = await llamaBusy();
+  if (busy) { if (certain) touch(); return; }   // working — or unreadable, which is not idle either
+  if (Date.now() - lastActive < limit) return;
+  if (booting > 0) return;
+  // No await between this last look and the kill below, so a request that touch()ed a
+  // moment ago is seen; one that lands after waits on `unloading`.
+  const idleMin = Math.round((Date.now() - lastActive) / 60_000);
+  console.log(`[llm] idle for ${idleMin} min — unloading ${llmStatus().profile || 'the model'} to free VRAM (next use loads it again)`);
+  unloading = stopLlama().finally(() => { unloading = null; });
+  await unloading;
+}
+
+/** Start the idle watcher. Safe to call twice. */
+export function startIdleWatch() {
+  if (idleTimer) return;
+  idleTimer = setInterval(() => {
+    if (ticking) return;
+    ticking = true;
+    idleTick().catch(e => console.error('[llm] idle check failed:', e.message)).finally(() => { ticking = false; });
+  }, Number(process.env.AIOS_IDLE_TICK_MS) || 15_000);   // env override is for tests
+  idleTimer.unref?.();
+}
+
 /** Free the GPU completely for another tenant (ComfyUI), remembering what was
  *  loaded so it can be restored afterwards.
  *
- *  Stopping beats swapping to the tiny CPU profile: a llama-server process holds
- *  its CUDA context and cuBLAS workspace even at -ngl 0, which is a few hundred MB
- *  that an SDXL checkpoint would rather have. On an 8GB card that margin decides
- *  whether a generation fits. */
+ *  Stopping beats switching to a low-context profile: the same model weights and
+ *  llama-server CUDA context would still occupy VRAM that an SDXL checkpoint needs.
+ *  On an 8GB card that margin decides whether a generation fits. */
 export async function suspendForGpu() {
   const cur = llmStatus();
   if (!cur.running && !cur.foreign) return { suspended: false, was: '', reason: 'nothing was serving' };
@@ -151,11 +215,16 @@ export async function suspendForGpu() {
 }
 
 /** Put back whatever suspendForGpu() stopped. Falls back to `fallback` when
- *  nothing was remembered, and does nothing if something is already serving. */
-export async function resumeAfterGpu({ fallback = 'big' } = {}) {
+ *  nothing was remembered, and does nothing if something is already serving.
+ *
+ *  `lazy` only gives the GPU back: the model is NOT reloaded now, because the next
+ *  request that needs one loads it on demand. An image render finishing is not a reason
+ *  to spend 30 seconds of GPU on a model nobody has asked for. */
+export async function resumeAfterGpu({ fallback = 'big', lazy = false } = {}) {
   let was = '';
   try { was = fs.readFileSync(SUSPEND_FILE, 'utf8').trim(); } catch { }
   try { fs.unlinkSync(SUSPEND_FILE); } catch { }
+  if (lazy) return { resumed: false, lazy: true, was, reason: 'loads on next use' };
 
   const cur = llmStatus();
   if (cur.running) return { resumed: false, profile: cur.profile, reason: 'already serving' };
@@ -534,7 +603,11 @@ async function withBootLock(fn) {
 }
 
 /** Shared spawn+wait: kill whatever runs, start detached, wait for /health. */
-const boot = (opts) => serializeBoot(() => withBootLock(() => bootNow(opts)));
+const boot = (opts) => {
+  booting++;
+  return serializeBoot(() => withBootLock(() => bootNow(opts)))
+    .finally(() => { booting--; touch(); });    // a fresh model gets a full idle window
+};
 
 async function bootNow({ model, alias, args, label, budget }) {
   const cfg = loadConfig().llm || {};
