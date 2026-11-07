@@ -22,7 +22,7 @@ import { streamChat } from './llm.js';
 import * as uploads from './uploads.js';
 const { getMeta } = uploads;
 import { loadConfig, saveConfig } from './config.js';
-import { visionModels, refSeesImages, refIsTranscriber } from './llmctl.js';
+import { visionModels, refSeesImages, refIsTranscriber, refPreset } from './llmctl.js';
 import { extractJSON, id as genId, now } from './util.js';
 import { all, one, run, tx, parseJSON } from './financedb.js';
 import * as finance from './finance.js';
@@ -414,6 +414,20 @@ function orientForOcr(meta, explicit) {
 //
 // So: transcribe with the reader, structure with the thinker. Each stage is the task its
 // model was trained for.
+//
+// Re-tested 2026-08-29 against HunyuanOCR, which advertises single-pass information
+// extraction (92.53% on receipts in its own technical report) and would collapse these two
+// stages into one if it held up. It does not, and the way it fails is instructive: given
+// the receipt schema directly it returned every product line correctly and then reported
+// the total of ¥4,123 as `4.123` — a JSON grammar cannot emit "4,123" for a number, so the
+// thousands separator became a decimal point and the figure was destroyed before any
+// validation could see it. Its date came back as `2026年06月28日(日)` and the merchant as
+// the branch rather than the chain. Transcribing the same photo, it got all three right,
+// because they are printed right there on the paper.
+//
+// The lesson is the same one this file already learned about Gemma, arriving from the
+// other direction: normalising money and dates is a language task, and a transcriber is
+// not a language model. The split stays.
 
 /** The prompt a transcriber expects. These models are prompt-sensitive: dots.ocr returns
  *  two tokens for "OCR" and a full layout parse for the string below. */
@@ -435,19 +449,48 @@ const TRANSCRIBE_PROMPTS = {
     - All layout elements must be sorted according to human reading order.
 
 5. Final Output: The entire output must be a single JSON object.`,
+  // Both of the 2026 readers answer to a plain instruction — llama.cpp's own vision test
+  // for HunyuanOCR is literally `-p "OCR"`, and PaddleOCR-VL's card specifies `OCR:` with
+  // the colon, which selects text recognition out of its six task heads. Written out
+  // rather than left to the default so that changing the default cannot silently change
+  // what these two are asked.
+  hunyuanocr: 'OCR',
+  paddleocr: 'OCR:',
+  // DeepSeek's grounding token asks for text with positions; without it the model tends
+  // to summarise the page instead of transcribing it.
+  'deepseek-ocr': '<|grounding|>OCR',
+  'glm-ocr': 'OCR',
+  lightonocr: 'OCR',
   default: 'OCR',
 };
 
-const transcribePrompt = (ref) => {
-  const s = String(ref || '').toLowerCase();
-  for (const [k, v] of Object.entries(TRANSCRIBE_PROMPTS)) if (k !== 'default' && s.includes(k)) return v;
-  return TRANSCRIBE_PROMPTS.default;
+/** Which readers answer with one JSON layout object per image instead of lines of text.
+ *  Only line-oriented output can be stitched back together from overlapping bands. */
+const TRANSCRIBE_STYLES = { 'dots.ocr': 'layout-json' };
+
+/** The model's own preset wins; the tables above are the fallback for a reader nobody
+ *  has configured yet. Looking the preset up is a config read plus a directory scan, so
+ *  both lookups are wrapped in try/catch — a reader that cannot be resolved (a cloud ref,
+ *  a model since deleted) must fall back to the default, not take the scan down. */
+const presetOcr = (ref) => {
+  try { return refPreset(ref); } catch { return null; }
 };
+
+const byName = (table, ref) => {
+  const s = String(ref || '').toLowerCase();
+  for (const [k, v] of Object.entries(table)) if (k !== 'default' && s.includes(k)) return v;
+  return table.default;
+};
+
+/** How a given reader wants to be asked. Exported so the benches can drive a model the
+ *  same way the pipeline does — asking dots.ocr for "OCR" returns two tokens. */
+export const ocrPromptFor = (ref) => presetOcr(ref)?.ocrPrompt || byName(TRANSCRIBE_PROMPTS, ref);
+const transcribePrompt = ocrPromptFor;
 
 /** What shape stage 1 comes back in. Only line-oriented text can be stitched back
  *  together from bands — a reader that answers with one JSON layout object per image has
  *  to see the whole page at once, so it reads the photo whole. */
-export const transcribeStyle = (ref) => (String(ref || '').toLowerCase().includes('dots.ocr') ? 'layout-json' : 'lines');
+export const transcribeStyle = (ref) => presetOcr(ref)?.ocrStyle || byName(TRANSCRIBE_STYLES, ref) || 'lines';
 
 /**
  * Hand the model the receipt, not the table it is lying on.
@@ -456,16 +499,90 @@ export const transcribeStyle = (ref) => (String(ref || '').toLowerCase().include
  * pixels, and the reviewer's photo should stay whole. Everything the model saw is still
  * visible in the original, so the "check it against the paper" loop is unaffected.
  */
-function cropForOcr(meta) {
+/**
+ * Straighten, then trim. Returns a THROWAWAY upload the caller must delete, or null when
+ * neither step found anything to do.
+ *
+ * Deskew runs first and that order is the whole reason this is one function. Both steps
+ * fight for the same pixel budget, but a crop box is axis-aligned: around a receipt lying
+ * at 6° it has to be wide enough to contain the corners, so it keeps a wedge of table
+ * down each side. Straighten first and the same box hugs the paper. Doing it the other
+ * way round means deskewing an image that has already thrown away the resolution.
+ *
+ * `planAngle` upstream handles quarter-turns, which are a different failure (the photo is
+ * sideways) with a different fix (turn it and read again). This is the few degrees of
+ * hand-held tilt that no amount of re-reading will correct.
+ */
+function prepareForOcr(meta) {
+  let buffer;
+  try { ({ buffer } = uploads.readUpload(meta.id)); }
+  catch (e) { console.error('[receipts] could not read the photo:', e.message); return null; }
+
+  const notes = [];
+  if (deskewEnabled()) {
+    try {
+      const straight = uploads.deskew(buffer);
+      if (straight) {
+        buffer = straight.buffer;
+        notes.push(`straightened ${straight.degrees > 0 ? '' : '+'}${(-straight.degrees).toFixed(1)}°`);
+      }
+    } catch (e) { console.error('[receipts] deskew failed, reading it tilted:', e.message); }
+  }
+
+  let area = 0;
   try {
-    const { buffer } = uploads.readUpload(meta.id);
     const cropped = uploads.cropToContent(buffer);
-    if (!cropped) return null;
-    return { meta: uploads.saveUploadSync({ name: 'crop.jpg', mime: 'image/jpeg', buffer: cropped.buffer }), area: cropped.area };
+    if (cropped) { buffer = cropped.buffer; area = cropped.area; notes.push(`cropped to ${cropped.area}% of the frame`); }
+  } catch (e) { console.error('[receipts] crop failed, using the whole photo:', e.message); }
+
+  if (!notes.length) return null;
+  try {
+    return { meta: uploads.saveUploadSync({ name: 'prep.jpg', mime: 'image/jpeg', buffer }), area, why: notes.join(', ') };
   } catch (e) {
-    console.error('[receipts] crop failed, using the whole photo:', e.message);
+    console.error('[receipts] could not store the prepared photo:', e.message);
     return null;
   }
+}
+
+/** Straightening is on unless it is turned off — it is deterministic, costs one ffmpeg
+ *  pass, and declines by itself on a photo that is already straight. The switch exists so
+ *  the bench can measure it (receipt-bench --no-deskew) rather than assume it helps. */
+let deskewOverride = null;
+const deskewEnabled = () => (deskewOverride === null ? (loadConfig().finance || {}).ocrDeskew !== false : deskewOverride);
+/** Force straightening on or off for one process — the bench measures both, and writing
+ *  the user's config to do it would leave the setting changed if the run were killed. */
+export const setDeskew = (on) => { deskewOverride = on === null ? null : !!on; };
+
+/**
+ * Cut a degenerate tail off a transcription.
+ *
+ * Greedy decoding at temperature 0 is what makes this pipeline reproducible, and it is
+ * also what makes a reader loop. Measured here: HunyuanOCR read a McDonald's receipt as a
+ * Markdown table, transcribed every line correctly, and then emitted `| | | |` until it
+ * hit the 4096-token cap — 7,987 characters, 142 seconds, and a wall of nothing for the
+ * structuring model to wade through.
+ *
+ * A repetition penalty is the usual answer and is the wrong one here. Receipts genuinely
+ * repeat: this archive has 国産豚肉 ミンチ printed three times on one receipt at three
+ * different prices, and penalising that is how you lose a real purchase. What no receipt
+ * ever has is the SAME line six times in a row, so that is what gets cut — deterministic,
+ * needs no sampler change, and cannot touch a legitimate repeat.
+ */
+export function trimRepetition(text, { run = 6 } = {}) {
+  const lines = String(text || '').split('\n');
+  let start = -1, streak = 1;
+  for (let i = 1; i < lines.length; i++) {
+    if (normLine(lines[i]) === normLine(lines[i - 1])) {
+      streak++;
+      if (streak === run) start = i - run + 1;
+    } else {
+      // A streak that ended is not degeneration — the loop only counts as runaway when it
+      // runs to the end of the output, which is what hitting the token cap looks like.
+      if (start >= 0) return lines.join('\n');
+      streak = 1;
+    }
+  }
+  return start >= 0 ? lines.slice(0, start).join('\n').trimEnd() : String(text || '');
 }
 
 /** Stage 1 — read the paper. No grammar: transcription is this model's native output,
@@ -478,7 +595,12 @@ async function transcribe(meta, modelRef, signal) {
     sampling: { temperature: 0 },
     signal,
   });
-  return String(res.text || res.reasoning || '').trim();
+  const raw = String(res.text || res.reasoning || '').trim();
+  const cut = trimRepetition(raw);
+  if (cut.length < raw.length) {
+    console.warn(`[receipts] the reader looped — trimmed ${raw.length - cut.length} characters of repeated lines off the end`);
+  }
+  return cut;
 }
 
 const normLine = (s) => String(s || '').replace(/\s+/g, ' ').trim();
@@ -612,23 +734,57 @@ function structureModel() {
  * failures come back as `{ error }` rather than thrown, because a failed attempt is a
  * result the loop has to compare against the others, not an emergency.
  */
-async function readOnce({ meta, modelRef, cfg, prompt, signal }) {
+/**
+ * The shop name off the top of the transcription, for when stage 2 did not take it.
+ *
+ * The name is the first thing printed on a receipt and the transcriber reads it fine —
+ * every 阪急OASIS scan in this archive opens `# 阪急OASIS` / `高槻川西店` — yet the
+ * structurer returns an empty merchant on roughly half of them (bench: shop 20%, against
+ * 93% of line amounts found). Recovering it from text already in hand beats another model
+ * call, and it is deterministic, which the structurer is not.
+ *
+ * An empty merchant is not merely a missing label, which is what makes this worth doing:
+ * `learnFix` files a correction with `merchant: ''` GLOBALLY, at every shop. That is how a
+ * price correction for one shop's mince escaped and started rewriting other receipts.
+ *
+ * Conservative on purpose — it only ever replaces an empty value, and it skips anything
+ * that is a document title, a phone number, a date, money, or a summary line. A branch
+ * name ("高槻川西店") is an acceptable answer: it is a real shop and a stable key, which
+ * "" is not.
+ */
+const MERCHANT_TITLE = /^(領収証|領収書|レシート|お買上明細|お買い上げ明細|明細書|receipt|tax invoice|invoice)$/i;
+
+export function merchantFromTranscription(raw) {
+  for (const line of String(raw || '').split('\n').slice(0, 8)) {
+    const s = line.replace(/^[#>*\s|—–-]+/, '').replace(/[|*_`\s]+$/, '').trim();
+    if (s.length < 2 || s.length > 40) continue;
+    if (MERCHANT_TITLE.test(s) || looksLikeSummary(s)) continue;
+    if (/[¥￥$€£]/.test(s)) continue;                                  // a money line
+    if (/^[\d\s()+.:/\-]+$/.test(s)) continue;                          // phone, barcode, rule
+    if (/\d{4}\s*年|\d{1,2}\s*月\s*\d{1,2}\s*日|\d{1,2}:\d{2}/.test(s)) continue;   // date or time
+    if (!/[A-Za-z\u3040-\u30ff\u4e00-\u9fff]/.test(s)) continue;        // must carry a word
+    return s;
+  }
+  return '';
+}
+
+async function readOnce({ meta, modelRef, cfg, prompt, signal, textModelRef }) {
   // A dedicated OCR model reads the paper far better than it answers questions about it,
   // so when one is selected the work is split: it transcribes, then a text model turns
   // that into the receipt object.
   if (refIsTranscriber(modelRef)) {
-    const textModel = structureModel();
+    const textModel = textModelRef || structureModel();
     let crop = null;
     // Held outside the try so a failure while STRUCTURING still hands back what was read
     // off the paper. That transcription is the expensive half and the only thing that can
     // tell the user whether the photo or the text model was at fault.
     let raw = '';
     try {
-      // Crop first: on every real receipt here the paper is under half the frame, and the
-      // model downsamples whatever it is handed. Uncropped, one of these transcribed to
-      // 86 characters; cropped, 698 and a perfect reading.
-      crop = cropForOcr(meta);
-      if (crop) console.log(`[receipts] cropped to the receipt (${crop.area}% of the frame) before reading`);
+      // Straighten and crop first: on every real receipt here the paper is under half the
+      // frame, and the model downsamples whatever it is handed. Uncropped, one of these
+      // transcribed to 86 characters; cropped, 698 and a perfect reading.
+      crop = prepareForOcr(meta);
+      if (crop) console.log(`[receipts] ${crop.why} before reading`);
       // …then, if what is left is a long strip, read it in bands rather than downscaling
       // the small print out of existence. Cropping first is what makes the shape test
       // meaningful: the aspect that matters is the paper's, not the table's.
@@ -643,6 +799,14 @@ async function readOnce({ meta, modelRef, cfg, prompt, signal }) {
         console.warn('[receipts] structuring failed on the first pass — retrying');
         out = await structure(raw, cfg, textModel, signal);
         parsed = normalize(extractJSON(out.text, { require: ['total', 'merchant', 'items'] }), cfg);
+      }
+      // The transcription has the shop name even when the structuring pass loses it.
+      if (parsed && !parsed.merchant) {
+        const fromPaper = merchantFromTranscription(raw);
+        if (fromPaper) {
+          parsed.merchant = fromPaper;
+          console.log(`[receipts] took the shop name off the transcription: ${fromPaper}`);
+        }
       }
       return {
         parsed, raw, model: `${modelRef} → ${textModel}`,
@@ -665,10 +829,17 @@ async function readOnce({ meta, modelRef, cfg, prompt, signal }) {
   // for its template. So the only reliable lever is headroom. The old 2400 cap is exactly
   // what produced "the model did not return usable JSON": 3130 characters of narration,
   // truncated before the object began.
+  // The same straighten-and-crop the two-stage path gets. It used to happen only there,
+  // which meant the single-pass reader was handed the table as well as the receipt — and
+  // cropping is the single preprocessing step measured to matter most here.
+  const prep = prepareForOcr(meta);
+  if (prep) console.log(`[receipts] ${prep.why} before reading`);
+  const view = prep?.meta || meta;
+
   const attempt = (maxTokens) => streamChat({
     modelRef,
     system: SYSTEM,
-    messages: [{ role: 'user', text: prompt, attachments: [meta] }],
+    messages: [{ role: 'user', text: prompt, attachments: [view] }],
     schema: RECEIPT_SCHEMA,
     maxTokens,
     sampling: { temperature: 0 },
@@ -686,6 +857,8 @@ async function readOnce({ meta, modelRef, cfg, prompt, signal }) {
     }
   } catch (e) {
     return { error: e.message };
+  } finally {
+    if (prep?.meta) { try { uploads.deleteUpload(prep.meta.id); } catch { /* already gone */ } }
   }
 
   // With the grammar on, `text` is the JSON. The reasoning fallback stays for providers
@@ -746,7 +919,15 @@ function tilePolicy() {
  */
 function planAngle(last, used) {
   const p = last?.parsed;
-  const illegible = !p || !p.merchant || !p.items?.length;
+  // AND, not OR — the two cases above are "nothing legible" versus "legible but wrong",
+  // and a missing shop name on its own is neither. Plenty of receipts here read every
+  // line correctly and simply have no shop name printed where the model can find it:
+  // one in this archive came back with 19 items and a matching total under a null
+  // merchant, and `||` sent that upright, perfectly-read photo round the whole rotation
+  // ladder — two extra passes of 25-40s GPU each, and a rotateStored that can leave the
+  // picture the user reviews against turned the wrong way. Turning the paper only helps
+  // when the paper was not read at all.
+  const illegible = !p || (!p.merchant && !p.items?.length);
   if (!illegible) return null;                       // read fine; the angle is not the problem
   return [180, 90, 270].find(a => !used.includes(a)) ?? null;
 }
@@ -778,37 +959,35 @@ function rotatedCopy(meta, deg) {
  *
  * Does NOT write to the ledger — the user reviews first, then calls apply().
  */
-export async function scan({ uploadId, model, rotate, signal } = {}) {
-  let meta = getMeta(String(uploadId || ''));
-  if (!meta) throw missing('upload not found — attach the image first');
-  if (meta.kind !== 'image') throw bad(`receipt scanning needs a photo, but that upload is ${meta.kind === 'pdf' ? 'a PDF' : meta.kind === 'text' ? 'a text file' : `a ${meta.mime}`}.`);
-  if (meta.unreadable) throw bad(`that photo is a ${meta.convertedFrom || meta.mime} and could not be converted to JPEG on this machine `
-    + '— install ffmpeg (or set uploads.ffmpeg to its path) and try again.');
-
-  // Straighten the photo BEFORE the model sees it. A receipt read at 90° is the single
-  // most avoidable cause of a bad scan.
+/**
+ * Read a photo of a receipt, all the way to a scored object — and touch no database.
+ *
+ * This is everything `scan()` used to do inline, lifted out so it has exactly two callers
+ * with opposite needs. `scan()` wants the result persisted and the user's stored photo
+ * left at the angle that won. The bench (scripts/receipt-bench.mjs) wants neither: it
+ * replays receipts that are already in the ledger, so a run that rotated the originals
+ * would both corrupt the archive and make the second run measure different pixels than
+ * the first.
+ *
+ * The split is by OWNERSHIP, not by a flag: this function freely rotates the `meta` it is
+ * given, and the caller decides whether that meta is the user's upload or a throwaway
+ * copy of it. A `mutate: false` flag would have meant threading a condition through the
+ * orientation logic, the retry loop and the winning-angle write, and any one of them
+ * getting it wrong would silently damage the archive.
+ */
+export async function readReceipt({ meta: startMeta, modelRef, rotate, signal, useFixes = true, textModelRef = '' } = {}) {
+  let meta = startMeta;
   const oriented = orientForOcr(meta, rotate);
   if (oriented.rotated) {
     meta = getMeta(meta.id) || meta;
     console.log(`[receipts] rotated the photo ${oriented.rotated}° — ${oriented.why}`);
   }
 
-  const modelRef = String(model || ocrModel());
-  if (!modelRef) throw bad('no model configured — set finance.ocrModel or a default chat model in Settings');
-
   const cfg = finance.settings();
   const prompt = SCHEMA_PROMPT
     .replace('{CATEGORIES}', cfg.expenseCategories.join(', '))
     .replace('{YEAR}', new Date().getFullYear())
     .replace('{LEARNED}', learnedPromptBlock());
-
-  const rec = {
-    id: genId(8), upload_id: meta.id, status: 'pending', model: modelRef,
-    raw: '', parsed: '', parsed_ai: '', error: '', txn_ids: '[]',
-    created_at: now(), updated_at: now(),
-  };
-  rec.oriented = oriented;
-  save(rec);
 
   const { floor, max } = retryPolicy();
   // An explicit `rotate` is an instruction, not a suggestion: the user turned the preview
@@ -836,7 +1015,7 @@ export async function scan({ uploadId, model, rotate, signal } = {}) {
     }
     used.push(angle);                           // counted once the pass is actually happening
     try {
-      last = await readOnce({ meta: view, modelRef, cfg, prompt, signal });
+      last = await readOnce({ meta: view, modelRef, cfg, prompt, signal, textModelRef });
     } finally {
       if (tmp) { try { uploads.deleteUpload(tmp.id); } catch { /* already gone */ } }
     }
@@ -845,7 +1024,13 @@ export async function scan({ uploadId, model, rotate, signal } = {}) {
       // Replay what the user has already taught us about this shop BEFORE scoring: a
       // phantom line the correction loop already knows to drop should not count against
       // the reading that (correctly) no longer contains it.
-      last.parsed = replayFixes(last.parsed);
+      //
+      // Off for the bench, and that is not a detail. Every stored fix was learned from a
+      // correction the user made to one of the very receipts the bench scores against, so
+      // replaying them hands the model the answer sheet and every reader scores well. See
+      // scripts/receipt-bench.mjs --with-fixes for the other measurement, which is a fair
+      // question about the whole pipeline rather than about the model.
+      if (useFixes) last.parsed = replayFixes(last.parsed);
       last.parsed.confidence = scoreConfidence(last.parsed, { raw: last.raw });
       const score = last.parsed.confidence.score;
       // `best?.parsed`, not `best`: a first pass that failed outright is held as `best` so
@@ -868,29 +1053,59 @@ export async function scan({ uploadId, model, rotate, signal } = {}) {
     } catch (e) { console.error('[receipts] could not save the winning angle:', e.message); }
   }
 
-  const reads = used.length;
-  if (!best?.parsed) {
+  if (best?.parsed) {
+    // How it got here, so the reviewer can see that a low number is a considered one and
+    // not a first impression.
+    best.parsed.confidence.reads = used.length;
+    best.parsed.confidence.angle = bestAngle;
+  }
+  return {
+    parsed: best?.parsed || null,
+    raw: String(best?.raw || ''),
+    model: best?.model || modelRef,
+    error: best?.parsed ? '' : (best?.error || 'the receipt could not be read'),
+    oriented, angle: bestAngle, reads: used.length,
+  };
+}
+
+export async function scan({ uploadId, model, rotate, signal } = {}) {
+  const meta = getMeta(String(uploadId || ''));
+  if (!meta) throw missing('upload not found — attach the image first');
+  if (meta.kind !== 'image') throw bad(`receipt scanning needs a photo, but that upload is ${meta.kind === 'pdf' ? 'a PDF' : meta.kind === 'text' ? 'a text file' : `a ${meta.mime}`}.`);
+  if (meta.unreadable) throw bad(`that photo is a ${meta.convertedFrom || meta.mime} and could not be converted to JPEG on this machine `
+    + '— install ffmpeg (or set uploads.ffmpeg to its path) and try again.');
+
+  const modelRef = String(model || ocrModel());
+  if (!modelRef) throw bad('no model configured — set finance.ocrModel or a default chat model in Settings');
+
+  const rec = {
+    id: genId(8), upload_id: meta.id, status: 'pending', model: modelRef,
+    raw: '', parsed: '', parsed_ai: '', error: '', txn_ids: '[]',
+    created_at: now(), updated_at: now(),
+  };
+  // Land a 'pending' row before the model is asked anything. A scan is 15-45s of GPU and
+  // the Receipts list polls: without this the receipt simply does not exist until it is
+  // finished, which reads as nothing having happened.
+  save(rec);
+
+  const read = await readReceipt({ meta, modelRef, rotate, signal });   // fixes on: this is production
+  rec.oriented = read.oriented;
+  rec.model = read.model;
+  rec.raw = String(read.raw).slice(0, 20000);
+  rec.updated_at = now();
+
+  if (!read.parsed) {
     rec.status = 'failed';
-    rec.raw = String(best?.raw || '').slice(0, 20000);
-    rec.error = best?.error || 'the receipt could not be read';
-    rec.updated_at = now();
+    rec.error = read.error;
     const failed = save(rec);
-    failed.oriented = oriented;
+    failed.oriented = read.oriented;
     return failed;
   }
 
-  // How it got here, so the reviewer can see that a low number is a considered one and
-  // not a first impression.
-  best.parsed.confidence.reads = reads;
-  best.parsed.confidence.angle = bestAngle;
-
   rec.status = 'parsed';
-  rec.model = best.model || modelRef;
-  rec.raw = String(best.raw || '').slice(0, 20000);
-  rec.parsed = JSON.stringify(best.parsed);
-  rec.updated_at = now();
+  rec.parsed = JSON.stringify(read.parsed);
   const saved = save(rec);
-  saved.oriented = oriented;
+  saved.oriented = read.oriented;
   return saved;
 }
 
@@ -924,10 +1139,25 @@ const SUMMARY_KEYWORD = new RegExp([
 const stripNoise = (s) => s
   .replace(/no\.?|#|[¥￥$€£]/gi, '')                       // "No.28822", "#4", currency marks
   .replace(/[\d.,\s:：．・()（）%％*×x/\\-]/gi, '')
-  .replace(/点|個|品|枚|本|items?|pcs?|qty|税|込|抜|等|円/gi, '');
+  // 外/内/対象/軽(減) belong to the tax vocabulary the line above already matched on.
+  // Without them `消費税等外税（8%） ¥305` — printed verbatim on these receipts — keeps a
+  // residual 外 and reads as a product, taking ¥305 of tax into the ledger as a purchase.
+  .replace(/点|個|品|枚|本|items?|pcs?|qty|税|込|抜|等|円|外|内|対象|軽減|軽|計/gi, '');
+
+/**
+ * A bare count line: `2点`, `4点`, `* 4点 068`.
+ *
+ * `点数` is in the keyword list but a naked number-plus-点 is not, and this archive has
+ * three of them — each carrying the amount of the REAL product line printed beside it, so
+ * each one is both a phantom purchase and a stolen price. Anchored on the leading digits,
+ * which is what keeps `*ｱﾎﾞｶﾄﾞ1個標 2点` and `*ﾏ・ﾏ・ﾂﾁｸﾞﾏｶﾛﾆ 2点` — real products that
+ * merely END in a count — out of it.
+ */
+const COUNT_LINE = /^[\s*＊•・]*\d+\s*点[\s\d¥￥,.\-]*$/;
 
 function looksLikeSummary(s) {
   const t = String(s || '').trim();
+  if (COUNT_LINE.test(t)) return true;
   const m = SUMMARY_KEYWORD.exec(t);
   if (!m) return false;
   return stripNoise(t.slice(m[0].length)) === '';
@@ -935,7 +1165,14 @@ function looksLikeSummary(s) {
 
 /** Placeholder names a model reaches for when it cannot read the line. Useless in a
  *  catalogue, and a signal the reading is untrustworthy rather than a real product. */
-const PLACEHOLDER_NAME = /^(?:product|item|unknown|n\/?a|unnamed|goods|misc(?:ellaneous)?|商品|品物|不明)$/i;
+//
+// Anchored-exact matched none of the names the model actually reaches for when it cannot
+// read a line: `Product Code`, `Grade (Item)`, `(Item/Service)`, `(Service/Item)` — all
+// present in this archive, all carrying real money. So a placeholder word may now be
+// wrapped in brackets and paired with a generic qualifier.
+const PLACEHOLDER_WORD = 'product|item|service|goods|grade|code|description|unknown|n\\/?a|unnamed|misc(?:ellaneous)?|商品|品物|品名|不明';
+const PLACEHOLDER_NAME = new RegExp(
+  `^[\\s(（\\[]*(?:${PLACEHOLDER_WORD})(?:[\\s/／・·()（）\\]\\[-]+(?:${PLACEHOLDER_WORD}))?[\\s)）\\]]*$`, 'i');
 
 /**
  * Do the line items add up?
@@ -986,9 +1223,20 @@ function reconcile(items, { subtotal, tax, total }) {
  */
 export function looksLikeCode(name) {
   const s = String(name || '').trim();
-  if (s.length < 3 || s.length > 20) return false;
+  if (s.length < 3 || s.length > 28) return false;
   if (/[\p{L}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(s)) return false;
-  return /^[#*]?\d[\d\s#*\-./]*\d$/.test(s) && (s.match(/\d/g) || []).length >= 3;
+  // A transcriber that cannot name a line often keeps the price next to the code:
+  // `4514603217216 ¥158`. The currency mark alone used to defeat this, so two real
+  // barcode lines reached the reviewer named "Product Code" with no warning at all.
+  //
+  // Stripping the amount is only safe if what remains is long enough to be a barcode
+  // rather than a numeric product — `1000 ¥298` is a price, not a code — hence the
+  // six-digit floor, which a JAN (8 or 13) clears and a shelf price does not.
+  const priced = s.match(/^(.*?)\s*[¥￥$€£]\s*[\d,.]+$/);
+  const core = priced ? priced[1].trim() : s;
+  if (priced && (core.match(/\d/g) || []).length < 6) return false;
+  if (core.length < 3 || core.length > 20) return false;
+  return /^[#*]?\d[\d\s#*\-./]*\d$/.test(core) && (core.match(/\d/g) || []).length >= 3;
 }
 
 function annotate(lines, total) {
@@ -1003,6 +1251,12 @@ function annotate(lines, total) {
     // and that correction is exactly what the catalogue learns from.
     if (looksLikeCode(it.name)) {
       warn.push(`“${it.name}” looks like an item code rather than a product — check the photo for the name`);
+    } else if (it.unnamed) {
+      // The reader could not name this line at all. Say so plainly: an unnamed line
+      // carrying money is the shape a phantom takes, and it is the reviewer — not the
+      // arithmetic check — who can tell a real purchase from a summary row wearing a
+      // product's clothes. The sum cannot: a subtotal equals the lines it replaced.
+      warn.push(`the reader could not name this line — check the photo before logging ${it.amount}`);
     }
     let probe = null;
     try { probe = items.priceProbe(it.printed || it.name); } catch { /* no history yet */ }
@@ -1153,8 +1407,15 @@ function normalize(obj, cfg, { trust = false } = {}) {
     let name = String(it?.name ?? it?.printed ?? '').trim().slice(0, 120);
     // "Product"/"商品" tells us nothing and would pollute the catalogue. The printed
     // text is always more useful than a placeholder, even untidied.
-    if (PLACEHOLDER_NAME.test(name) && printed) name = printed;
+    // Remember that the model had no name for this line, even after substitution.
+    // Swapping in the printed text usually helps, but not when the printed text is the
+    // same placeholder — `(Item/Service)` naming `(Service/Item)`, both carrying ¥797,
+    // which is the subtotal. Losing that signal meant the line reached the reviewer
+    // looking like an ordinary product.
+    const unnamed = PLACEHOLDER_NAME.test(name);
+    if (unnamed && printed) name = printed;
     const line = { printed, name, qty: Math.max(1, Math.trunc(Number(it?.qty) || 1)), amount: numOrNull(it?.amount) };
+    if (unnamed) line.unnamed = true;
     // Sticky: the editor sets this when a human touches the name or the printed text, and
     // apply() uses it to file the line under THEIR name instead of the model's guess. It
     // has to survive re-normalisation, and it must never be inferrable by comparing keys —
@@ -1528,11 +1789,34 @@ function learnFromEdit(aiParsed, userParsed) {
   // model line gets a second chance against the user's unclaimed lines, paired on the
   // money — a line carrying the same amount at the same shop is the same purchase under a
   // corrected name, not a phantom.
-  const byKey = new Map(userParsed.items.map(it => [fixKey(it.printed || it.name), it]));
+  //
+  // A printed name is NOT a unique key, and assuming it was is how this loop learned to
+  // corrupt correct money. This very archive has `*国産豚肉 ﾐﾝﾁ` printed THREE times on
+  // one receipt at 264, 299 and 273 — the same mince, weighed three times — and
+  // `*輸入豚肉 ﾛｰｽ しゃぶ` twice at 199 and 185. A Map built from those keeps only the
+  // last line per name, so a model line matched the wrong user line and the difference
+  // between two genuinely different lines was filed as a correction: "when you read 299,
+  // they meant 273". It reached hits=8, above AUTO_FIX_AFTER, with merchant='' — i.e.
+  // applied at every shop — and the replay guard could not catch it because the value it
+  // checks against IS the correct reading. Every future scan of that receipt would have
+  // been silently short by ¥26, and the arithmetic check would have blamed the total.
+  //
+  // So: keep every line under its key, and when a name is ambiguous let the money break
+  // the tie — an identical name carrying an identical amount is the same line, and there
+  // is nothing to learn from it. Only if no amount matches do we fall back to order.
+  const byKey = new Map();
+  for (const it of userParsed.items) {
+    const k = fixKey(it.printed || it.name);
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(it);
+  }
+  const dupKey = new Set([...byKey].filter(([, v]) => v.length > 1).map(([k]) => k));
   const claimed = new Set();
   const pairs = aiParsed.items.map((ai) => {
-    const mine = byKey.get(fixKey(ai.printed || ai.name));
-    if (mine && !claimed.has(mine)) { claimed.add(mine); return [ai, mine]; }
+    const queue = byKey.get(fixKey(ai.printed || ai.name)) || [];
+    const mine = queue.find(it => !claimed.has(it) && Number(it.amount) === Number(ai.amount))
+      || queue.find(it => !claimed.has(it));
+    if (mine) { claimed.add(mine); return [ai, mine]; }
     return [ai, null];
   });
   const spare = userParsed.items.filter(it => !claimed.has(it));
@@ -1544,16 +1828,20 @@ function learnFromEdit(aiParsed, userParsed) {
 
   for (const [ai, mine] of pairs) {
     const raw = ai.printed || ai.name;
+    // When one name appears on several lines, which line the user edited is not
+    // recoverable from a diff — the pairing above is a best guess, and `amount`/`drop`
+    // are exactly the two lessons a wrong guess turns into corrupted money. A rename is
+    // safe (every printing of that name shares it), so it still learns.
+    const ambiguous = dupKey.has(fixKey(raw));
     if (!mine) {                                        // genuinely gone: the user deleted it
-      learnFix({ merchant, kind: 'drop', raw, aiValue: String(ai.amount) });
-      n++;
+      if (!ambiguous) { learnFix({ merchant, kind: 'drop', raw, aiValue: String(ai.amount) }); n++; }
       continue;
     }
     if (mine.name && ai.name && mine.name !== ai.name) {
       learnFix({ merchant, kind: 'rename', raw, aiValue: ai.name, userValue: mine.name });
       n++;
     }
-    if (Number(mine.amount) !== Number(ai.amount)) {
+    if (!ambiguous && Number(mine.amount) !== Number(ai.amount)) {
       learnFix({ merchant, kind: 'amount', raw, aiValue: String(ai.amount), userValue: String(mine.amount) });
       n++;
     }

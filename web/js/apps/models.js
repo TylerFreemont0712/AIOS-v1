@@ -53,8 +53,11 @@ export default {
       ui.main.innerHTML = '';
       if (!inf) return;
       const st = inf.status;
-      ui.chip.textContent = st.running ? `serving ${inf.serving} :${st.port}` : 'llama-server down';
-      ui.chip.style.color = st.running ? 'var(--ok)' : 'var(--err)';
+      // Off is the normal resting state now: the model loads on first use and unloads when idle.
+      ui.chip.textContent = st.running
+        ? `serving ${inf.serving} :${st.port}${st.idleLeftSec != null ? ` · unloads in ${Math.max(1, Math.ceil(st.idleLeftSec / 60))}m idle` : ''}`
+        : st.suspended ? 'paused for Studio' : st.foreign ? 'llama-server (unmanaged)' : 'idle — loads on demand';
+      ui.chip.style.color = st.running ? 'var(--ok)' : 'var(--muted)';
       if (inf.gpu) {
         const used = inf.gpu.usedMB, total = inf.gpu.totalMB;
         ui.gpu.innerHTML = '';
@@ -75,7 +78,7 @@ export default {
       ui.main.append(el('div', { class: 'bench-best' },
         el('div', { class: 'learn-lbl' }, 'SERVING'),
         el('div', { class: 'muted small' },
-          'Every model below is available everywhere as “local:​…” in model pickers — pick one and it is served automatically on demand (in-flight generations are never interrupted). Manual Serve exists for pre-loading.')));
+          'Every model below is available everywhere as “local:​…” in model pickers — pick one and it is served automatically on demand (in-flight generations are never interrupted), then unloaded after a quiet spell (Settings → Providers). Manual Serve exists for pre-loading.')));
 
       // the garage
       for (const m of inf.candidates || []) ui.main.append(modelCard(m, inf));

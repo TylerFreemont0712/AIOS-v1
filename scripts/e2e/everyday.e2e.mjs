@@ -100,6 +100,15 @@ const srv = http.createServer((req, res) => {
 });
 await new Promise(r => srv.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${srv.address().port}`;
+// The crawler refuses private addresses by default, which is the point of the guard
+// (server/tools.js:safeFetch) — so assert the refusal first, then opt in the way a
+// user who genuinely wants their own LAN crawled would, and test the crawl itself.
+let refused = '';
+try { await tools.crawlSite(base + '/', { maxPages: 2, depth: 1 }); }
+catch (e) { refused = e.message; }
+ok(/private address/.test(refused), 'crawl_site refuses loopback until it is allowed');
+cfg.updateConfig({ tools: { ...cfg.loadConfig().tools, allowPrivateFetch: true } });
+
 const crawl = await tools.crawlSite(base + '/', { maxPages: 10, depth: 2 });
 ok(/\/a\b/.test(crawl) && /\/b\b/.test(crawl) && /\/c\b/.test(crawl), 'crawl reached same-host pages /a /b /c');
 ok(!/example\.invalid/.test(crawl), 'crawl did NOT follow the external link (same-host confinement)');
@@ -107,6 +116,7 @@ const ranked = await tools.crawlSite(base + '/', { query: 'banana', maxPages: 10
 ok(ranked.includes('/b') && ranked.indexOf('/b') < ranked.indexOf('/a') && /relevance 2/.test(ranked), 'query "banana" ranks /b (2 hits) above /a (1 hit)');
 ok(!/\/c\b/.test(ranked), 'query "banana" drops /c (0 matches)');
 srv.close();
+cfg.updateConfig({ tools: { ...cfg.loadConfig().tools, allowPrivateFetch: false } });
 
 // ---------- notes: quick_note create + append (never clobber) ----------
 console.log('\nquick_note:');

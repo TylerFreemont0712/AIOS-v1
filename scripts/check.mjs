@@ -12,7 +12,7 @@ let failed = false;
 // frontend: full bundle resolution (output discarded). Every HTML entry point
 // needs listing — the phone shell at /m has its own and shares no code with the
 // desktop bundle beyond api.js.
-const ENTRIES = ['web/js/main.js', 'web/js/mobile/receipts.js'];
+const ENTRIES = ['web/js/main.js', 'web/js/mobile/app.js'];
 for (const entry of ENTRIES) {
   try {
     await build({

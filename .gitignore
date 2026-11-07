@@ -2,6 +2,11 @@ node_modules/
 data/
 *.log
 .DS_Store
+
+# The running server's PID. It is rewritten on every start, so while it was tracked
+# every restart showed up as a dirty working tree and eventually as a "chore: update
+# aios process PID" commit. Runtime state, not source.
+aios.pid
 scripts/searxng/config/
 
 # Model weights, wherever they land. `data/` above already covers the directory AIOS

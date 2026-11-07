@@ -15,7 +15,7 @@
 import os from 'node:os';
 import { loadConfig, updateConfig } from './config.js';
 import { leaderboard } from './bench.js';
-import { listLocalModels, listMmproj, llmStatus, startModel, servingAlias, modelAlias, modelArgsFor, presetFor, paramsB, fitContext, findByAlias, llamaBusy } from './llmctl.js';
+import { listLocalModels, listMmproj, llmStatus, startModel, servingAlias, modelAlias, modelArgsFor, presetFor, paramsB, fitContext, findByAlias, llamaBusy, touch, unloadInFlight } from './llmctl.js';
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -108,15 +108,46 @@ export async function legacyAutoRef() {
  *  in-flight generation (bounded) rather than killing it — this is what makes every
  *  local model safely selectable from any picker with zero manual serve/unserve. */
 export async function ensureServing(alias, { waitBusyMs = 180_000 } = {}) {
+  touch();                      // a request is the only thing that keeps the model loaded
+  await unloadInFlight();       // an idle unload mid-flight: let it finish, then boot fresh
   if (servingAlias() === alias) return;
   const m = findByAlias(alias);
   if (!m) throw err(`no local model answers to "${alias}" — check the Models app`, 404);
   const t0 = Date.now();
-  while (llmStatus().running && await llamaBusy()) {
-    if (Date.now() - t0 > waitBusyMs) throw err('llama-server has been busy for 3 minutes — try again, or stop the running generation', 503);
+  let everAnswered = false;         // did /slots tell us the truth even once?
+  while (llmStatus().running) {
+    const { busy, certain } = await llamaBusy();
+    if (certain) everAnswered = true;
+    if (!busy) break;
+    if (Date.now() - t0 > waitBusyMs) {
+      // Three minutes of "busy" is one of two very different situations, and they need
+      // opposite responses. If /slots answered even once, a generation is genuinely in
+      // flight and killing it would lose somebody's reply — refuse, and say so.
+      if (everAnswered) throw err('llama-server has been busy for 3 minutes — try again, or stop the running generation', 503);
+      // If it never answered, the server is wedged rather than busy, and a wedged one
+      // never recovers on its own: every swap would fail until someone restarted it by
+      // hand. Measured 2026-09-05 — three hours of exactly this, during which no local
+      // model could be selected at all and every receipt scan failed. Take the GPU back.
+      console.warn(`[llm] /slots has not answered in ${Math.round((Date.now() - t0) / 1000)}s — treating llama-server as wedged, restarting it for "${alias}"`);
+      break;
+    }
     await sleep(2000);
   }
   await startModel(m.path);   // waits for /health; first request pays the load time
+}
+
+/** Would calling this model right now have to load it first? True only for a ref served
+ *  by the managed llama-server that is not the model currently up. Background jobs ask
+ *  this so a schedule never becomes the reason a 6GB model loads. */
+export function needsBoot(ref) {
+  const s = String(ref || '');
+  let alias = '';
+  if (s.startsWith('local:')) alias = s.slice(6);
+  else if (s.startsWith('custom_')) {
+    const i = s.indexOf(':');
+    if (i > 0 && s.slice(0, i) === localProviderId() && findByAlias(s.slice(i + 1))) alias = s.slice(i + 1);
+  }
+  return !!alias && servingAlias() !== alias;
 }
 
 /** local:<alias> → serve it (if needed) and rewrite to the concrete provider ref. */

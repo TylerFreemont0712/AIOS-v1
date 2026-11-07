@@ -191,12 +191,18 @@ export async function heatmap() {
 let sugCache = { at: 0, key: '', text: '' };
 
 /** Stream 2-3 sentences of prioritized GitHub to-dos to topic gh:suggest:<reqId>. */
-export async function suggest({ reqId, modelRef, projectId } = {}) {
+export async function suggest({ reqId, modelRef, projectId, manual = false } = {}) {
   const send = (ev) => publish(`gh:suggest:${reqId}`, { t: 'gh.suggest', reqId, ev });
   try {
     const cfg = loadConfig();
     const ref = modelRef || cfg.defaults.chatModel || cfg.defaults.agentModel;
     if (!ref) { send({ type: 'error', message: 'no model configured' }); return; }
+    // Opening the tab must not be what loads a 6GB model. Unless the user asked for the
+    // suggestion (the button), only answer when a model is already up.
+    if (!manual) {
+      const { needsBoot } = await import('./router.js');
+      if (needsBoot(ref)) { send({ type: 'idle' }); return; }
+    }
     const user = await me();
     const key = `${user.login}:${projectId || ''}:${ref}`;
     if (sugCache.text && sugCache.key === key && Date.now() - sugCache.at < 15 * 60_000) {
@@ -272,7 +278,7 @@ export async function markRead(threadId) {
 
 /** Basic-auth header trick for one-shot authenticated push/clone over https —
  *  the token never lands in .git/config or the remote URL. */
-function authArgs() {
+export function authArgs() {
   const { token } = resolveToken();
   const b64 = Buffer.from(`x-access-token:${token}`).toString('base64');
   return ['-c', `http.https://github.com/.extraheader=AUTHORIZATION: basic ${b64}`];

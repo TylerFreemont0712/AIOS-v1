@@ -8,13 +8,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#262624">
   <meta name="color-scheme" content="dark light">
-  <title>AIOS · Receipts</title>
+  <title>AIOS</title>
 
   <!-- Add to Home Screen on iOS: standalone chrome, translucent status bar, and a
-       name short enough not to be truncated under the icon. -->
+       name short enough not to be truncated under the icon.
+
+       This only sticks on a STABLE, SECURE origin. Over the LAN's plain http the
+       install is unreliable and the microphone does not exist at all; over the
+       tailnet's HTTPS name both work. See server/remote.js. -->
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Receipts">
+  <meta name="apple-mobile-web-app-title" content="AIOS">
   <meta name="mobile-web-app-capable" content="yes">
   <link rel="apple-touch-icon" href="/icons/aios-192.png">
   <link rel="icon" href="/icons/aios.svg">
@@ -25,6 +29,6 @@
 </head>
 <body class="m-body">
   <div id="m-app" class="m-app"></div>
-  <script type="module" src="/js/mobile/receipts.js"></script>
+  <script type="module" src="/js/mobile/app.js"></script>
 </body>
 </html>

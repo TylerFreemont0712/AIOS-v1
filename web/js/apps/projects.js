@@ -40,14 +40,14 @@ export default {
 
     function card(p) {
       const gitChip = p.git
-        ? el('span', { class: 'chip' }, icon('git'), `${p.git.branch}${p.git.dirty ? ` · ${p.git.dirty} dirty` : ''}`)
+        ? el('span', { class: 'chip' }, icon('git'), `${p.git.branch}${p.git.dirty ? ` · ${p.git.dirty} dirty` : ''}${p.git.ahead ? ` · ↑${p.git.ahead}` : ''}${p.git.behind ? ` · ↓${p.git.behind}` : ''}`)
         : el('span', { class: 'chip' }, 'no git');
       const active = state.project?.id === p.id;
       const c = el('div', { class: 'proj-card' + (p.exists ? '' : ' missing') },
         el('div', { class: 'p-name' }, p.favorite ? el('span', { class: 'fav' }, '★') : null, p.name,
           active ? el('span', { class: 'chip accent', style: { marginLeft: 'auto' } }, 'active') : null),
         el('div', { class: 'p-path' }, p.path),
-        el('div', { class: 'p-meta' }, gitChip, el('span', { class: 'chip' }, timeAgo(p.lastOpenedAt))),
+        el('div', { class: 'p-meta' }, gitChip, el('span', { class: 'chip', title: p.activityAt ? `last changed ${new Date(p.activityAt).toLocaleString()}` : 'opened ' + timeAgo(p.lastOpenedAt) }, p.activityAt ? `changed ${timeAgo(p.activityAt)}` : timeAgo(p.lastOpenedAt))),
         p.notes ? el('div', { class: 'muted small' }, p.notes) : null,
         el('div', { class: 'p-actions' },
           el('button', { class: 'btn sm', onclick: (e) => { e.stopPropagation(); use(p); openApp('agent'); } }, icon('agent'), 'Agent'),

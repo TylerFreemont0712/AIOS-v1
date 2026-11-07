@@ -1,7 +1,7 @@
 {
-  "name": "AIOS Receipts",
-  "short_name": "Receipts",
-  "description": "Photograph a receipt; the AIOS box reads it and files it under Finances.",
+  "name": "AIOS",
+  "short_name": "AIOS",
+  "description": "Your AI operating hub, on your phone — chat, voice, money, tasks, notes, files and a shell on the box.",
   "start_url": "/m",
   "scope": "/",
   "display": "standalone",
@@ -12,5 +12,10 @@
     { "src": "/icons/aios.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
     { "src": "/icons/aios-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
     { "src": "/icons/aios-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Snap a receipt", "url": "/m#money?capture=1" },
+    { "name": "New chat", "url": "/m#chat?fresh=1" },
+    { "name": "Today", "url": "/m#tasks" }
   ]
 }

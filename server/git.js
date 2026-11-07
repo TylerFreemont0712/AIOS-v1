@@ -103,7 +103,7 @@ export async function gitInit(root) {
 }
 
 /** Commits need an identity; default a local one from the AIOS profile if unset. */
-async function ensureIdentity(root) {
+export async function ensureIdentity(root) {
   if (sync(root, ['config', 'user.email'])) return;
   const u = loadConfig().user || {};
   await runGit(root, ['config', 'user.name', u.name || 'AIOS']);
@@ -215,13 +215,13 @@ export function cleanMessage(text) {
 }
 
 /** The change set as text for the model: stat + capped patch + heads of new files. */
-function changesText(root, info, cap) {
-  const base = info.hasCommits ? ['diff', 'HEAD'] : ['diff'];
+function changesText(root, info, cap, staged = false) {
+  const base = staged ? ['diff', '--cached'] : info.hasCommits ? ['diff', 'HEAD'] : ['diff'];
   const stat = (sync(root, [...base, '--stat']) || '').slice(0, 2000);
   let patch = (sync(root, [...base, '--unified=2']) || '');
   let extra = '';
   // untracked files never show in diff — include their heads so the model knows what they are
-  for (const f of info.files.filter(f => f.s === '??').slice(0, 6)) {
+  for (const f of staged ? [] : info.files.filter(f => f.s === '??').slice(0, 6)) {
     try {
       const abs = path.join(root, f.path);
       if (fs.statSync(abs).isFile() && fs.statSync(abs).size < 200_000) {
@@ -243,10 +243,11 @@ export const isGenericSubject = (subject) => {
 };
 
 /** Draft a commit message from the working-tree diff; template fallback without a model. */
-export async function commitMessage(root, { modelRef } = {}) {
+export async function commitMessage(root, { modelRef, staged = false } = {}) {
   if (!isRepo(root)) throw err('not a git repository');
   const info = gitInfo(root);
   if (!info.dirty) throw err('working tree clean — nothing to describe');
+  if (staged && !sync(root, ['diff', '--cached', '--name-only'])) throw err('nothing is staged — stage the changes you want described');
   const cfg = loadConfig();
   const ref = modelRef || cfg.defaults.agentModel || cfg.defaults.chatModel;
   if (!ref) return { message: templateMessage(info), generated: false };
@@ -268,7 +269,7 @@ Output ONLY the commit message — no fences, no quotes, no commentary.
 
 Branch: ${info.branch}
 
-${changesText(root, info, cap)}`;
+${changesText(root, info, cap, staged)}`;
 
   try {
     // reasoning models spend most tokens thinking before the first message line —

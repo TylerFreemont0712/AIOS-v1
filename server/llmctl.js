@@ -1,6 +1,5 @@
-// AIOS-managed llama.cpp lifecycle (ownership approved 2026-07-11). Two profiles:
-// 'big'  — the GPU daily driver
-// 'tiny' — a small fast model for quick work and low-VRAM situations
+// AIOS-managed llama.cpp lifecycle. Both profiles use Spark-X2.5-4B:
+// 'big' is the normal 32k context, 'tiny' is an 8k low-context fallback.
 // Freeing the GPU for ComfyUI is no longer a profile swap: suspendForGpu() stops
 // llama-server outright and resumeAfterGpu() puts back whatever was serving.
 // Pidfile discipline mirrors scripts/aios-launch.sh; a llama-server started by the
@@ -75,6 +74,7 @@ export function llmStatus() {
   let profile = '';
   try { profile = fs.readFileSync(PROFILE_FILE, 'utf8').trim(); } catch { }
   const foreign = foreignPids();
+  const limitMin = idleLimitMin();
   return {
     managed: cfg.managed !== false,
     running: mine, profile: mine ? profile : '',
@@ -85,6 +85,10 @@ export function llmStatus() {
     // Set while Studio/ComfyUI holds the GPU. The UI needs this to distinguish
     // "deliberately stopped so Comfy can render" from "the LLM fell over".
     suspended: gpuSuspendedFor(),
+    // On-demand lifecycle: minutes of quiet before the model is unloaded (0 = never),
+    // and how long is left on that clock right now. Only AIOS's own server has one.
+    idleUnloadMin: limitMin,
+    idleLeftSec: mine && limitMin ? Math.max(0, Math.round((limitMin * 60_000 - (Date.now() - lastActive)) / 1000)) : null,
   };
 }
 
@@ -133,13 +137,73 @@ export async function stopLlama() {
   return { stopped: true };
 }
 
+// ---------- on-demand lifecycle: idle unload ----------
+//
+// Nothing starts llama-server on its own. It comes up when something actually needs a
+// model (router.js ensureServing, which every `local:` request passes through), and this
+// watcher stops it again after `llm.idleUnloadMin` quiet minutes (default 12, 0 = never).
+// The cost being avoided is ~6GB of VRAM held all day on an 8GB card that ComfyUI also
+// wants; the cost being paid is a 10-30s load on the first message after a quiet spell.
+//
+// "Quiet" is measured, not guessed: /slots says whether a generation is in flight (a
+// five-minute reply on this box must never be unloaded under), touch() marks the start of
+// every request, and a finished boot starts the clock fresh. It only ever stops a server
+// AIOS started — a llama-server launched from the PyQt launcher is somebody's experiment.
+let lastActive = Date.now();
+let booting = 0;                 // boots in flight — never unload underneath one
+let unloading = null;            // promise while an idle unload is stopping the server
+let idleTimer = null;
+let ticking = false;
+
+/** Note that the model was just used (or just came up) — restarts the idle clock. */
+export function touch() { lastActive = Date.now(); }
+
+/** Minutes of quiet before unloading; 0 turns the unload off. */
+export function idleLimitMin() {
+  const v = Number(loadConfig().llm?.idleUnloadMin);
+  return Number.isFinite(v) && v >= 0 ? v : 12;
+}
+
+/** Resolves once an in-progress idle unload has finished (immediately otherwise), so a
+ *  request arriving mid-unload waits for the port to free and then boots cleanly instead
+ *  of being sent to a server that is shutting down. */
+export const unloadInFlight = () => unloading || Promise.resolve();
+
+async function idleTick() {
+  const cfg = loadConfig().llm || {};
+  const limit = idleLimitMin() * 60_000;
+  if (!limit || cfg.managed === false || booting > 0 || unloading) return;
+  const pid = readPid();
+  if (!(alive(pid) && isLlama(pid))) return;
+  const { busy, certain } = await llamaBusy();
+  if (busy) { if (certain) touch(); return; }   // working — or unreadable, which is not idle either
+  if (Date.now() - lastActive < limit) return;
+  if (booting > 0) return;
+  // No await between this last look and the kill below, so a request that touch()ed a
+  // moment ago is seen; one that lands after waits on `unloading`.
+  const idleMin = Math.round((Date.now() - lastActive) / 60_000);
+  console.log(`[llm] idle for ${idleMin} min — unloading ${llmStatus().profile || 'the model'} to free VRAM (next use loads it again)`);
+  unloading = stopLlama().finally(() => { unloading = null; });
+  await unloading;
+}
+
+/** Start the idle watcher. Safe to call twice. */
+export function startIdleWatch() {
+  if (idleTimer) return;
+  idleTimer = setInterval(() => {
+    if (ticking) return;
+    ticking = true;
+    idleTick().catch(e => console.error('[llm] idle check failed:', e.message)).finally(() => { ticking = false; });
+  }, Number(process.env.AIOS_IDLE_TICK_MS) || 15_000);   // env override is for tests
+  idleTimer.unref?.();
+}
+
 /** Free the GPU completely for another tenant (ComfyUI), remembering what was
  *  loaded so it can be restored afterwards.
  *
- *  Stopping beats swapping to the tiny CPU profile: a llama-server process holds
- *  its CUDA context and cuBLAS workspace even at -ngl 0, which is a few hundred MB
- *  that an SDXL checkpoint would rather have. On an 8GB card that margin decides
- *  whether a generation fits. */
+ *  Stopping beats switching to a low-context profile: the same model weights and
+ *  llama-server CUDA context would still occupy VRAM that an SDXL checkpoint needs.
+ *  On an 8GB card that margin decides whether a generation fits. */
 export async function suspendForGpu() {
   const cur = llmStatus();
   if (!cur.running && !cur.foreign) return { suspended: false, was: '', reason: 'nothing was serving' };
@@ -151,11 +215,16 @@ export async function suspendForGpu() {
 }
 
 /** Put back whatever suspendForGpu() stopped. Falls back to `fallback` when
- *  nothing was remembered, and does nothing if something is already serving. */
-export async function resumeAfterGpu({ fallback = 'big' } = {}) {
+ *  nothing was remembered, and does nothing if something is already serving.
+ *
+ *  `lazy` only gives the GPU back: the model is NOT reloaded now, because the next
+ *  request that needs one loads it on demand. An image render finishing is not a reason
+ *  to spend 30 seconds of GPU on a model nobody has asked for. */
+export async function resumeAfterGpu({ fallback = 'big', lazy = false } = {}) {
   let was = '';
   try { was = fs.readFileSync(SUSPEND_FILE, 'utf8').trim(); } catch { }
   try { fs.unlinkSync(SUSPEND_FILE); } catch { }
+  if (lazy) return { resumed: false, lazy: true, was, reason: 'loads on next use' };
 
   const cur = llmStatus();
   if (cur.running) return { resumed: false, profile: cur.profile, reason: 'already serving' };
@@ -291,11 +360,16 @@ export function visionModels() {
  * Declared by the `ocr` tag on the model's preset, so adding a new one is configuration.
  */
 export function refIsTranscriber(ref) {
+  return !!refPreset(ref)?.tags.includes('ocr');
+}
+
+/** The preset behind a model ref, or null when the ref does not resolve to a local gguf
+ *  (a cloud model, or one since deleted). The tag/prompt/style lookups all start here. */
+export function refPreset(ref) {
   const s = String(ref || '').trim();
   const alias = s.includes(':') ? s.slice(s.indexOf(':') + 1) : s;
   const m = findByAlias(alias);
-  if (!m) return false;
-  return presetFor(m.file, m.sizeGB).tags.includes('ocr');
+  return m ? presetFor(m.file, m.sizeGB) : null;
 }
 
 /**
@@ -363,6 +437,14 @@ export function presetFor(file, sizeGB) {
     jinja: saved.jinja !== false,
     extra: String(saved.extra || ''),               // raw escape hatch for anything else
     tags: Array.isArray(saved.tags) ? saved.tags : [],
+    // How a reader tagged `ocr` wants to be asked, and what shape it answers in.
+    // Dedicated OCR models are prompt-sensitive to the point of uselessness when asked
+    // wrongly — dots.ocr returns two tokens for "OCR" and a full layout parse for its own
+    // instruction — and each new one arrives with its own. Empty means "use the built-in
+    // default for this model name" (see ocrPromptFor in receipts.js), so adding a reader
+    // is a preset edit rather than a code change.
+    ocrPrompt: String(saved.ocrPrompt || ''),
+    ocrStyle: saved.ocrStyle === 'layout-json' || saved.ocrStyle === 'lines' ? saved.ocrStyle : '',
     configured: !!cfg.presets?.[file],              // false = running on size defaults
   };
 }
@@ -415,23 +497,128 @@ export function llamaLog(lines = 120) {
   } catch { return '(no log yet)'; }
 }
 
-/** Is llama mid-generation right now? Routing must never yank a model out from under
- *  an in-flight request. Unknown (endpoint missing) counts as busy — safer. */
+/**
+ * Is llama mid-generation right now? Routing must never yank a model out from under
+ * an in-flight request.
+ *
+ * Returns `{ busy, certain }`, and the second field is load-bearing. This used to
+ * return a bare boolean where "I could not tell" collapsed into "busy" — safe for a
+ * second, catastrophic for an hour. Measured 2026-09-05: a llama-server sat for 3h16m
+ * with /health answering in 0.3ms while /slots never answered at all (every probe
+ * created a task that never completed — the log filled with `stop: cancel task`, two
+ * per routing decision, for three hours). Because unknown meant busy, EVERY model swap
+ * was refused for that whole time: each receipt scan waited out the full three minutes
+ * and then failed with "llama-server has been busy", naming an in-flight generation
+ * that did not exist. A wedged server is not a busy one, and unlike a busy one it never
+ * gets better on its own. The caller needs to be able to tell those apart.
+ */
 export async function llamaBusy() {
   const cfg = loadConfig().llm || {};
+  const port = cfg.port || 8080;
   try {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 1500);
-    const r = await fetch(`http://127.0.0.1:${cfg.port || 8080}/slots`, { signal: ctl.signal }).finally(() => clearTimeout(t));
-    if (!r.ok) return true;
+    const r = await fetch(`http://127.0.0.1:${port}/slots`, { signal: ctl.signal }).finally(() => clearTimeout(t));
+    if (!r.ok) return { busy: true, certain: false };
     const slots = await r.json();
-    return Array.isArray(slots) ? slots.some(s => s.is_processing) : true;
-  } catch { return !(await healthy(cfg.port || 8080)) ? false : true; }
+    if (!Array.isArray(slots)) return { busy: true, certain: false };
+    return { busy: slots.some(s => s.is_processing), certain: true };
+  } catch {
+    // Not answering /health either: it is down, which is emphatically not busy.
+    if (!(await healthy(port))) return { busy: false, certain: true };
+    return { busy: true, certain: false };
+  }
+}
+
+/**
+ * Model swaps run one at a time, in the order they were asked for.
+ *
+ * Every boot begins by killing whatever llama-server is running, so two boots in
+ * flight at once kill each other's server and neither survives. Caught live on
+ * 2026-09-05 with one receipt scan racing one chat send, in llama.log:
+ *
+ *   12:39:56.884 starting "model:hunyuanocr-q8_0" -> couldn't bind socket, port 8080
+ *   12:39:58.338 starting "model:hunyuanocr-q8_0" -> model loaded ... listening
+ *                        ...0.4s later:               cleaning up before exit
+ *
+ * The OCR model loads in two seconds and was killed 400ms after it came up, by the
+ * competing boot's stopLlama(). The scan saw "did not become healthy", fell back to a
+ * text-only chat model that cannot see an image at all, and the receipt failed — nine
+ * minutes later, because each of its three attempts also waited out the busy check.
+ * From the phone that is simply a photo that never reads.
+ *
+ * A queue rather than a lock: the second caller still gets its model, just after the
+ * first is up. Serializing here rather than in router.js covers every entrance —
+ * startModel, startProfile, resumeAfterGpu and the /api/llm routes all land in boot().
+ */
+let bootChain = Promise.resolve();
+function serializeBoot(fn) {
+  const next = bootChain.then(fn, fn);         // a rejection must not poison the queue
+  bootChain = next.then(() => { }, () => { });
+  return next;
+}
+
+// …and the queue alone is not enough, because it is per-process. `npm run receipt-bench`
+// (scripts/receipt-bench.mjs imports server/receipts.js and calls readReceipt directly),
+// `npm run audit` and the e2e scripts each drive the SAME llama-server from their own node
+// process with their own queue — so a bench run against the live hub is the identical
+// fatal race, and was caught being exactly that: two boots 22ms apart, one per process.
+// A lock file is the only thing both sides can see.
+//
+// Stale locks are how this pattern usually fails, so the holder writes its pid and the
+// time, and a lock is stolen when its owner is gone or it has outlived the longest
+// legitimate boot. Stealing beats blocking: a lock left by a crashed bench must never be
+// able to stop this machine from loading a model.
+const LOCK = path.join(DIR, 'boot.lock');
+const LOCK_CEILING_MS = 300_000;               // a cold 27B load is minutes, not seconds
+
+function lockIsLive() {
+  try {
+    const { pid, at } = JSON.parse(fs.readFileSync(LOCK, 'utf8'));
+    if (!(Date.now() - at < LOCK_CEILING_MS)) return false;   // also false for a bad `at`
+    return pid !== process.pid && alive(pid);
+  } catch { return false; }                    // absent or unreadable: nobody holds it
+}
+
+async function withBootLock(fn) {
+  const t0 = Date.now();
+  for (;;) {
+    try {
+      fs.mkdirSync(DIR, { recursive: true });
+      const fd = fs.openSync(LOCK, 'wx');      // create-or-fail: the atomic bit
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
+      fs.closeSync(fd);
+      break;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;        // a real fs problem is not ours to paper over
+      if (!lockIsLive() || Date.now() - t0 > LOCK_CEILING_MS) {
+        try { fs.unlinkSync(LOCK); } catch { /* someone else got there first */ }
+        continue;
+      }
+      await sleep(400);
+    }
+  }
+  try { return await fn(); }
+  finally { try { fs.unlinkSync(LOCK); } catch { /* already stolen; nothing to undo */ } }
 }
 
 /** Shared spawn+wait: kill whatever runs, start detached, wait for /health. */
-async function boot({ model, alias, args, label, budget }) {
+const boot = (opts) => {
+  booting++;
+  return serializeBoot(() => withBootLock(() => bootNow(opts)))
+    .finally(() => { booting--; touch(); });    // a fresh model gets a full idle window
+};
+
+async function bootNow({ model, alias, args, label, budget }) {
   const cfg = loadConfig().llm || {};
+  // Re-check now that it is our turn. While this call sat in the queue, the boot ahead
+  // of it may have started exactly the model we want — two requests for the same model
+  // arriving together is the common case, not the rare one. Without this they cost the
+  // same 30s load twice, the second one killing a perfectly good server to do it.
+  const cur = llmStatus();
+  if (cur.running && cur.profile === label && await healthy(cfg.port || 8080)) {
+    return { ok: true, profile: label, already: true };
+  }
   if (!fs.existsSync(cfg.binary)) throw err(`llama-server binary not found at ${cfg.binary}`, 500);
   if (!fs.existsSync(model)) throw err(`model file missing: ${model} — is the download finished?`, 500);
 
